@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sutradb"
+version = "2.0.0"
+description = "High-performance, zero-dependency hybrid vector search & BM25 lexical engine in pure Python."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Samarth", email = "samarth@sam-codes.vercel.app"}
+]
+keywords = [
+    "vector-database",
+    "embeddings",
+    "semantic-search",
+    "bm25",
+    "hybrid-search",
+    "rag",
+    "llm",
+    "machine-learning"
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence"
+]
+dependencies = [
+    "numpy>=1.24.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0"
+]
+
+[project.scripts]
+sutradb = "sutradb.server:run_server"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sutradb*"]
