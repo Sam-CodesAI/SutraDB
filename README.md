@@ -1,5 +1,6 @@
 # सूत्र DB (SutraDB)
 
+[![PyPI](https://img.shields.io/pypi/v/sutradb-core.svg?style=flat&color=blue&logo=pypi)](https://pypi.org/project/sutradb-core/)
 [![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12-blue?logo=python)](https://python.org)
 [![NumPy](https://img.shields.io/badge/Accelerated%20By-NumPy%20BLAS-013243?logo=numpy)](https://numpy.org)
 [![Tests](https://img.shields.io/badge/Tests-20%2F20%20Passing-brightgreen)](https://github.com/Sam-CodesAI/SutraDB)
@@ -81,7 +82,7 @@ Ran on standard 4-vCPU Linux environment (5,000 documents, 128 dimensions):
 | **Vector Search Latency (P50)** | **0.36 ms** | ~4.2 ms | 35 – 65 ms (Network roundtrip) |
 | **Ingestion Throughput** | **52,000+ docs/sec** | ~4,800 docs/sec | Rate-limited by HTTP |
 | **RAM Overhead** | **~22 MB** | ~140 MB | 0 MB (Remote) |
-| **Setup Overhead** | `pip install sutradb` | Docker / heavy pip | API keys + Monthly bill |
+| **Setup Overhead** | `pip install sutradb-core` | Docker / heavy pip | API keys + Monthly bill |
 
 ---
 
