@@ -104,8 +104,10 @@ class Collection:
             return
         for entry in entries:
             op = entry.get("op")
-            if op == "insert":
+            if op in ("insert", "update"):
                 raw_docs = entry.get("docs", [])
+                if not raw_docs and "doc" in entry:
+                    raw_docs = [entry["doc"]]
                 vectors = [np.array(d["vector"], dtype=np.float32) for d in raw_docs]
                 docs = [Document.from_dict(d, v) for d, v in zip(raw_docs, vectors)]
                 self._insert_internal(docs, log_to_wal=False)
@@ -144,6 +146,7 @@ class Collection:
         new_vectors = []
         new_texts = []
         new_docs = []
+        updated_docs = []
 
         for doc in documents:
             if doc.vector is None:
@@ -167,7 +170,7 @@ class Collection:
                 idx = self.id_to_index[doc.id]
                 self.vectors[idx] = vec
                 self.documents[idx] = doc
-                # Rebuilding BM25 when updating documents
+                updated_docs.append(doc)
                 continue
 
             idx = len(self.documents) + len(new_docs)
@@ -184,22 +187,30 @@ class Collection:
                 self.vectors = np.vstack([self.vectors, stacked_new])
 
             self.documents.extend(new_docs)
-            self.bm25_index.add_documents(new_texts)
+            if not updated_docs:
+                self.bm25_index.add_documents(new_texts)
 
-        if log_to_wal and self.wal and new_docs:
-            wal_payload = {
-                "op": "insert",
-                "docs": [
-                    {
-                        "id": d.id,
-                        "vector": d.vector.tolist() if d.vector is not None else [],
-                        "text": d.text,
-                        "metadata": d.metadata
-                    }
-                    for d in new_docs
-                ]
-            }
-            self.wal.append(wal_payload)
+        # If any documents were updated, rebuild the full BM25 index
+        if updated_docs:
+            self.bm25_index = BM25Index()
+            self.bm25_index.add_documents([d.text for d in self.documents])
+
+        if log_to_wal and self.wal:
+            wal_docs = new_docs + updated_docs
+            if wal_docs:
+                wal_payload = {
+                    "op": "insert",
+                    "docs": [
+                        {
+                            "id": d.id,
+                            "vector": d.vector.tolist() if d.vector is not None else [],
+                            "text": d.text,
+                            "metadata": d.metadata
+                        }
+                        for d in wal_docs
+                    ]
+                }
+                self.wal.append(wal_payload)
 
         return len(self.documents)
 
@@ -489,8 +500,12 @@ class SutraDB:
                 disk_file = self.persist_dir / f"{name}.sutra"
                 wal_file = self.persist_dir / f"{name}.wal"
                 if disk_file.exists():
-                    col = Collection(name=name, dimension=1, storage_path=disk_file, enable_wal=wal_file.exists())
+                    has_wal = wal_file.exists()
+                    col = Collection(name=name, dimension=1, storage_path=disk_file, enable_wal=False)
                     col.load()
+                    if has_wal:
+                        col.wal = WriteAheadLog(wal_file)
+                        col._replay_wal_if_present()
                     self.collections[name] = col
                     return col
                 elif wal_file.exists():

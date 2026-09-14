@@ -87,3 +87,40 @@ def test_collection_delete():
     assert col.count() == 1
     assert col.get("d1") is None
     assert col.get("d2") is not None
+
+
+def test_collection_document_update_bm25_refresh():
+    col = Collection(name="test_update_bm25", dimension=2, metric="cosine")
+    col.insert(Document(id="doc-1", vector=[1.0, 0.0], text="database indexing engine"))
+
+    # Initial search matches "indexing"
+    res1 = col.query(text="indexing")
+    assert len(res1) == 1
+    assert res1[0].id == "doc-1"
+
+    # Update document with completely new text
+    col.insert(Document(id="doc-1", vector=[0.0, 1.0], text="machine learning vision model"))
+
+    # Stale keyword "indexing" should NO LONGER match
+    res_stale = col.query(text="indexing")
+    assert len(res_stale) == 0
+
+    # New keyword "learning" MUST match
+    res_new = col.query(text="learning")
+    assert len(res_new) == 1
+    assert res_new[0].id == "doc-1"
+
+
+def test_negative_cosine_rrf():
+    col = Collection(name="test_neg_rrf", dimension=2, metric="cosine")
+    col.insert([
+        Document(id="d-opposing", vector=[-1.0, 0.0], text="keyword matching here"),
+        Document(id="d-orthogonal", vector=[0.0, 1.0], text="keyword matching here"),
+    ])
+
+    # Query with [1.0, 0.0] -> cosine to d-opposing is -1.0, to d-orthogonal is 0.0
+    results = col.query(vector=[1.0, 0.0], text="keyword", hybrid=True, top_k=2)
+    assert len(results) == 2
+    # Both documents must have positive RRF scores even though cosine is <= 0
+    assert results[0].score > 0
+    assert results[1].score > 0

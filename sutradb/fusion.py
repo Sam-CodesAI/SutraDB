@@ -43,7 +43,7 @@ def reciprocal_rank_fusion(
     dense_sorted_local = np.argsort(-dense_valid)
     for rank, local_idx in enumerate(dense_sorted_local, start=1):
         global_idx = valid_indices[local_idx]
-        if dense_scores[global_idx] > 1e-6:
+        if dense_scores[global_idx] > 0.0:
             rrf_map[global_idx] += dense_weight / (k_constant + rank)
 
     # BM25 ranking (sort valid indices by BM25 score descending)

@@ -21,6 +21,10 @@ class FilterEngine:
             # Implicit $eq comparison
             return field_value == condition
 
+        # If dictionary has no operator keys ($...), treat as literal object comparison
+        if not any(isinstance(k, str) and k.startswith("$") for k in condition):
+            return field_value == condition
+
         # Process explicit operator dictionary
         for op, target in condition.items():
             if op == "$eq":

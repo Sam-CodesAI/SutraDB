@@ -70,3 +70,34 @@ def test_wal_durability(tmp_path: Path):
     assert col_recovered.count() == 2
     assert col_recovered.get("wal_1") is not None
     assert col_recovered.get("wal_2") is not None
+
+
+def test_snapshot_plus_wal_reload(tmp_path: Path):
+    db_dir = tmp_path / "combined_db"
+    db = SutraDB(persist_directory=db_dir)
+    col = db.create_collection("products", dimension=16, enable_wal=True)
+
+    # 1. Insert 5 items and take clean snapshot
+    base_docs = [
+        Document(id=f"base_{i}", vector=np.random.randn(16).astype(np.float32), text=f"Base item {i}")
+        for i in range(5)
+    ]
+    col.insert(base_docs)
+    col.save()
+
+    # 2. Insert 2 more items logged only to WAL (no save)
+    wal_docs = [
+        Document(id=f"wal_{i}", vector=np.random.randn(16).astype(np.float32), text=f"WAL item {i}")
+        for i in range(2)
+    ]
+    col.insert(wal_docs)
+
+    # 3. Restart DB and reload collection
+    db_reloaded = SutraDB(persist_directory=db_dir)
+    col_reloaded = db_reloaded.get_collection("products")
+
+    # Should have all 7 items and correct dimension 16
+    assert col_reloaded.dimension == 16
+    assert col_reloaded.count() == 7
+    assert col_reloaded.get("base_0") is not None
+    assert col_reloaded.get("wal_1") is not None

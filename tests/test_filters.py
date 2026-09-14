@@ -74,3 +74,16 @@ def test_build_mask():
 
     mask = FilterEngine.build_mask(metadata_list, filter_spec)
     assert np.array_equal(mask, np.array([True, False, False, False]))
+
+
+def test_nested_dict_filter():
+    meta = {
+        "author": {"name": "Alice", "role": "admin"},
+        "status": "active"
+    }
+
+    # Exact dictionary match should succeed without Unknown filter operator error
+    assert FilterEngine.evaluate(meta, {"author": {"name": "Alice", "role": "admin"}})
+    assert not FilterEngine.evaluate(meta, {"author": {"name": "Bob", "role": "admin"}})
+    # Standard operator should also work with nested condition
+    assert FilterEngine.evaluate(meta, {"author": {"$eq": {"name": "Alice", "role": "admin"}}})
