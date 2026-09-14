@@ -14,6 +14,8 @@ from sutradb.filters import FilterEngine
 from sutradb.bm25 import BM25Index
 from sutradb.fusion import reciprocal_rank_fusion, linear_score_fusion
 from sutradb.storage import BinaryStorage, WriteAheadLog
+from sutradb.ann import IVFIndex, IVFConfig, auto_n_lists
+from sutradb.concurrency import ReadWriteLock
 
 
 @dataclass
@@ -71,7 +73,8 @@ class Collection:
         dimension: int,
         metric: Union[Metric, str] = Metric.COSINE,
         storage_path: Optional[Union[str, Path]] = None,
-        enable_wal: bool = False
+        enable_wal: bool = False,
+        ann_config: Optional[IVFConfig] = None
     ):
         self.name = name
         self.dimension = int(dimension)
@@ -87,6 +90,14 @@ class Collection:
         
         # BM25 lexical engine
         self.bm25_index = BM25Index()
+
+        # Thread safety: ReadWriteLock allows concurrent reads, exclusive writes
+        self._lock = ReadWriteLock()
+
+        # ANN index (IVF-Flat) for sublinear search at scale
+        self._ann_config = ann_config
+        self._ann_index: Optional[IVFIndex] = None
+        self._ann_dirty: bool = False  # True when vectors added since last index build
 
         # Durability log
         self.wal: Optional[WriteAheadLog] = None
