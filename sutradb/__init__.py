@@ -9,7 +9,7 @@ from sutradb.filters import FilterEngine
 from sutradb.bm25 import BM25Index
 from sutradb.fusion import reciprocal_rank_fusion, linear_score_fusion
 
-__version__ = "2.0.1"
+__version__ = "2.1.0"
 __all__ = [
     "SutraDB",
     "Collection",

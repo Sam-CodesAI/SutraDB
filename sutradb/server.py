@@ -54,7 +54,7 @@ class SutraHTTPHandler(BaseHTTPRequestHandler):
         if path == "" or path == "/health":
             self._send_json(200, {
                 "status": "healthy",
-                "version": "2.0.1",
+                "version": "2.1.0",
                 "collections": self.db.list_collections()
             })
             return
@@ -197,7 +197,7 @@ def run_server(host: str = "0.0.0.0", port: int = 8765, data_dir: str = "./sutra
     db = SutraDB(persist_directory=data_dir)
     SutraHTTPHandler.db = db
     server = HTTPServer((host, port), SutraHTTPHandler)
-    print(f"⚡ SutraDB v2.0 REST server running at http://{host}:{port}")
+    print(f"⚡ SutraDB v2.1 REST server running at http://{host}:{port}")
     print(f"📁 Persistence directory: {Path(data_dir).resolve()}")
     try:
         server.serve_forever()

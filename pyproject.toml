@@ -4,14 +4,21 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sutradb-core"
-version = "2.0.1"
-description = "High-performance, zero-dependency hybrid vector search & BM25 lexical engine in pure Python."
+version = "2.1.0"
+description = "High-performance, zero-dependency hybrid vector search & BM25 lexical engine with IVF-Flat ANN indexing in pure Python."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
-    {name = "Samarth", email = "samarth@sam-codes.vercel.app"}
+    {name = "Samarth Nimangre", email = "samarthknimangre@gmail.com"}
 ]
+
+[project.urls]
+Homepage = "https://sam-codes.vercel.app"
+Repository = "https://github.com/Sam-CodesAI/SutraDB"
+Documentation = "https://github.com/Sam-CodesAI/SutraDB#readme"
+"Bug Tracker" = "https://github.com/Sam-CodesAI/SutraDB/issues"
+
 keywords = [
     "vector-database",
     "embeddings",

@@ -90,6 +90,12 @@ Ran on standard 4-vCPU Linux environment (5,000 documents, 128 dimensions):
 
 ### 1. Installation
 
+Install via PyPI:
+```bash
+pip install sutradb-core
+```
+
+Or clone for local development & benchmarking:
 ```bash
 git clone https://github.com/Sam-CodesAI/SutraDB.git
 cd SutraDB
