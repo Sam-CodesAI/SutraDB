@@ -37,7 +37,8 @@ def test_server_health_and_lifecycle(server_url):
         assert resp.status == 200
         data = json.loads(resp.read().decode("utf-8"))
         assert data["status"] == "healthy"
-        assert data["version"] == "2.0.0"
+        from sutradb import __version__
+        assert data["version"] == __version__
 
     # 2. Create collection
     create_body = json.dumps({"name": "articles", "dimension": 3, "metric": "cosine"}).encode("utf-8")
