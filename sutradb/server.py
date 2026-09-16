@@ -54,7 +54,7 @@ class SutraHTTPHandler(BaseHTTPRequestHandler):
         if path == "" or path == "/health":
             self._send_json(200, {
                 "status": "healthy",
-                "version": "2.1.0",
+                "version": "2.1.1",
                 "collections": self.db.list_collections()
             })
             return
