@@ -3,7 +3,7 @@
 [![PyPI](https://img.shields.io/pypi/v/sutradb-core.svg?style=flat&color=blue&logo=pypi)](https://pypi.org/project/sutradb-core/)
 [![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12-blue?logo=python)](https://python.org)
 [![NumPy](https://img.shields.io/badge/Accelerated%20By-NumPy%20BLAS-013243?logo=numpy)](https://numpy.org)
-[![Tests](https://img.shields.io/badge/Tests-20%2F20%20Passing-brightgreen)](https://github.com/Sam-CodesAI/SutraDB)
+[![Tests](https://img.shields.io/badge/Tests-28%2F28%20Passing-brightgreen)](https://github.com/Sam-CodesAI/SutraDB)
 [![Latency](https://img.shields.io/badge/Query%20P50-0.36ms-orange)](https://github.com/Sam-CodesAI/SutraDB)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
@@ -64,6 +64,8 @@ Designed specifically for the 95% of AI applications (local RAG, agent memory, e
 ## ⚡ Key Highlights
 
 * **Pure SIMD / BLAS Velocity:** Pre-normalizes vectors at insertion time so Cosine Similarity reduces to a single GEMV matrix-vector multiplication executed in L1 cache lines.
+* **IVF-Flat Approximate Nearest Neighbor (ANN):** Sublinear clustering index powered by k-means++ centroid initialization. Dramatically prunes search space for large-scale datasets while preserving high recall (`collection.build_index()`, `use_ann=True`).
+* **Thread-Safe Readers-Writer Concurrency:** Built-in `ReadWriteLock` with writer priority guarantees zero race conditions during parallel batch insertions, deletes, and query executions.
 * **Reciprocal Rank Fusion (RRF):** Dense embeddings understand semantic intent; BM25 matches exact serial numbers, error codes, and technical jargon. SutraDB dynamically fuses both ranking signals via RRF.
 * **Single-Stage In-Flight Predicate Masking:** Zero subset memory allocations. Evaluates complex JSON conditions (`$eq`, `$ne`, `$gt`, `$gte`, `$in`, `$nin`, `$contains`, `$and`, `$or`) into high-speed bitmasks in under $30\mu\text{s}$.
 * **Zero-Copy Memory-Mapped Persistence:** Custom `.sutra` 64-byte aligned binary format allows near-instant cold starts via `mmap`, backed by an append-only CRC32 Write-Ahead Log (WAL) for durability.
@@ -140,6 +142,14 @@ results = collection.query(
 
 for r in results:
     print(f"[{r.score:.4f}] {r.id}: {r.text}")
+
+# Optional: Build IVF-Flat ANN index for sublinear search on large datasets
+collection.build_index(n_lists=4, n_probe=2)
+ann_results = collection.query(
+    vector=[1.0, 0.0, 0.0, 0.0],
+    top_k=5,
+    use_ann=True
+)
 ```
 
 ---

@@ -148,7 +148,8 @@ class Collection:
             else:
                 raise TypeError(f"Unsupported document type: {type(item)}")
 
-        return self._insert_internal(parsed_docs, log_to_wal=True)
+        with self._lock.write():
+            return self._insert_internal(parsed_docs, log_to_wal=True)
 
     def _insert_internal(self, documents: List[Document], log_to_wal: bool = True) -> int:
         if not documents:
@@ -192,6 +193,7 @@ class Collection:
 
         if new_vectors:
             stacked_new = np.vstack(new_vectors)
+            start_offset = self.vectors.shape[0]
             if self.vectors.shape[0] == 0:
                 self.vectors = stacked_new
             else:
@@ -201,10 +203,19 @@ class Collection:
             if not updated_docs:
                 self.bm25_index.add_documents(new_texts)
 
-        # If any documents were updated, rebuild the full BM25 index
+            # Incrementally add to ANN index if trained and clean
+            if self._ann_index is not None and self._ann_index.is_trained and not self._ann_dirty:
+                try:
+                    self._ann_index.add(stacked_new, start_idx=start_offset)
+                except Exception:
+                    self._ann_dirty = True
+
+        # If any documents were updated, rebuild the full BM25 index and mark ANN dirty
         if updated_docs:
             self.bm25_index = BM25Index()
             self.bm25_index.add_documents([d.text for d in self.documents])
+            if self._ann_index is not None:
+                self._ann_dirty = True
 
         if log_to_wal and self.wal:
             wal_docs = new_docs + updated_docs
@@ -225,6 +236,23 @@ class Collection:
 
         return len(self.documents)
 
+    def build_index(self, config: Optional[IVFConfig] = None) -> IVFIndex:
+        """
+        Builds or rebuilds the IVF-Flat approximate nearest neighbor index.
+        Enables sublinear O(n * nprobe / n_lists) search times for large collections.
+        """
+        with self._lock.write():
+            if len(self.vectors) == 0:
+                raise ValueError("Cannot build index on an empty collection.")
+
+            effective_config = config or self._ann_config or IVFConfig(n_lists=auto_n_lists(len(self.vectors)))
+            self._ann_config = effective_config
+            index = IVFIndex(effective_config)
+            index.rebuild(self.vectors)
+            self._ann_index = index
+            self._ann_dirty = False
+            return index
+
     def query(
         self,
         vector: Optional[Union[List[float], np.ndarray]] = None,
@@ -235,7 +263,8 @@ class Collection:
         rrf_constant: int = 60,
         dense_weight: float = 1.0,
         bm25_weight: float = 1.0,
-        alpha: Optional[float] = None
+        alpha: Optional[float] = None,
+        use_ann: bool = False
     ) -> List[SearchResult]:
         """
         Executes a vector, lexical, or hybrid search with optional metadata filtering.
@@ -249,224 +278,277 @@ class Collection:
             rrf_constant: Smoothing factor for Reciprocal Rank Fusion (default 60).
             dense_weight: Importance multiplier for dense score.
             bm25_weight: Importance multiplier for BM25 score.
-            alpha: If specified, uses linear convex fusion instead of RRF (alpha * dense + (1-alpha) * bm25).
+            alpha: If specified, uses linear convex fusion instead of RRF.
+            use_ann: If True and ANN index is available, executes sublinear IVF-Flat search.
         """
-        n = len(self.documents)
-        if n == 0:
-            return []
-
-        # 1. Compile in-flight metadata filter mask
-        metadata_list = [d.metadata for d in self.documents]
-        mask = FilterEngine.build_mask(metadata_list, filter)
-        valid_count = int(np.sum(mask))
-        if valid_count == 0:
-            return []
-
-        # 2. Vector distance scoring
-        has_vector = vector is not None
-        has_text = bool(text and text.strip())
-
-        dense_scores: Optional[np.ndarray] = None
-        if has_vector:
-            q_vec = np.asarray(vector, dtype=np.float32)
-            dense_scores = compute_distances(
-                q_vec,
-                self.vectors,
-                metric=self.metric,
-                is_normalized=(self.metric == Metric.COSINE)
-            )
-
-        # 3. Lexical BM25 scoring
-        bm25_scores: Optional[np.ndarray] = None
-        if has_text:
-            bm25_scores = self.bm25_index.score_query(text, mask=mask)
-
-        # 4. Route search execution based on mode
-        results: List[SearchResult] = []
-
-        if hybrid and has_vector and has_text and dense_scores is not None and bm25_scores is not None:
-            # Hybrid search combining dense + lexical
-            if alpha is not None:
-                fused = linear_score_fusion(dense_scores, bm25_scores, alpha=alpha, top_k=top_k, mask=mask)
-            else:
-                fused = reciprocal_rank_fusion(
-                    dense_scores,
-                    bm25_scores,
-                    top_k=top_k,
-                    k_constant=rrf_constant,
-                    dense_weight=dense_weight,
-                    bm25_weight=bm25_weight,
-                    mask=mask
-                )
-
-            for doc_idx, final_score, d_score, b_score in fused:
-                doc = self.documents[doc_idx]
-                results.append(SearchResult(
-                    id=doc.id,
-                    score=final_score,
-                    text=doc.text,
-                    metadata=doc.metadata,
-                    dense_score=d_score,
-                    bm25_score=b_score
-                ))
-
-        elif has_vector and dense_scores is not None:
-            # Pure vector search
-            valid_indices = np.where(mask)[0]
-            scores_valid = dense_scores[valid_indices]
-            
-            k = min(top_k, len(valid_indices))
-            top_local = np.argsort(-scores_valid)[:k]
-
-            for local_i in top_local:
-                doc_idx = valid_indices[local_i]
-                doc = self.documents[doc_idx]
-                results.append(SearchResult(
-                    id=doc.id,
-                    score=float(dense_scores[doc_idx]),
-                    text=doc.text,
-                    metadata=doc.metadata,
-                    dense_score=float(dense_scores[doc_idx]),
-                    bm25_score=None
-                ))
-
-        elif has_text and bm25_scores is not None:
-            # Pure lexical search
-            valid_indices = np.where(mask)[0]
-            scores_valid = bm25_scores[valid_indices]
-            
-            # Keep only items with non-zero BM25 match
-            positive_mask = scores_valid > 0.0
-            if not np.any(positive_mask):
+        with self._lock.read():
+            n = len(self.documents)
+            if n == 0:
                 return []
 
-            matched_indices = valid_indices[positive_mask]
-            matched_scores = scores_valid[positive_mask]
+            # 1. Compile in-flight metadata filter mask
+            metadata_list = [d.metadata for d in self.documents]
+            mask = FilterEngine.build_mask(metadata_list, filter)
+            valid_count = int(np.sum(mask))
+            if valid_count == 0:
+                return []
 
-            k = min(top_k, len(matched_indices))
-            top_local = np.argsort(-matched_scores)[:k]
+            # 2. Vector distance scoring
+            has_vector = vector is not None
+            has_text = bool(text and text.strip())
 
-            for local_i in top_local:
-                doc_idx = matched_indices[local_i]
-                doc = self.documents[doc_idx]
-                results.append(SearchResult(
-                    id=doc.id,
-                    score=float(bm25_scores[doc_idx]),
-                    text=doc.text,
-                    metadata=doc.metadata,
-                    dense_score=None,
-                    bm25_score=float(bm25_scores[doc_idx])
-                ))
-        else:
-            raise ValueError("Query must specify either a vector, a text string, or both for hybrid search.")
+            dense_scores: Optional[np.ndarray] = None
+            can_use_ann = (
+                use_ann and
+                has_vector and
+                self._ann_index is not None and
+                self._ann_index.is_trained and
+                not self._ann_dirty
+            )
 
-        return results
+            if has_vector:
+                q_vec = np.asarray(vector, dtype=np.float32)
+
+                # Pure vector search with active ANN index
+                if can_use_ann and not (hybrid and has_text):
+                    ann_indices, ann_scores = self._ann_index.search(
+                        q_vec,
+                        self.vectors,
+                        k=top_k,
+                        metric=self.metric,
+                        is_normalized=(self.metric == Metric.COSINE),
+                        mask=mask
+                    )
+                    results: List[SearchResult] = []
+                    for doc_idx, score in zip(ann_indices, ann_scores):
+                        doc = self.documents[doc_idx]
+                        results.append(SearchResult(
+                            id=doc.id,
+                            score=float(score),
+                            text=doc.text,
+                            metadata=doc.metadata,
+                            dense_score=float(score),
+                            bm25_score=None
+                        ))
+                    return results
+
+                # Exact vector search (or hybrid candidate scoring)
+                dense_scores = compute_distances(
+                    q_vec,
+                    self.vectors,
+                    metric=self.metric,
+                    is_normalized=(self.metric == Metric.COSINE)
+                )
+
+            # 3. Lexical BM25 scoring
+            bm25_scores: Optional[np.ndarray] = None
+            if has_text:
+                bm25_scores = self.bm25_index.score_query(text, mask=mask)
+
+            # 4. Route search execution based on mode
+            results: List[SearchResult] = []
+
+            if hybrid and has_vector and has_text and dense_scores is not None and bm25_scores is not None:
+                # Hybrid search combining dense + lexical
+                if alpha is not None:
+                    fused = linear_score_fusion(dense_scores, bm25_scores, alpha=alpha, top_k=top_k, mask=mask)
+                else:
+                    fused = reciprocal_rank_fusion(
+                        dense_scores,
+                        bm25_scores,
+                        top_k=top_k,
+                        k_constant=rrf_constant,
+                        dense_weight=dense_weight,
+                        bm25_weight=bm25_weight,
+                        mask=mask
+                    )
+
+                for doc_idx, final_score, d_score, b_score in fused:
+                    doc = self.documents[doc_idx]
+                    results.append(SearchResult(
+                        id=doc.id,
+                        score=final_score,
+                        text=doc.text,
+                        metadata=doc.metadata,
+                        dense_score=d_score,
+                        bm25_score=b_score
+                    ))
+
+            elif has_vector and dense_scores is not None:
+                # Pure vector search (brute-force)
+                valid_indices = np.where(mask)[0]
+                scores_valid = dense_scores[valid_indices]
+                
+                k = min(top_k, len(valid_indices))
+                top_local = np.argsort(-scores_valid)[:k]
+
+                for local_i in top_local:
+                    doc_idx = valid_indices[local_i]
+                    doc = self.documents[doc_idx]
+                    results.append(SearchResult(
+                        id=doc.id,
+                        score=float(dense_scores[doc_idx]),
+                        text=doc.text,
+                        metadata=doc.metadata,
+                        dense_score=float(dense_scores[doc_idx]),
+                        bm25_score=None
+                    ))
+
+            elif has_text and bm25_scores is not None:
+                # Pure lexical search
+                valid_indices = np.where(mask)[0]
+                scores_valid = bm25_scores[valid_indices]
+                
+                # Keep only items with non-zero BM25 match
+                positive_mask = scores_valid > 0.0
+                if not np.any(positive_mask):
+                    return []
+
+                matched_indices = valid_indices[positive_mask]
+                matched_scores = scores_valid[positive_mask]
+
+                k = min(top_k, len(matched_indices))
+                top_local = np.argsort(-matched_scores)[:k]
+
+                for local_i in top_local:
+                    doc_idx = matched_indices[local_i]
+                    doc = self.documents[doc_idx]
+                    results.append(SearchResult(
+                        id=doc.id,
+                        score=float(bm25_scores[doc_idx]),
+                        text=doc.text,
+                        metadata=doc.metadata,
+                        dense_score=None,
+                        bm25_score=float(bm25_scores[doc_idx])
+                    ))
+            else:
+                raise ValueError("Query must specify either a vector, a text string, or both for hybrid search.")
+
+            return results
 
     def get(self, doc_id: str) -> Optional[Document]:
         """Retrieves a single document by its unique ID."""
-        idx = self.id_to_index.get(doc_id)
-        if idx is None:
-            return None
-        return self.documents[idx]
+        with self._lock.read():
+            idx = self.id_to_index.get(doc_id)
+            if idx is None:
+                return None
+            return self.documents[idx]
 
     def delete(self, doc_ids: Union[str, List[str]]) -> int:
         """
         Deletes one or more documents by ID.
         Re-indexes collection memory and BM25 index.
         """
-        if isinstance(doc_ids, str):
-            doc_ids = [doc_ids]
+        with self._lock.write():
+            if isinstance(doc_ids, str):
+                doc_ids = [doc_ids]
 
-        ids_to_remove = set(doc_ids)
-        keep_indices = [i for i, d in enumerate(self.documents) if d.id not in ids_to_remove]
-        deleted_count = len(self.documents) - len(keep_indices)
+            ids_to_remove = set(doc_ids)
+            keep_indices = [i for i, d in enumerate(self.documents) if d.id not in ids_to_remove]
+            deleted_count = len(self.documents) - len(keep_indices)
 
-        if deleted_count == 0:
-            return 0
+            if deleted_count == 0:
+                return 0
 
-        # Rebuild contiguous memory structures
-        self.vectors = self.vectors[keep_indices]
-        self.documents = [self.documents[i] for i in keep_indices]
-        self.id_to_index = {doc.id: i for i, doc in enumerate(self.documents)}
+            # Rebuild contiguous memory structures
+            self.vectors = self.vectors[keep_indices]
+            self.documents = [self.documents[i] for i in keep_indices]
+            self.id_to_index = {doc.id: i for i, doc in enumerate(self.documents)}
 
-        # Rebuild BM25 index
-        self.bm25_index = BM25Index()
-        self.bm25_index.add_documents([d.text for d in self.documents])
+            # Rebuild BM25 index
+            self.bm25_index = BM25Index()
+            self.bm25_index.add_documents([d.text for d in self.documents])
 
-        return deleted_count
+            # Invalidate ANN index if present
+            if self._ann_index is not None:
+                self._ann_dirty = True
+
+            return deleted_count
 
     def count(self) -> int:
         """Returns the number of documents currently stored."""
-        return len(self.documents)
+        with self._lock.read():
+            return len(self.documents)
 
     def save(self, filepath: Optional[Union[str, Path]] = None) -> int:
         """Persists the collection to a memory-aligned .sutra binary file."""
-        target_path = filepath or self.storage_path
-        if not target_path:
-            raise ValueError("No storage path provided for collection save")
+        with self._lock.read():
+            target_path = filepath or self.storage_path
+            if not target_path:
+                raise ValueError("No storage path provided for collection save")
 
-        target_path = Path(target_path)
-        if target_path.suffix != ".sutra":
-            target_path = target_path.with_suffix(".sutra")
+            target_path = Path(target_path)
+            if target_path.suffix != ".sutra":
+                target_path = target_path.with_suffix(".sutra")
 
-        doc_payloads = [d.to_dict() for d in self.documents]
-        bytes_written = BinaryStorage.write(
-            target_path,
-            self.vectors,
-            doc_payloads,
-            self.metric.value
-        )
+            doc_payloads = [d.to_dict() for d in self.documents]
+            bytes_written = BinaryStorage.write(
+                target_path,
+                self.vectors,
+                doc_payloads,
+                self.metric.value
+            )
 
-        # Clear WAL on clean snapshot
-        if self.wal:
-            self.wal.clear()
+            # Clear WAL on clean snapshot
+            if self.wal:
+                self.wal.clear()
 
-        return bytes_written
+            return bytes_written
 
     def load(self, filepath: Optional[Union[str, Path]] = None) -> int:
         """Loads vectors and documents from a .sutra binary file."""
-        target_path = filepath or self.storage_path
-        if not target_path:
-            raise ValueError("No storage path provided for collection load")
+        with self._lock.write():
+            target_path = filepath or self.storage_path
+            if not target_path:
+                raise ValueError("No storage path provided for collection load")
 
-        target_path = Path(target_path)
-        if not target_path.exists():
-            raise FileNotFoundError(f"Cannot find database file at {target_path}")
+            target_path = Path(target_path)
+            if not target_path.exists():
+                raise FileNotFoundError(f"Cannot find database file at {target_path}")
 
-        vectors, doc_dicts, metric = BinaryStorage.read(target_path)
-        self.vectors = vectors
-        self.dimension = vectors.shape[1] if vectors.size > 0 else self.dimension
-        self.metric = Metric(metric)
+            vectors, doc_dicts, metric = BinaryStorage.read(target_path)
+            self.vectors = vectors
+            self.dimension = vectors.shape[1] if vectors.size > 0 else self.dimension
+            self.metric = Metric(metric)
 
-        self.documents = []
-        self.id_to_index = {}
-        for i, d in enumerate(doc_dicts):
-            vec = self.vectors[i] if i < len(self.vectors) else None
-            doc = Document.from_dict(d, vec)
-            self.documents.append(doc)
-            self.id_to_index[doc.id] = i
+            self.documents = []
+            self.id_to_index = {}
+            for i, d in enumerate(doc_dicts):
+                vec = self.vectors[i] if i < len(self.vectors) else None
+                doc = Document.from_dict(d, vec)
+                self.documents.append(doc)
+                self.id_to_index[doc.id] = i
 
-        # Re-index BM25
-        self.bm25_index = BM25Index()
-        self.bm25_index.add_documents([d.text for d in self.documents])
+            # Re-index BM25
+            self.bm25_index = BM25Index()
+            self.bm25_index.add_documents([d.text for d in self.documents])
 
-        # Replay WAL if any newer entries occurred
-        if self.wal:
-            self._replay_wal_if_present()
+            # Invalidate ANN index on load
+            if self._ann_index is not None:
+                self._ann_dirty = True
 
-        return len(self.documents)
+            # Replay WAL if any newer entries occurred
+            if self.wal:
+                self._replay_wal_if_present()
+
+            return len(self.documents)
 
     def stats(self) -> Dict[str, Any]:
         """Returns collection operational and memory statistics."""
-        vector_bytes = self.vectors.nbytes
-        return {
-            "name": self.name,
-            "count": len(self.documents),
-            "dimension": self.dimension,
-            "metric": self.metric.value,
-            "vector_memory_bytes": vector_bytes,
-            "vector_memory_mb": round(vector_bytes / (1024 * 1024), 3)
-        }
+        with self._lock.read():
+            vector_bytes = self.vectors.nbytes
+            res = {
+                "name": self.name,
+                "count": len(self.documents),
+                "dimension": self.dimension,
+                "metric": self.metric.value,
+                "vector_memory_bytes": vector_bytes,
+                "vector_memory_mb": round(vector_bytes / (1024 * 1024), 3)
+            }
+            if self._ann_index is not None:
+                res["ann"] = self._ann_index.stats()
+                res["ann"]["dirty"] = self._ann_dirty
+            return res
 
 
 class SutraDB:

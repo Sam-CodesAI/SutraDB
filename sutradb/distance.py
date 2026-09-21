@@ -56,6 +56,8 @@ def compute_distances(
     metric_str = metric.value if isinstance(metric, Metric) else str(metric).lower()
     q = np.asarray(query, dtype=np.float32).ravel()
     M = np.asarray(matrix, dtype=np.float32)
+    if M.size == 0:
+        return np.empty(0, dtype=np.float32)
 
     if M.ndim == 1:
         M = M.reshape(1, -1)

@@ -10,6 +10,7 @@ import sys
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
+from sutradb import __version__
 from sutradb.core import SutraDB, Collection
 
 
@@ -54,7 +55,7 @@ class SutraHTTPHandler(BaseHTTPRequestHandler):
         if path == "" or path == "/health":
             self._send_json(200, {
                 "status": "healthy",
-                "version": "2.1.1",
+                "version": __version__,
                 "collections": self.db.list_collections()
             })
             return
