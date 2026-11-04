@@ -87,6 +87,8 @@ class Collection:
         # Document and metadata stores
         self.documents: List[Document] = []
         self.id_to_index: Dict[str, int] = {}
+        # Soft-deletion tombstones (True if deleted, False if active)
+        self._tombstones: np.ndarray = np.zeros(0, dtype=bool)
         
         # BM25 lexical engine
         self.bm25_index = BM25Index()
@@ -122,6 +124,11 @@ class Collection:
                 vectors = [np.array(d["vector"], dtype=np.float32) for d in raw_docs]
                 docs = [Document.from_dict(d, v) for d, v in zip(raw_docs, vectors)]
                 self._insert_internal(docs, log_to_wal=False)
+            elif op == "delete":
+                ids = entry.get("ids", [])
+                if not ids and "id" in entry:
+                    ids = [entry["id"]]
+                self._delete_internal(ids, log_to_wal=False)
 
     def insert(self, documents: Union[Document, List[Document], Dict[str, Any], List[Dict[str, Any]]]) -> int:
         """
@@ -182,6 +189,8 @@ class Collection:
                 idx = self.id_to_index[doc.id]
                 self.vectors[idx] = vec
                 self.documents[idx] = doc
+                if idx < len(self._tombstones):
+                    self._tombstones[idx] = False
                 updated_docs.append(doc)
                 continue
 
@@ -200,6 +209,12 @@ class Collection:
                 self.vectors = np.vstack([self.vectors, stacked_new])
 
             self.documents.extend(new_docs)
+            new_tombstones = np.zeros(len(new_docs), dtype=bool)
+            if len(self._tombstones) == 0:
+                self._tombstones = new_tombstones
+            else:
+                self._tombstones = np.concatenate([self._tombstones, new_tombstones])
+
             if not updated_docs:
                 self.bm25_index.add_documents(new_texts)
 
@@ -234,7 +249,7 @@ class Collection:
                 }
                 self.wal.append(wal_payload)
 
-        return len(self.documents)
+        return int(np.sum(~self._tombstones)) if len(self._tombstones) > 0 else len(self.documents)
 
     def build_index(self, config: Optional[IVFConfig] = None) -> IVFIndex:
         """
@@ -286,9 +301,11 @@ class Collection:
             if n == 0:
                 return []
 
-            # 1. Compile in-flight metadata filter mask
+            # 1. Compile in-flight metadata filter mask with tombstone filtering
             metadata_list = [d.metadata for d in self.documents]
             mask = FilterEngine.build_mask(metadata_list, filter)
+            if len(self._tombstones) > 0:
+                mask = mask & (~self._tombstones)
             valid_count = int(np.sum(mask))
             if valid_count == 0:
                 return []
@@ -432,47 +449,53 @@ class Collection:
             idx = self.id_to_index.get(doc_id)
             if idx is None:
                 return None
+            if idx < len(self._tombstones) and self._tombstones[idx]:
+                return None
             return self.documents[idx]
 
     def delete(self, doc_ids: Union[str, List[str]]) -> int:
         """
-        Deletes one or more documents by ID.
-        Re-indexes collection memory and BM25 index.
+        Soft-deletes one or more documents by ID using tombstones.
+        Preserves vector memory alignment and ANN index integrity.
+        Records delete operations to WAL.
         """
         with self._lock.write():
-            if isinstance(doc_ids, str):
-                doc_ids = [doc_ids]
+            return self._delete_internal(doc_ids, log_to_wal=True)
 
-            ids_to_remove = set(doc_ids)
-            keep_indices = [i for i, d in enumerate(self.documents) if d.id not in ids_to_remove]
-            deleted_count = len(self.documents) - len(keep_indices)
+    def _delete_internal(self, doc_ids: Union[str, List[str]], log_to_wal: bool = True) -> int:
+        if isinstance(doc_ids, str):
+            doc_ids = [doc_ids]
 
-            if deleted_count == 0:
-                return 0
+        deleted_ids = []
+        for doc_id in doc_ids:
+            if doc_id in self.id_to_index:
+                idx = self.id_to_index[doc_id]
+                if idx < len(self._tombstones) and not self._tombstones[idx]:
+                    self._tombstones[idx] = True
+                    deleted_ids.append(doc_id)
+                del self.id_to_index[doc_id]
 
-            # Rebuild contiguous memory structures
-            self.vectors = self.vectors[keep_indices]
-            self.documents = [self.documents[i] for i in keep_indices]
-            self.id_to_index = {doc.id: i for i, doc in enumerate(self.documents)}
+        if not deleted_ids:
+            return 0
 
-            # Rebuild BM25 index
-            self.bm25_index = BM25Index()
-            self.bm25_index.add_documents([d.text for d in self.documents])
+        if log_to_wal and self.wal:
+            self.wal.append({
+                "op": "delete",
+                "ids": deleted_ids
+            })
 
-            # Invalidate ANN index if present
-            if self._ann_index is not None:
-                self._ann_dirty = True
-
-            return deleted_count
+        return len(deleted_ids)
 
     def count(self) -> int:
-        """Returns the number of documents currently stored."""
+        """Returns the number of active (non-tombstoned) documents currently stored."""
         with self._lock.read():
-            return len(self.documents)
+            if len(self._tombstones) == 0:
+                return len(self.documents)
+            return int(np.sum(~self._tombstones))
 
     def save(self, filepath: Optional[Union[str, Path]] = None) -> int:
         """Persists the collection to a memory-aligned .sutra binary file."""
-        with self._lock.read():
+        with self._lock.write():
             target_path = filepath or self.storage_path
             if not target_path:
                 raise ValueError("No storage path provided for collection save")
@@ -480,6 +503,19 @@ class Collection:
             target_path = Path(target_path)
             if target_path.suffix != ".sutra":
                 target_path = target_path.with_suffix(".sutra")
+
+            # Compact tombstoned documents before snapshotting
+            if len(self._tombstones) > 0 and np.any(self._tombstones):
+                active_indices = np.where(~self._tombstones)[0]
+                self.vectors = self.vectors[active_indices] if len(active_indices) > 0 else np.empty((0, self.dimension), dtype=np.float32)
+                self.documents = [self.documents[i] for i in active_indices]
+                self.id_to_index = {doc.id: i for i, doc in enumerate(self.documents)}
+                self._tombstones = np.zeros(len(self.documents), dtype=bool)
+                self.bm25_index = BM25Index()
+                if self.documents:
+                    self.bm25_index.add_documents([d.text for d in self.documents])
+                if self._ann_index is not None:
+                    self._ann_dirty = True
 
             doc_payloads = [d.to_dict() for d in self.documents]
             bytes_written = BinaryStorage.write(
@@ -519,6 +555,8 @@ class Collection:
                 self.documents.append(doc)
                 self.id_to_index[doc.id] = i
 
+            self._tombstones = np.zeros(len(self.documents), dtype=bool)
+
             # Re-index BM25
             self.bm25_index = BM25Index()
             self.bm25_index.add_documents([d.text for d in self.documents])
@@ -531,15 +569,18 @@ class Collection:
             if self.wal:
                 self._replay_wal_if_present()
 
-            return len(self.documents)
+            return int(np.sum(~self._tombstones)) if len(self._tombstones) > 0 else len(self.documents)
 
     def stats(self) -> Dict[str, Any]:
         """Returns collection operational and memory statistics."""
         with self._lock.read():
+            active_count = int(np.sum(~self._tombstones)) if len(self._tombstones) > 0 else len(self.documents)
             vector_bytes = self.vectors.nbytes
             res = {
                 "name": self.name,
-                "count": len(self.documents),
+                "count": active_count,
+                "total_records": len(self.documents),
+                "tombstones": int(np.sum(self._tombstones)) if len(self._tombstones) > 0 else 0,
                 "dimension": self.dimension,
                 "metric": self.metric.value,
                 "vector_memory_bytes": vector_bytes,

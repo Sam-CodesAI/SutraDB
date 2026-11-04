@@ -1,28 +1,274 @@
 """
-Zero-dependency HTTP REST micro-server for SutraDB.
-Enables running SutraDB as a standalone network microservice using Python's built-in http.server.
+Production ASGI HTTP REST server for SutraDB powered by FastAPI and Uvicorn.
+Provides bounded payload enforcement (max 10MB), high-throughput asynchronous execution,
+and complete document CRUD with vector & lexical query endpoints.
 """
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
 from pathlib import Path
 import sys
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlparse
+
+from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+import uvicorn
 
 from sutradb import __version__
 from sutradb.core import SutraDB, Collection
 
+# Bounded payload maximum size (10MB)
+MAX_PAYLOAD_SIZE = 10 * 1024 * 1024
+
+
+# Pydantic Schemas
+class CreateCollectionRequest(BaseModel):
+    name: str = Field(..., description="Unique collection name")
+    dimension: int = Field(..., gt=0, description="Dense vector dimension")
+    metric: str = Field("cosine", description="Distance metric: cosine, euclidean, dot")
+    enable_wal: bool = Field(False, description="Enable Write-Ahead Log durability")
+
+
+class QueryRequest(BaseModel):
+    vector: Optional[List[float]] = Field(None, description="Query dense embedding vector")
+    text: Optional[str] = Field(None, description="Lexical search query string")
+    filter: Optional[Dict[str, Any]] = Field(None, description="Compound metadata filter dictionary")
+    top_k: int = Field(10, gt=0, description="Max results to return")
+    hybrid: bool = Field(True, description="Enable hybrid dense + BM25 search")
+    alpha: Optional[float] = Field(None, description="Convex linear weight if not using RRF")
+    rrf_constant: int = Field(60, ge=1, description="Reciprocal Rank Fusion smoothing constant")
+    dense_weight: float = Field(1.0, ge=0.0, description="Dense score weight multiplier")
+    bm25_weight: float = Field(1.0, ge=0.0, description="BM25 score weight multiplier")
+    use_ann: bool = Field(False, description="Use IVF-Flat ANN index if trained")
+
+
+class BatchDeleteRequest(BaseModel):
+    ids: List[str] = Field(..., min_length=1, description="List of document IDs to delete")
+
+
+def create_app(data_dir: str = "./sutra_data", db: Optional[SutraDB] = None) -> FastAPI:
+    """Creates and configures the production FastAPI ASGI application."""
+    app = FastAPI(
+        title="SutraDB API",
+        version=__version__,
+        description="High-Performance Hybrid Vector & BM25 Search Engine in pure Python."
+    )
+
+    # Injected or initialized database instance
+    app.state.db = db if db is not None else SutraDB(persist_directory=data_dir)
+
+    # CORS Middleware
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # Bounded payload middleware (max 10MB)
+    @app.middleware("http")
+    async def enforce_payload_limit(request: Request, call_next):
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > MAX_PAYLOAD_SIZE:
+            return JSONResponse(
+                status_code=413,
+                content={"error": "Payload exceeds maximum allowed size of 10MB"}
+            )
+        return await call_next(request)
+
+    @app.get("/", tags=["Health"])
+    @app.get("/health", tags=["Health"])
+    def health_check():
+        active_db: SutraDB = app.state.db
+        return {
+            "status": "healthy",
+            "version": __version__,
+            "collections": active_db.list_collections()
+        }
+
+    @app.get("/collections", tags=["Collections"])
+    def list_collections():
+        active_db: SutraDB = app.state.db
+        cols = []
+        for name in active_db.list_collections():
+            try:
+                col = active_db.get_collection(name)
+                cols.append(col.stats())
+            except KeyError:
+                continue
+        return {"collections": cols}
+
+    @app.post("/collections", status_code=status.HTTP_201_CREATED, tags=["Collections"])
+    def create_collection(payload: CreateCollectionRequest):
+        active_db: SutraDB = app.state.db
+        try:
+            col = active_db.create_collection(
+                name=payload.name,
+                dimension=payload.dimension,
+                metric=payload.metric,
+                enable_wal=payload.enable_wal
+            )
+            return {"message": "Collection created", "stats": col.stats()}
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.get("/collections/{name}/stats", tags=["Collections"])
+    def get_collection_stats(name: str):
+        active_db: SutraDB = app.state.db
+        try:
+            col = active_db.get_collection(name)
+            return col.stats()
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
+
+    @app.delete("/collections/{name}", tags=["Collections"])
+    def drop_collection(name: str):
+        active_db: SutraDB = app.state.db
+        dropped = active_db.drop_collection(name)
+        if not dropped:
+            raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
+        return {"message": f"Collection '{name}' dropped successfully"}
+
+    @app.post("/collections/{name}/documents", tags=["Documents"])
+    @app.post("/collections/{name}/insert", tags=["Documents"])
+    async def insert_documents(name: str, request: Request):
+        active_db: SutraDB = app.state.db
+        try:
+            col = active_db.get_collection(name)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
+
+        try:
+            body = await request.json()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON body: {str(e)}")
+
+        docs = []
+        if isinstance(body, dict):
+            docs = body.get("documents", [body] if ("vector" in body or "text" in body) else [])
+        elif isinstance(body, list):
+            docs = body
+
+        if not docs:
+            raise HTTPException(status_code=400, detail="Missing 'documents' list")
+
+        try:
+            total_count = col.insert(docs)
+            return {"inserted": len(docs), "total_count": total_count}
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.get("/collections/{name}/documents/{id}", tags=["Documents"])
+    def get_document(name: str, id: str):
+        active_db: SutraDB = app.state.db
+        try:
+            col = active_db.get_collection(name)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
+
+        doc = col.get(id)
+        if doc is None:
+            raise HTTPException(status_code=404, detail=f"Document '{id}' not found in collection '{name}'")
+        return doc.to_dict()
+
+    @app.delete("/collections/{name}/documents/{id}", tags=["Documents"])
+    def delete_single_document(name: str, id: str):
+        active_db: SutraDB = app.state.db
+        try:
+            col = active_db.get_collection(name)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
+
+        deleted = col.delete(id)
+        if deleted == 0:
+            raise HTTPException(status_code=404, detail=f"Document '{id}' not found in collection '{name}'")
+        return {"deleted": deleted, "message": f"Document '{id}' deleted successfully"}
+
+    @app.delete("/collections/{name}/documents", tags=["Documents"])
+    async def delete_documents_batch(name: str, request: Request):
+        active_db: SutraDB = app.state.db
+        try:
+            col = active_db.get_collection(name)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
+
+        try:
+            body = await request.json()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON body: {str(e)}")
+
+        ids = body.get("ids", []) if isinstance(body, dict) else (body if isinstance(body, list) else [])
+        if not ids:
+            raise HTTPException(status_code=400, detail="Missing 'ids' list for batch deletion")
+
+        deleted = col.delete(ids)
+        return {"deleted": deleted, "message": f"Deleted {deleted} documents"}
+
+    @app.post("/collections/{name}/query", tags=["Query"])
+    def query_collection(name: str, payload: QueryRequest):
+        active_db: SutraDB = app.state.db
+        try:
+            col = active_db.get_collection(name)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
+
+        try:
+            results = col.query(
+                vector=payload.vector,
+                text=payload.text,
+                filter=payload.filter,
+                top_k=payload.top_k,
+                hybrid=payload.hybrid,
+                alpha=payload.alpha,
+                rrf_constant=payload.rrf_constant,
+                dense_weight=payload.dense_weight,
+                bm25_weight=payload.bm25_weight,
+                use_ann=payload.use_ann
+            )
+            return {
+                "count": len(results),
+                "results": [r.to_dict() for r in results]
+            }
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post("/collections/{name}/save", tags=["Persistence"])
+    def save_collection(name: str):
+        active_db: SutraDB = app.state.db
+        try:
+            col = active_db.get_collection(name)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
+
+        try:
+            bytes_written = col.save()
+            return {"message": "Snapshot saved", "bytes": bytes_written}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    return app
+
+
+# Module-level default application instance
+app = create_app()
+
 
 class SutraHTTPHandler(BaseHTTPRequestHandler):
-    """Handles REST HTTP requests for SutraDB."""
+    """
+    Backwards-compatible HTTP request handler using standard library http.server.
+    Supports complete document CRUD and bounded payload size checks.
+    """
 
-    db: SutraDB = None  # Injected on server startup
+    db: Optional[SutraDB] = None  # Injected on server startup
 
-    def _send_json(self, status: int, payload: Dict[str, Any]) -> None:
+    def _send_json(self, status_code: int, payload: Dict[str, Any]) -> None:
         """Sends a JSON response with CORS headers."""
         data = json.dumps(payload, separators=(',', ':')).encode("utf-8")
-        self.send_response(status)
+        self.send_response(status_code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -32,9 +278,12 @@ class SutraHTTPHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _read_json(self) -> Optional[Dict[str, Any]]:
-        """Reads and parses JSON payload from request body."""
+        """Reads and parses JSON payload from request body with size bounds."""
         content_length = int(self.headers.get("Content-Length", 0))
         if content_length == 0:
+            return None
+        if content_length > MAX_PAYLOAD_SIZE:
+            self._send_json(413, {"error": "Payload exceeds maximum allowed size of 10MB"})
             return None
         body = self.rfile.read(content_length)
         return json.loads(body.decode("utf-8"))
@@ -56,25 +305,44 @@ class SutraHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(200, {
                 "status": "healthy",
                 "version": __version__,
-                "collections": self.db.list_collections()
+                "collections": self.db.list_collections() if self.db else []
             })
             return
 
         if path == "/collections":
             cols = []
-            for name in self.db.list_collections():
-                col = self.db.get_collection(name)
-                cols.append(col.stats())
+            if self.db:
+                for name in self.db.list_collections():
+                    try:
+                        col = self.db.get_collection(name)
+                        cols.append(col.stats())
+                    except KeyError:
+                        continue
             self._send_json(200, {"collections": cols})
             return
 
-        # /collections/<name>/stats
         parts = path.split("/")
+        # /collections/<name>/stats
         if len(parts) == 4 and parts[1] == "collections" and parts[3] == "stats":
             col_name = parts[2]
             try:
                 col = self.db.get_collection(col_name)
                 self._send_json(200, col.stats())
+            except KeyError:
+                self._send_json(404, {"error": f"Collection '{col_name}' not found"})
+            return
+
+        # /collections/<name>/documents/<id>
+        if len(parts) == 5 and parts[1] == "collections" and parts[3] == "documents":
+            col_name = parts[2]
+            doc_id = parts[4]
+            try:
+                col = self.db.get_collection(col_name)
+                doc = col.get(doc_id)
+                if doc is None:
+                    self._send_json(404, {"error": f"Document '{doc_id}' not found in collection '{col_name}'"})
+                else:
+                    self._send_json(200, doc.to_dict())
             except KeyError:
                 self._send_json(404, {"error": f"Collection '{col_name}' not found"})
             return
@@ -88,7 +356,10 @@ class SutraHTTPHandler(BaseHTTPRequestHandler):
         parts = path.split("/")
 
         try:
-            body = self._read_json() or {}
+            body = self._read_json()
+            if body is None and int(self.headers.get("Content-Length", 0)) > MAX_PAYLOAD_SIZE:
+                return
+            body = body or {}
         except Exception as e:
             self._send_json(400, {"error": f"Invalid JSON body: {str(e)}"})
             return
@@ -98,22 +369,23 @@ class SutraHTTPHandler(BaseHTTPRequestHandler):
             name = body.get("name")
             dimension = body.get("dimension")
             metric = body.get("metric", "cosine")
+            enable_wal = bool(body.get("enable_wal", False))
             if not name or not dimension:
                 self._send_json(400, {"error": "Fields 'name' and 'dimension' are required"})
                 return
             try:
-                col = self.db.create_collection(name=name, dimension=int(dimension), metric=metric)
+                col = self.db.create_collection(name=name, dimension=int(dimension), metric=metric, enable_wal=enable_wal)
                 self._send_json(201, {"message": "Collection created", "stats": col.stats()})
             except Exception as e:
                 self._send_json(400, {"error": str(e)})
             return
 
-        # POST /collections/<name>/insert
-        if len(parts) == 4 and parts[1] == "collections" and parts[3] == "insert":
+        # POST /collections/<name>/documents or POST /collections/<name>/insert
+        if len(parts) == 4 and parts[1] == "collections" and parts[3] in ("insert", "documents"):
             col_name = parts[2]
             try:
                 col = self.db.get_collection(col_name)
-                docs = body.get("documents", [])
+                docs = body.get("documents", []) if isinstance(body, dict) else (body if isinstance(body, list) else [])
                 if not docs:
                     self._send_json(400, {"error": "Missing 'documents' list"})
                     return
@@ -136,6 +408,10 @@ class SutraHTTPHandler(BaseHTTPRequestHandler):
                 top_k = int(body.get("top_k", 10))
                 hybrid = bool(body.get("hybrid", True))
                 alpha = body.get("alpha")
+                rrf_constant = int(body.get("rrf_constant", 60))
+                dense_weight = float(body.get("dense_weight", 1.0))
+                bm25_weight = float(body.get("bm25_weight", 1.0))
+                use_ann = bool(body.get("use_ann", False))
 
                 results = col.query(
                     vector=vector,
@@ -143,7 +419,11 @@ class SutraHTTPHandler(BaseHTTPRequestHandler):
                     filter=filter_spec,
                     top_k=top_k,
                     hybrid=hybrid,
-                    alpha=float(alpha) if alpha is not None else None
+                    alpha=float(alpha) if alpha is not None else None,
+                    rrf_constant=rrf_constant,
+                    dense_weight=dense_weight,
+                    bm25_weight=bm25_weight,
+                    use_ann=use_ann
                 )
                 self._send_json(200, {
                     "count": len(results),
@@ -186,6 +466,37 @@ class SutraHTTPHandler(BaseHTTPRequestHandler):
                 self._send_json(404, {"error": f"Collection '{col_name}' not found"})
             return
 
+        # DELETE /collections/<name>/documents/<id>
+        if len(parts) == 5 and parts[1] == "collections" and parts[3] == "documents":
+            col_name = parts[2]
+            doc_id = parts[4]
+            try:
+                col = self.db.get_collection(col_name)
+                deleted = col.delete(doc_id)
+                if deleted > 0:
+                    self._send_json(200, {"deleted": deleted, "message": f"Document '{doc_id}' deleted successfully"})
+                else:
+                    self._send_json(404, {"error": f"Document '{doc_id}' not found in collection '{col_name}'"})
+            except KeyError:
+                self._send_json(404, {"error": f"Collection '{col_name}' not found"})
+            return
+
+        # DELETE /collections/<name>/documents (batch)
+        if len(parts) == 4 and parts[1] == "collections" and parts[3] == "documents":
+            col_name = parts[2]
+            try:
+                col = self.db.get_collection(col_name)
+                body = self._read_json() or {}
+                ids = body.get("ids", []) if isinstance(body, dict) else (body if isinstance(body, list) else [])
+                if not ids:
+                    self._send_json(400, {"error": "Missing 'ids' list for batch deletion"})
+                    return
+                deleted = col.delete(ids)
+                self._send_json(200, {"deleted": deleted, "message": f"Deleted {deleted} documents"})
+            except KeyError:
+                self._send_json(404, {"error": f"Collection '{col_name}' not found"})
+            return
+
         self._send_json(404, {"error": "Endpoint not found"})
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -194,19 +505,13 @@ class SutraHTTPHandler(BaseHTTPRequestHandler):
 
 
 def run_server(host: str = "0.0.0.0", port: int = 8765, data_dir: str = "./sutra_data") -> None:
-    """Starts the SutraDB HTTP server."""
-    db = SutraDB(persist_directory=data_dir)
-    SutraHTTPHandler.db = db
-    server = HTTPServer((host, port), SutraHTTPHandler)
-    print(f"⚡ SutraDB v2.1 REST server running at http://{host}:{port}")
+    """Starts the SutraDB ASGI server with Uvicorn."""
+    app_instance = create_app(data_dir=data_dir)
+    print(f"⚡ SutraDB v{__version__} Production ASGI server running at http://{host}:{port}")
     print(f"📁 Persistence directory: {Path(data_dir).resolve()}")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nShutting down SutraDB server gracefully...")
-        server.server_close()
+    uvicorn.run(app_instance, host=host, port=port, log_level="info")
 
 
 if __name__ == "__main__":
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
-    run_server(port=port)
+    port_arg = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
+    run_server(port=port_arg)

@@ -18,6 +18,8 @@ def reciprocal_rank_fusion(
 ) -> List[Tuple[int, float, float, float]]:
     """
     Combines dense similarity scores and BM25 lexical scores using Reciprocal Rank Fusion (RRF).
+    Candidate-pruned: evaluates top M candidates from dense and top M from BM25, computing
+    RRF scores strictly over the candidate union.
     
     Formula:
         RRF_Score(d) = (w_dense / (k + rank_dense(d))) + (w_bm25 / (k + rank_bm25(d)))
@@ -35,35 +37,72 @@ def reciprocal_rank_fusion(
     if len(valid_indices) == 0:
         return []
 
-    # Map doc_index -> RRF accumulator
-    rrf_map: Dict[int, float] = {idx: 0.0 for idx in valid_indices}
+    # Bound candidate count M: min(top_k * 4, 200)
+    M = min(top_k * 4, 200)
 
-    # Dense ranking (sort valid indices by dense score descending)
+    # 1. Top M candidates from dense search
     dense_valid = dense_scores[valid_indices]
-    dense_sorted_local = np.argsort(-dense_valid)
-    for rank, local_idx in enumerate(dense_sorted_local, start=1):
-        global_idx = valid_indices[local_idx]
-        if dense_scores[global_idx] > 0.0:
-            rrf_map[global_idx] += dense_weight / (k_constant + rank)
+    k_dense = min(M, len(dense_valid))
+    if k_dense < len(dense_valid):
+        top_dense_local = np.argpartition(-dense_valid, k_dense - 1)[:k_dense]
+        top_dense_local = top_dense_local[np.argsort(-dense_valid[top_dense_local])]
+    else:
+        top_dense_local = np.argsort(-dense_valid)
 
-    # BM25 ranking (sort valid indices by BM25 score descending)
-    # Only award BM25 RRF rank if document had non-zero BM25 score
+    dense_candidates = [int(valid_indices[i]) for i in top_dense_local]
+    dense_ranks: Dict[int, int] = {}
+    for rank, doc_idx in enumerate(dense_candidates, start=1):
+        if dense_scores[doc_idx] > 0.0:
+            dense_ranks[doc_idx] = rank
+
+    # If all candidate dense scores are non-positive (e.g. opposing cosine), award rank to all candidates
+    if not dense_ranks and len(dense_candidates) > 0:
+        dense_ranks = {
+            doc_idx: rank for rank, doc_idx in enumerate(dense_candidates, start=1)
+        }
+
+    # 2. Top M candidates from BM25 lexical search (only considering positive BM25 scores)
     bm25_valid = bm25_scores[valid_indices]
-    bm25_sorted_local = np.argsort(-bm25_valid)
-    for rank, local_idx in enumerate(bm25_sorted_local, start=1):
-        global_idx = valid_indices[local_idx]
-        if bm25_scores[global_idx] > 0.0:
-            rrf_map[global_idx] += bm25_weight / (k_constant + rank)
+    pos_mask = bm25_valid > 0.0
+    pos_indices = valid_indices[pos_mask]
+    pos_scores = bm25_valid[pos_mask]
 
-    # Sort candidates by combined RRF score
-    sorted_candidates = sorted(rrf_map.items(), key=lambda item: item[1], reverse=True)
-    top_candidates = sorted_candidates[:top_k]
+    bm25_candidates: List[int] = []
+    bm25_ranks: Dict[int, int] = {}
+    if len(pos_scores) > 0:
+        k_bm25 = min(M, len(pos_scores))
+        if k_bm25 < len(pos_scores):
+            top_bm25_local = np.argpartition(-pos_scores, k_bm25 - 1)[:k_bm25]
+            top_bm25_local = top_bm25_local[np.argsort(-pos_scores[top_bm25_local])]
+        else:
+            top_bm25_local = np.argsort(-pos_scores)
+        bm25_candidates = [int(pos_indices[i]) for i in top_bm25_local]
+        bm25_ranks = {
+            doc_idx: rank for rank, doc_idx in enumerate(bm25_candidates, start=1)
+        }
 
-    results = [
-        (idx, score, float(dense_scores[idx]), float(bm25_scores[idx]))
-        for idx, score in top_candidates
-    ]
-    return results
+    # 3. Candidate union
+    candidate_union = list(dict.fromkeys(dense_candidates + bm25_candidates))
+
+    # 4. Compute RRF scores strictly over the candidate union
+    scored_candidates: List[Tuple[int, float, float, float]] = []
+    for doc_idx in candidate_union:
+        score = 0.0
+        if doc_idx in dense_ranks:
+            score += dense_weight / (k_constant + dense_ranks[doc_idx])
+        if doc_idx in bm25_ranks:
+            score += bm25_weight / (k_constant + bm25_ranks[doc_idx])
+
+        scored_candidates.append((
+            doc_idx,
+            score,
+            float(dense_scores[doc_idx]),
+            float(bm25_scores[doc_idx])
+        ))
+
+    # 5. Sort candidate union by combined RRF score descending
+    scored_candidates.sort(key=lambda item: item[1], reverse=True)
+    return scored_candidates[:top_k]
 
 
 def linear_score_fusion(
