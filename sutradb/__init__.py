@@ -10,7 +10,7 @@ from sutradb.bm25 import BM25Index
 from sutradb.fusion import reciprocal_rank_fusion, linear_score_fusion
 from sutradb.ann import IVFIndex, IVFConfig, auto_n_lists
 
-__version__ = "2.1.2"
+__version__ = "1.0.0"
 __all__ = [
     "SutraDB",
     "Collection",
