@@ -24,7 +24,7 @@ def test_ann_exports():
     assert callable(auto_n_lists)
     assert auto_n_lists(100) == 16
     assert auto_n_lists(10_000) == 100
-    assert __version__ == "2.1.2"
+    assert __version__ == "1.0.0"
 
 
 def test_ivf_index_direct():
