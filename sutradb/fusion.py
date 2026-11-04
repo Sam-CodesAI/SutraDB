@@ -29,7 +29,7 @@ def reciprocal_rank_fusion(
         Sorted descending by final_rrf_score.
     """
     n = len(dense_scores)
-    if n == 0:
+    if top_k <= 0 or n == 0:
         return []
 
     # Filter by mask if provided
@@ -55,7 +55,7 @@ def reciprocal_rank_fusion(
         if dense_scores[doc_idx] > 0.0:
             dense_ranks[doc_idx] = rank
 
-    # If all candidate dense scores are non-positive (e.g. opposing cosine), award rank to all candidates
+    # If all candidate dense scores are non-positive (e.g. opposing/orthogonal cosine), award rank to all candidates
     if not dense_ranks and len(dense_candidates) > 0:
         dense_ranks = {
             doc_idx: rank for rank, doc_idx in enumerate(dense_candidates, start=1)
@@ -100,8 +100,8 @@ def reciprocal_rank_fusion(
             float(bm25_scores[doc_idx])
         ))
 
-    # 5. Sort candidate union by combined RRF score descending
-    scored_candidates.sort(key=lambda item: item[1], reverse=True)
+    # 5. Sort candidate union by combined RRF score descending with deterministic tie-breaking
+    scored_candidates.sort(key=lambda item: (item[1], item[2], item[3]), reverse=True)
     return scored_candidates[:top_k]
 
 

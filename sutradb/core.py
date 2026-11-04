@@ -26,12 +26,15 @@ class Document:
     text: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
+    def to_dict(self, include_vector: bool = False) -> Dict[str, Any]:
+        data = {
             "id": self.id,
             "text": self.text,
             "metadata": self.metadata
         }
+        if include_vector and self.vector is not None:
+            data["vector"] = self.vector.tolist() if isinstance(self.vector, np.ndarray) else list(self.vector)
+        return data
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any], vector: Optional[np.ndarray] = None) -> "Document":
@@ -688,6 +691,9 @@ class SutraDB:
         """Removes a collection from memory and deletes its files on disk."""
         col = self.collections.pop(name, None)
         dropped = col is not None
+
+        if col is not None and col.wal is not None:
+            col.wal.close()
 
         if self.persist_dir:
             sutra_file = self.persist_dir / f"{name}.sutra"

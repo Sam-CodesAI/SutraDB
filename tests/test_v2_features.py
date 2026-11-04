@@ -242,6 +242,7 @@ def test_fastapi_server_full_crud_and_bounds(tmp_path: Path):
     doc_data = resp.json()
     assert doc_data["id"] == "k1"
     assert doc_data["text"] == "Kubernetes orchestration patterns"
+    assert doc_data["vector"] == [1.0, 0.0, 0.0]
 
     # 5. Query collection
     resp = client.post("/collections/knowledge/query", json={
@@ -281,3 +282,159 @@ def test_fastapi_server_full_crud_and_bounds(tmp_path: Path):
     )
     assert resp.status_code == 413
     assert "Payload exceeds maximum allowed size" in resp.json()["error"]
+
+    # 10. Malformed Content-Length header returns HTTP 400
+    resp = client.post(
+        "/collections/knowledge/documents",
+        content=b"{}",
+        headers={"Content-Length": "not-a-number", "Content-Type": "application/json"}
+    )
+    assert resp.status_code == 400
+
+    # 11. Chunked streaming body exceeding 10MB returns HTTP 413
+    def large_stream():
+        chunk = b"x" * (1024 * 1024)
+        for _ in range(11):
+            yield chunk
+
+    resp = client.post(
+        "/collections/knowledge/documents",
+        content=large_stream(),
+        headers={"Content-Type": "application/json"}
+    )
+    assert resp.status_code == 413
+    assert "Payload exceeds maximum allowed size" in resp.json()["error"]
+
+
+def test_reader_reentrancy_under_waiting_writer():
+    """
+    Verifies that a reader thread performing nested reads does NOT deadlock
+    when a writer is waiting in the queue.
+    """
+    lock = ReadWriteLock()
+    events = []
+
+    def reader():
+        with lock.read():
+            events.append("r1_acquired")
+            time.sleep(0.05)
+            # Re-entrant read acquisition while writer is waiting
+            with lock.read():
+                events.append("r1_nested_acquired")
+            events.append("r1_releasing")
+
+    def writer():
+        time.sleep(0.02)
+        with lock.write():
+            events.append("writer_acquired")
+
+    t_r = threading.Thread(target=reader)
+    t_w = threading.Thread(target=writer)
+    t_r.start()
+    t_w.start()
+
+    t_r.join(timeout=2.0)
+    t_w.join(timeout=2.0)
+
+    assert not t_r.is_alive(), "Reader deadlocked during nested read!"
+    assert not t_w.is_alive(), "Writer deadlocked!"
+    assert events == ["r1_acquired", "r1_nested_acquired", "r1_releasing", "writer_acquired"]
+
+
+def test_lock_upgrades_and_unmatched_releases():
+    """
+    Verifies that illegal lock operations raise appropriate RuntimeErrors:
+    - Lock upgrade (read -> write) raises RuntimeError to avoid self-deadlock.
+    - Unmatched release calls raise RuntimeError.
+    - Writer re-entrancy succeeds.
+    """
+    lock = ReadWriteLock()
+
+    # Writer re-entrancy
+    with lock.write():
+        with lock.write():
+            pass
+
+    # Lock upgrade prohibited
+    with lock.read():
+        with pytest.raises(RuntimeError, match="Cannot upgrade read lock to write lock"):
+            with lock.write():
+                pass
+
+    # Unmatched releases
+    with pytest.raises(RuntimeError, match="Cannot release read lock"):
+        lock._release_read()
+
+    with pytest.raises(RuntimeError, match="Cannot release write lock"):
+        lock._release_write()
+
+
+def test_reinsert_deleted_document_and_compaction(tmp_path: Path):
+    """
+    Tests edge case: Rapid re-insertion of a previously soft-deleted document ID.
+    Ensures correct retrieval, tombstone clearing, and clean compaction on save().
+    """
+    save_file = tmp_path / "reinsert_test.sutra"
+    col = Collection(name="reinsert_col", dimension=3, metric="cosine", storage_path=save_file)
+
+    # 1. Insert initial
+    col.insert(Document(id="doc_x", vector=[1.0, 0.0, 0.0], text="initial version"))
+    assert col.count() == 1
+    assert col.get("doc_x").text == "initial version"
+
+    # 2. Delete doc_x
+    del_count = col.delete("doc_x")
+    assert del_count == 1
+    assert col.count() == 0
+    assert col.get("doc_x") is None
+
+    # 3. Re-insert doc_x with new vector and text
+    col.insert(Document(id="doc_x", vector=[0.0, 1.0, 0.0], text="updated second version"))
+    assert col.count() == 1
+    doc_retrieved = col.get("doc_x")
+    assert doc_retrieved is not None
+    assert doc_retrieved.text == "updated second version"
+
+    # 4. Save and verify compaction
+    col.save()
+    assert col.stats()["tombstones"] == 0
+    assert col.stats()["count"] == 1
+    assert col.stats()["total_records"] == 1
+
+    # 5. Reload into fresh collection
+    col_reloaded = Collection(name="reinsert_col", dimension=3, storage_path=save_file)
+    col_reloaded.load()
+    assert col_reloaded.count() == 1
+    assert col_reloaded.get("doc_x").text == "updated second version"
+
+
+def test_drop_collection_wal_closure(tmp_path: Path):
+    """
+    Verifies that SutraDB.drop_collection safely closes open WAL file descriptors
+    before unlinking disk files.
+    """
+    db_dir = tmp_path / "drop_db"
+    db = SutraDB(persist_directory=db_dir)
+    col = db.create_collection("ephemeral", dimension=2, enable_wal=True)
+    col.insert(Document(id="e1", vector=[1.0, 0.0], text="temp"))
+
+    wal_handle = col.wal._file
+    assert not wal_handle.closed
+
+    dropped = db.drop_collection("ephemeral")
+    assert dropped is True
+    assert wal_handle.closed
+    assert "ephemeral" not in db.list_collections()
+
+
+def test_rrf_zero_and_negative_top_k():
+    """
+    Verifies that reciprocal_rank_fusion handles top_k <= 0 and empty scores cleanly.
+    """
+    dense = np.array([1.0, 0.5], dtype=np.float32)
+    bm25 = np.array([0.8, 0.2], dtype=np.float32)
+
+    assert reciprocal_rank_fusion(dense, bm25, top_k=0) == []
+    assert reciprocal_rank_fusion(dense, bm25, top_k=-5) == []
+    assert reciprocal_rank_fusion(np.empty(0, dtype=np.float32), np.empty(0, dtype=np.float32), top_k=5) == []
+

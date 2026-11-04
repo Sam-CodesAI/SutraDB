@@ -37,6 +37,7 @@ class ReadWriteLock:
         self._writer_thread: threading.Thread | None = None
         self._waiting_writers: int = 0
         self._write_count: int = 0
+        self._reader_threads: dict[int, int] = {}
 
     @contextmanager
     def read(self) -> Generator[None, None, None]:
@@ -58,26 +59,47 @@ class ReadWriteLock:
 
     def _acquire_read(self) -> None:
         with self._cond:
+            ident = threading.get_ident()
             # Allow re-entrant read from writer thread
             if self._writer and self._writer_thread == threading.current_thread():
                 self._readers += 1
+                self._reader_threads[ident] = self._reader_threads.get(ident, 0) + 1
                 return
-            # Writer-preference: block incoming readers when a writer is active OR waiting
+            # Allow re-entrant read from thread that already holds read lock (avoids deadlock)
+            if ident in self._reader_threads:
+                self._readers += 1
+                self._reader_threads[ident] += 1
+                return
+            # Writer-preference: block new incoming readers when a writer is active OR waiting
             while self._writer or self._waiting_writers > 0:
                 self._cond.wait()
             self._readers += 1
+            self._reader_threads[ident] = 1
 
     def _release_read(self) -> None:
         with self._cond:
+            ident = threading.get_ident()
+            is_writer_holding = self._writer and self._writer_thread == threading.current_thread()
+            if ident not in self._reader_threads and not is_writer_holding:
+                raise RuntimeError("Cannot release read lock: lock not acquired by current thread")
             self._readers -= 1
+            if ident in self._reader_threads:
+                self._reader_threads[ident] -= 1
+                if self._reader_threads[ident] == 0:
+                    del self._reader_threads[ident]
             if self._readers == 0:
                 self._cond.notify_all()
 
     def _acquire_write(self) -> None:
         with self._cond:
+            ident = threading.get_ident()
+            # Allow re-entrant write from writer thread
             if self._writer and self._writer_thread == threading.current_thread():
                 self._write_count += 1
                 return
+            # Prohibit lock upgrades from reader to writer to avoid instant self-deadlock
+            if ident in self._reader_threads:
+                raise RuntimeError("Cannot upgrade read lock to write lock (deadlock prevention)")
             self._waiting_writers += 1
             try:
                 while self._writer or self._readers > 0:
@@ -90,6 +112,8 @@ class ReadWriteLock:
 
     def _release_write(self) -> None:
         with self._cond:
+            if not self._writer or self._writer_thread != threading.current_thread():
+                raise RuntimeError("Cannot release write lock: lock not held by current thread")
             self._write_count -= 1
             if self._write_count == 0:
                 self._writer = False

@@ -24,6 +24,19 @@ from sutradb.core import SutraDB, Collection
 MAX_PAYLOAD_SIZE = 10 * 1024 * 1024
 
 
+class PayloadTooLargeError(Exception):
+    """Raised when streaming request body exceeds bounded limit."""
+    pass
+
+
+def _is_payload_too_large(exc: BaseException) -> bool:
+    if isinstance(exc, PayloadTooLargeError):
+        return True
+    if hasattr(exc, "exceptions"):
+        return any(_is_payload_too_large(sub) for sub in exc.exceptions)
+    return False
+
+
 # Pydantic Schemas
 class CreateCollectionRequest(BaseModel):
     name: str = Field(..., description="Unique collection name")
@@ -73,12 +86,42 @@ def create_app(data_dir: str = "./sutra_data", db: Optional[SutraDB] = None) -> 
     @app.middleware("http")
     async def enforce_payload_limit(request: Request, call_next):
         content_length = request.headers.get("content-length")
-        if content_length and int(content_length) > MAX_PAYLOAD_SIZE:
-            return JSONResponse(
-                status_code=413,
-                content={"error": "Payload exceeds maximum allowed size of 10MB"}
-            )
-        return await call_next(request)
+        if content_length:
+            try:
+                if int(content_length) > MAX_PAYLOAD_SIZE:
+                    return JSONResponse(
+                        status_code=413,
+                        content={"error": "Payload exceeds maximum allowed size of 10MB"}
+                    )
+            except ValueError:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "Invalid Content-Length header"}
+                )
+
+        received_bytes = 0
+        original_receive = request._receive
+
+        async def bounded_receive():
+            nonlocal received_bytes
+            message = await original_receive()
+            if message.get("type") == "http.request":
+                body_chunk = message.get("body", b"")
+                received_bytes += len(body_chunk)
+                if received_bytes > MAX_PAYLOAD_SIZE:
+                    raise PayloadTooLargeError("Payload exceeds maximum allowed size of 10MB")
+            return message
+
+        request._receive = bounded_receive
+        try:
+            return await call_next(request)
+        except Exception as e:
+            if _is_payload_too_large(e):
+                return JSONResponse(
+                    status_code=413,
+                    content={"error": "Payload exceeds maximum allowed size of 10MB"}
+                )
+            raise
 
     @app.get("/", tags=["Health"])
     @app.get("/health", tags=["Health"])
@@ -145,6 +188,8 @@ def create_app(data_dir: str = "./sutra_data", db: Optional[SutraDB] = None) -> 
         try:
             body = await request.json()
         except Exception as e:
+            if _is_payload_too_large(e):
+                raise
             raise HTTPException(status_code=400, detail=f"Invalid JSON body: {str(e)}")
 
         docs = []
@@ -173,7 +218,7 @@ def create_app(data_dir: str = "./sutra_data", db: Optional[SutraDB] = None) -> 
         doc = col.get(id)
         if doc is None:
             raise HTTPException(status_code=404, detail=f"Document '{id}' not found in collection '{name}'")
-        return doc.to_dict()
+        return doc.to_dict(include_vector=True)
 
     @app.delete("/collections/{name}/documents/{id}", tags=["Documents"])
     def delete_single_document(name: str, id: str):
@@ -199,6 +244,8 @@ def create_app(data_dir: str = "./sutra_data", db: Optional[SutraDB] = None) -> 
         try:
             body = await request.json()
         except Exception as e:
+            if _is_payload_too_large(e):
+                raise
             raise HTTPException(status_code=400, detail=f"Invalid JSON body: {str(e)}")
 
         ids = body.get("ids", []) if isinstance(body, dict) else (body if isinstance(body, list) else [])
@@ -279,7 +326,12 @@ class SutraHTTPHandler(BaseHTTPRequestHandler):
 
     def _read_json(self) -> Optional[Dict[str, Any]]:
         """Reads and parses JSON payload from request body with size bounds."""
-        content_length = int(self.headers.get("Content-Length", 0))
+        content_length_header = self.headers.get("Content-Length", "0")
+        try:
+            content_length = int(content_length_header)
+        except ValueError:
+            self._send_json(400, {"error": "Invalid Content-Length header"})
+            return None
         if content_length == 0:
             return None
         if content_length > MAX_PAYLOAD_SIZE:
@@ -342,7 +394,7 @@ class SutraHTTPHandler(BaseHTTPRequestHandler):
                 if doc is None:
                     self._send_json(404, {"error": f"Document '{doc_id}' not found in collection '{col_name}'"})
                 else:
-                    self._send_json(200, doc.to_dict())
+                    self._send_json(200, doc.to_dict(include_vector=True))
             except KeyError:
                 self._send_json(404, {"error": f"Collection '{col_name}' not found"})
             return
@@ -504,9 +556,14 @@ class SutraHTTPHandler(BaseHTTPRequestHandler):
         pass
 
 
-def run_server(host: str = "0.0.0.0", port: int = 8765, data_dir: str = "./sutra_data") -> None:
+def run_server(
+    host: str = "0.0.0.0",
+    port: int = 8765,
+    data_dir: str = "./sutra_data",
+    db: Optional[SutraDB] = None
+) -> None:
     """Starts the SutraDB ASGI server with Uvicorn."""
-    app_instance = create_app(data_dir=data_dir)
+    app_instance = create_app(data_dir=data_dir, db=db)
     print(f"⚡ SutraDB v{__version__} Production ASGI server running at http://{host}:{port}")
     print(f"📁 Persistence directory: {Path(data_dir).resolve()}")
     uvicorn.run(app_instance, host=host, port=port, log_level="info")
