@@ -47,7 +47,8 @@ Documentation = "https://github.com/Sam-CodesAI/SutraDB#readme"
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.0.0"
+    "pytest>=8.0.0",
+    "httpx>=0.24.0"
 ]
 
 [project.scripts]
