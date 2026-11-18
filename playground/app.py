@@ -560,7 +560,18 @@ class PlaygroundHandler(BaseHTTPRequestHandler):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 7860
+    port = 7860
+    if len(sys.argv) > 1:
+        if sys.argv[1] in ("--help", "-h", "help"):
+            print("Usage: python playground/app.py [port]")
+            print("Starts the SutraSearch Playground web UI (default port: 7860).")
+            return
+        try:
+            port = int(sys.argv[1])
+        except ValueError:
+            print(f"Error: Invalid port '{sys.argv[1]}'. Port must be an integer.")
+            print("Usage: python playground/app.py [port]")
+            sys.exit(1)
 
     print()
     print("  ╔══════════════════════════════════════════════════╗")
