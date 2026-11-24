@@ -200,6 +200,104 @@ impl HNSWIndex {
         Ok(())
     }
 
+    /// Dynamically deletes a node from the HNSW graph and heals adjacent edges.
+    /// Preserves graph connectivity and re-elects entry point if needed.
+    pub fn delete_node(
+        &mut self,
+        doc_id: u32,
+        all_vectors: &[Vec<f32>],
+        metric: Metric,
+        is_normalized: bool,
+    ) -> bool {
+        let node_level = match self.node_levels.remove(&doc_id) {
+            Some(lvl) => lvl,
+            None => return false,
+        };
+
+        let min_links = (self.config.m / 2).max(1);
+
+        for l in 0..=node_level {
+            if l >= self.layers.len() {
+                continue;
+            }
+
+            // Get deleted node's neighbors at layer l
+            let neighbors = self.layers[l].remove(&doc_id).unwrap_or_default();
+            let m_max = if l == 0 { self.config.m0 } else { self.config.m };
+
+            // Remove doc_id from each neighbor's edge list
+            let mut to_cross_connect = Vec::new();
+
+            for &nbr in &neighbors {
+                if let Some(nbr_list) = self.layers[l].get_mut(&nbr) {
+                    nbr_list.retain(|&x| x != doc_id);
+
+                    // Edge Healing: If neighbor's degree dropped below min_links, reconnect
+                    if nbr_list.len() < min_links {
+                        // Consider potential candidates: other neighbors of deleted node
+                        let mut candidates: Vec<u32> = neighbors
+                            .iter()
+                            .copied()
+                            .filter(|&c| c != nbr && !nbr_list.contains(&c))
+                            .collect();
+
+                        // Score candidates against nbr vector
+                        candidates.sort_by(|&a, &b| {
+                            let sa = compute_vector_score(
+                                &all_vectors[nbr as usize],
+                                &all_vectors[a as usize],
+                                metric,
+                                is_normalized,
+                            ).unwrap_or(f32::NEG_INFINITY);
+                            let sb = compute_vector_score(
+                                &all_vectors[nbr as usize],
+                                &all_vectors[b as usize],
+                                metric,
+                                is_normalized,
+                            ).unwrap_or(f32::NEG_INFINITY);
+                            sb.partial_cmp(&sa).unwrap_or(Ordering::Equal)
+                        });
+
+                        for cand in candidates {
+                            if nbr_list.len() >= m_max {
+                                break;
+                            }
+                            nbr_list.push(cand);
+                            to_cross_connect.push((cand, nbr));
+                        }
+                    }
+                }
+            }
+
+            // Bidirectionally add connections without violating borrow checker
+            for (cand, nbr) in to_cross_connect {
+                if let Some(cand_list) = self.layers[l].get_mut(&cand) {
+                    if !cand_list.contains(&nbr) && cand_list.len() < m_max {
+                        cand_list.push(nbr);
+                    }
+                }
+            }
+        }
+
+        // Re-elect entry point if deleted node was the entry point
+        if self.entry_point == Some(doc_id) {
+            self.entry_point = None;
+            // Search from top layer down for any existing node
+            for l in (0..self.layers.len()).rev() {
+                if let Some(&new_ep) = self.layers[l].keys().next() {
+                    self.entry_point = Some(new_ep);
+                    self.max_level = l;
+                    break;
+                }
+            }
+            if self.entry_point.is_none() {
+                self.max_level = 0;
+            }
+        }
+
+        true
+    }
+
     /// Searches a single layer for nearest neighbors using beam search.
     fn search_layer(
         &self,
@@ -323,5 +421,48 @@ impl HNSWIndex {
         }
 
         Ok(results)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hnsw_insert_delete_and_heal() {
+        let mut index = HNSWIndex::new(HNSWConfig::default());
+        let vectors = vec![
+            vec![1.0, 0.0],
+            vec![0.9, 0.1],
+            vec![0.0, 1.0],
+            vec![0.1, 0.9],
+            vec![0.5, 0.5],
+        ];
+
+        for (i, v) in vectors.iter().enumerate() {
+            index.insert(i as u32, v, &vectors, Metric::Cosine, true).unwrap();
+        }
+
+        assert_eq!(index.node_levels.len(), 5);
+        assert!(index.entry_point.is_some());
+
+        // Search before deletion
+        let q = vec![1.0, 0.0];
+        let res = index.search(&q, &vectors, 2, 16, Metric::Cosine, true, None).unwrap();
+        assert!(!res.is_empty());
+        assert_eq!(res[0].0, 0);
+
+        // Delete entry point or node 0
+        let ep = index.entry_point.unwrap();
+        let deleted = index.delete_node(ep, &vectors, Metric::Cosine, true);
+        assert!(deleted);
+        assert!(!index.node_levels.contains_key(&ep));
+        assert!(index.entry_point.is_some());
+        assert_ne!(index.entry_point.unwrap(), ep);
+
+        // Search again, should still return nearest valid remaining node
+        let res2 = index.search(&q, &vectors, 2, 16, Metric::Cosine, true, None).unwrap();
+        assert!(!res2.is_empty());
+        assert_ne!(res2[0].0, ep);
     }
 }

@@ -6,7 +6,39 @@ and generates high-speed boolean bitmasks with nested dot-notation path resoluti
 
 from typing import Any, Dict, List, Optional
 import re
+import math
 import numpy as np
+
+
+def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Calculates the great-circle distance in meters between two lat/lon coordinates."""
+    earth_radius_meters = 6_371_000.0
+    d_lat = math.radians(lat2 - lat1)
+    d_lon = math.radians(lon2 - lon1)
+    lat1_rad = math.radians(lat1)
+    lat2_rad = math.radians(lat2)
+
+    a = math.sin(d_lat / 2.0) ** 2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(d_lon / 2.0) ** 2
+    c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+    return earth_radius_meters * c
+
+
+def extract_lat_lon(val: Any) -> Optional[tuple]:
+    """Extracts (lat, lon) from list/tuple or dict."""
+    if isinstance(val, (list, tuple)) and len(val) >= 2:
+        try:
+            return float(val[0]), float(val[1])
+        except (ValueError, TypeError):
+            return None
+    elif isinstance(val, dict):
+        lat = val.get("lat") if "lat" in val else val.get("latitude")
+        lon = val.get("lon") if "lon" in val else (val.get("lng") if "lng" in val else val.get("longitude"))
+        if lat is not None and lon is not None:
+            try:
+                return float(lat), float(lon)
+            except (ValueError, TypeError):
+                return None
+    return None
 
 
 def resolve_nested_path(data: Optional[Dict[str, Any]], path: str) -> Any:
@@ -103,6 +135,39 @@ class FilterEngine:
             elif op == "$exists":
                 has_value = field_value is not None
                 if has_value != bool(target):
+                    return False
+            elif op == "$geo_within":
+                point = extract_lat_lon(field_value)
+                if point is None or not isinstance(target, dict):
+                    return False
+                center = extract_lat_lon(target.get("center"))
+                radius_meters = target.get("radius_meters")
+                if radius_meters is None and "radius_km" in target:
+                    radius_meters = float(target["radius_km"]) * 1000.0
+                if center is None or radius_meters is None:
+                    return False
+                dist = haversine_distance(point[0], point[1], center[0], center[1])
+                if dist > float(radius_meters):
+                    return False
+            elif op == "$geo_box":
+                point = extract_lat_lon(field_value)
+                if point is None:
+                    return False
+                bounds = None
+                if isinstance(target, (list, tuple)) and len(target) >= 4:
+                    bounds = (float(target[0]), float(target[1]), float(target[2]), float(target[3]))
+                elif isinstance(target, dict):
+                    bl = extract_lat_lon(target.get("bottom_left"))
+                    tr = extract_lat_lon(target.get("top_right"))
+                    if bl and tr:
+                        bounds = (min(bl[0], tr[0]), min(bl[1], tr[1]), max(bl[0], tr[0]), max(bl[1], tr[1]))
+                    elif all(k in target for k in ("min_lat", "min_lon", "max_lat", "max_lon")):
+                        bounds = (float(target["min_lat"]), float(target["min_lon"]), float(target["max_lat"]), float(target["max_lon"]))
+                if bounds is None:
+                    return False
+                min_lat, min_lon, max_lat, max_lon = bounds
+                lat, lon = point
+                if not (min_lat <= lat <= max_lat and min_lon <= lon <= max_lon):
                     return False
             else:
                 raise ValueError(f"Unknown filter operator: {op}")

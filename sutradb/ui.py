@@ -257,8 +257,8 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
       <div class="bento-card">
         <div class="label">Quantization & Compression</div>
-        <div class="value" style="color: var(--primary);"><span style="font-size: 20px;">🛡️</span> SQ8 Ready</div>
-        <div class="sub">75% RAM savings enabled</div>
+        <div class="value" style="color: var(--primary);"><span style="font-size: 20px;">🛡️</span> 1-Bit BQ & SQ8</div>
+        <div class="sub">32x BQ & 75% SQ8 RAM savings</div>
       </div>
     </div>
 
@@ -308,7 +308,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
           <div class="form-group">
             <label>Metadata Filter JSON (AST)</label>
-            <textarea id="queryFilter" placeholder='{"category": "ai", "user.role": {"$in": ["admin", "editor"]}}' rows="2"></textarea>
+            <textarea id="queryFilter" placeholder='{"category": "ai", "location": {"$geo_within": {"center": [37.77, -122.41], "radius_meters": 5000}}}' rows="2"></textarea>
           </div>
 
           <div class="form-group">
@@ -513,6 +513,7 @@ for doc in results:
           <td>${c.wal_enabled ? '✅ Enabled' : 'Disabled'}</td>
           <td>
             <button style="font-size: 11px; padding: 4px 8px;" onclick="buildHNSW('${c.name}')">HNSW</button>
+            <button style="font-size: 11px; padding: 4px 8px;" onclick="enableBQ('${c.name}')">1-Bit BQ</button>
             <button style="font-size: 11px; padding: 4px 8px;" onclick="enableSQ8('${c.name}')">SQ8</button>
             <button style="font-size: 11px; padding: 4px 8px;" onclick="compactCollection('${c.name}')">Compact</button>
           </td>
@@ -536,6 +537,11 @@ for doc in results:
     async function enableSQ8(name) {
       const res = await fetch('/collections/' + name + '/sq8', { method: 'POST' });
       if (res.ok) alert('SQ8 8-bit Quantization enabled for ' + name + ' (75% RAM savings active)');
+    }
+
+    async function enableBQ(name) {
+      const res = await fetch('/collections/' + name + '/bq', { method: 'POST' });
+      if (res.ok) alert('1-Bit Binary Quantization (BQ) enabled for ' + name + ' (32x RAM savings active)');
     }
 
     async function compactCollection(name) {

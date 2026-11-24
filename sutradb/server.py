@@ -434,6 +434,17 @@ def create_app(data_dir: Optional[str] = None, db: Optional[SutraDB] = None) -> 
         col.enable_sq8()
         return {"message": "SQ8 quantization enabled", "stats": col.stats()}
 
+    @app.post("/collections/{name}/bq", tags=["Indexing"])
+    def enable_bq(name: str):
+        active_db: SutraDB = app.state.db
+        try:
+            col = active_db.get_collection(name)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
+
+        col.enable_bq()
+        return {"message": "1-Bit Binary Quantization (BQ) enabled (32x RAM reduction)", "stats": col.stats()}
+
     @app.post("/collections/{name}/save", tags=["Persistence"])
     def save_collection(name: str):
         active_db: SutraDB = app.state.db

@@ -5,10 +5,12 @@ use std::str::FromStr;
 use serde_json::Value;
 
 use crate::collection::{NativeCollection, NativeDocument};
+use crate::distance::bq::BQVector;
 use crate::distance::simd::{dot_product, compute_vector_score};
 use crate::distance::sq8::SQ8Vector;
 use crate::distance::Metric;
 use crate::error::SutraError;
+use crate::filter::haversine_distance;
 use crate::index::hnsw::HNSWConfig;
 use crate::index::ivf::IVFConfig;
 
@@ -124,6 +126,12 @@ impl PyNativeCollection {
     fn enable_sq8(&mut self, py: Python) {
         py.allow_threads(|| {
             self.inner.enable_sq8();
+        });
+    }
+
+    fn enable_bq(&mut self, py: Python) {
+        py.allow_threads(|| {
+            self.inner.enable_bq();
         });
     }
 
@@ -249,6 +257,22 @@ fn sq8_quantize(v: Vec<f32>) -> (Vec<u8>, f32, f32) {
 }
 
 #[pyfunction]
+fn bq_quantize(v: Vec<f32>) -> (Vec<u64>, usize) {
+    let bq = BQVector::quantize(&v);
+    (bq.bits, bq.dimension)
+}
+
+#[pyfunction]
+fn bq_hamming(a: Vec<u64>, b: Vec<u64>) -> u32 {
+    BQVector::hamming_distance_words(&a, &b)
+}
+
+#[pyfunction]
+fn haversine(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    haversine_distance(lat1, lon1, lat2, lon2)
+}
+
+#[pyfunction]
 fn tokenize_text(text: &str) -> Vec<String> {
     crate::bm25::tokenizer::tokenize(text)
 }
@@ -259,6 +283,9 @@ pub fn register_module(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(simd_cosine, m)?)?;
     m.add_function(wrap_pyfunction!(simd_euclidean, m)?)?;
     m.add_function(wrap_pyfunction!(sq8_quantize, m)?)?;
+    m.add_function(wrap_pyfunction!(bq_quantize, m)?)?;
+    m.add_function(wrap_pyfunction!(bq_hamming, m)?)?;
+    m.add_function(wrap_pyfunction!(haversine, m)?)?;
     m.add_function(wrap_pyfunction!(tokenize_text, m)?)?;
     Ok(())
 }

@@ -15,8 +15,9 @@ from sutradb.fusion import reciprocal_rank_fusion, linear_score_fusion
 from sutradb.ann import IVFIndex, IVFConfig, auto_n_lists
 from sutradb.integrations.langchain import SutraDBVectorStore
 from sutradb.integrations.llamaindex import SutraDBLlamaIndexVectorStore
+from sutradb.quantization import BQVector, SQ8Vector
 
-__version__ = "3.1.0"
+__version__ = "3.2.0"
 __all__ = [
     "SutraDB",
     "Collection",
@@ -26,6 +27,8 @@ __all__ = [
     "SutraClient",
     "SutraDBVectorStore",
     "SutraDBLlamaIndexVectorStore",
+    "BQVector",
+    "SQ8Vector",
     "Metric",
     "FilterEngine",
     "BM25Index",

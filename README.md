@@ -62,20 +62,22 @@ Designed specifically for production RAG (Retrieval-Augmented Generation), local
 
 ---
 
-## ⚡ Industrial Capabilities (v3.0)
+## ⚡ Industrial Capabilities (v3.2)
 
 * **Native Rust SIMD Core:** Pure Rust computation core releasing the Python GIL during query execution and batch ingestion for zero-overhead multicore scaling.
+* **1-Bit Binary Quantization (BQ):** Compresses 64 float32 dimensions into a single 64-bit word (`u64`), delivering a staggering **32x RAM reduction** and sub-microsecond hardware `POPCNT` Hamming distance evaluation. Features two-stage candidate pruning + exact reranking for $>95\%$ recall.
 * **SQ8 Scalar Quantization (8-Bit):** Compresses vectors from 32-bit floats to 8-bit unsigned integers, slashing RAM consumption by **75%** while retaining $>98\%$ recall via asymmetric dot product queries.
+* **Dynamic Online HNSW Graph Deletion & Healing:** Instant node removal with real-time edge re-wiring, neighbor reconnection, and entry point re-election without tombstones or graph fragmentation.
+* **Geo-Spatial Filtering (`$geo_within` & `$geo_box`):** Native great-circle Haversine distance in meters and rectangular bounding box queries supporting coordinate arrays `[lat, lon]` and dictionaries `{"lat": ..., "lon": ...}`.
 * **Dual ANN Indexing (HNSW & IVF-Flat):** 
   - **HNSW:** Hierarchical Navigable Small World graphs for $O(\log N)$ vector search and dynamic streaming additions.
   - **IVF-Flat:** Sublinear Voronoi cell clustering with k-means++ for high-density batched workloads.
+* **Official AI Framework Connectors:** First-class integrations for **LangChain** (`sutradb.integrations.langchain`) and **LlamaIndex** (`sutradb.integrations.llamaindex`).
+* **Nested JSON Metadata & Array Filtering:** Dot-notation path resolution (`user.profile.city`) and operators (`$eq`, `$ne`, `$gt`, `$gte`, `$in`, `$all`, `$size`, `$regex`, `$geo_within`, `$geo_box`).
 * **First-Class Multi-Tenancy (Namespaces):** Strict hardware/logical isolation (`namespace="tenant_123"`). Zero cross-tenant data leaks.
-* **Secondary Inverted Field Indexing:** Instant $O(1)$ categorical metadata lookups with compound AST boolean predicate bitmasking (`$eq`, `$ne`, `$gt`, `$gte`, `$in`, `$contains`, `$and`, `$or`, `$not`).
 * **Zero-Copy Memory-Mapped Files (`memmap2`):** Direct OS page-cache mapping of `.sutra` binary vectors. Instant cold-start queries without loading gigabytes of data into heap RAM.
 * **Resilient Write-Ahead Log (WAL):** Atomic append-only transaction logging with CRC32 integrity checks, automatic snapshot compaction, and corrupted-tail power-cut auto-healing.
-* **Idempotent Upsert & In-Place Metadata Updates:** Patch metadata without copying or re-normalizing dense vectors.
-* **Prometheus Observability:** Native `/metrics` endpoint exporting query latency histograms, QPS, collection counts, and memory footprint.
-* **Official Python Client (`SutraClient`):** High-throughput HTTP client SDK with connection pooling and retries.
+* **Zero-Dependency Web Console (`/ui` & `/dashboard`):** Real-time monitoring dashboard with in-browser 2D Canvas PCA vector projection and hybrid query builder.
 
 ---
 
@@ -227,6 +229,54 @@ results = col.query(
 )
 ```
 
+### 7. 1-Bit Binary Quantization (32x RAM Reduction & Two-Stage Search)
+
+Compress high-dimensional vectors by 32x and evaluate Hamming candidate distances via hardware `POPCNT`:
+
+```python
+# Enable 1-bit quantization
+col.enable_bq()
+
+# Queries automatically run Two-Stage Search:
+# Stage 1: Fast Hamming distance scan over 1-bit bitmasks to select top candidates
+# Stage 2: Exact full-precision distance reranking of top candidate pool
+results = col.query(vector=query_vector, top_k=5)
+```
+
+### 8. Geo-Spatial Metadata Filtering ($geo_within & $geo_box)
+
+Filter vectors using great-circle Haversine distances in meters or rectangular bounding boxes:
+
+```python
+# Radius query within 5,000 meters of San Francisco center
+sf_results = col.query(
+    vector=query_vector,
+    filter={
+        "location": {
+            "$geo_within": {
+                "center": [37.7749, -122.4194],
+                "radius_meters": 5000.0
+            }
+        }
+    },
+    top_k=10
+)
+
+# Bounding box query covering SF Bay Area
+bay_results = col.query(
+    text="local restaurants",
+    filter={
+        "location": {
+            "$geo_box": {
+                "bottom_left": [37.70, -122.50],
+                "top_right": [37.85, -122.20]
+            }
+        }
+    },
+    top_k=10
+)
+```
+
 ---
 
 ## 🌐 Embedded Web Management Dashboard
@@ -246,7 +296,7 @@ http://localhost:8765/ui  or  http://localhost:8765/dashboard
 **Features included out of the box:**
 - ⚡ **Interactive Hybrid Playground:** Test dense vectors, BM25 text queries, and slide RRF weights with live score bar breakdowns.
 - 📊 **2D Vector PCA Projection:** Visualizes high-dimensional embeddings mapped into an interactive in-browser 2D Canvas scatter plot with hover tooltips.
-- 🛠️ **Collection Manager:** 1-click HNSW indexing, SQ8 8-bit quantization (75% RAM savings), and WAL compaction.
+- 🛠️ **Collection Manager:** 1-click HNSW indexing, 1-Bit BQ quantization (32x RAM reduction), SQ8 quantization (75% RAM reduction), and WAL compaction.
 - 💻 **Real-Time Code Generator:** Auto-generates exact Python SDK, LangChain, and `curl` code for any query.
 
 ---
@@ -261,6 +311,7 @@ http://localhost:8765/ui  or  http://localhost:8765/dashboard
 - `POST /collections/{name}/upsert` - Idempotent upsert
 - `PATCH /collections/{name}/documents/{id}/metadata` - In-place metadata patch
 - `POST /collections/{name}/hnsw` - Trigger HNSW graph build
+- `POST /collections/{name}/bq` - Enable 1-Bit Binary Quantization (32x RAM reduction)
 - `POST /collections/{name}/sq8` - Enable SQ8 vector quantization
 - `POST /collections/{name}/query` - Hybrid, vector, or lexical search
 
@@ -271,10 +322,10 @@ http://localhost:8765/ui  or  http://localhost:8765/dashboard
 Run both native Rust and Python test suites:
 
 ```bash
-# 1. Rust engine integration tests (8 tests)
+# 1. Rust engine integration tests (17 tests)
 cargo test
 
-# 2. Python test suite (50 tests)
+# 2. Python test suite (59 tests)
 pytest -v
 ```
 

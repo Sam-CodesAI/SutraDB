@@ -249,3 +249,168 @@ fn test_native_collection_full_lifecycle() {
     let loaded_d1 = loaded.documents.iter().find(|d| d.id == "d1").unwrap();
     assert_eq!(loaded_d1.metadata["env"], "staging");
 }
+
+#[test]
+fn test_bq_quantization_and_two_stage_search() {
+    let mut col = NativeCollection::new(
+        "bq_test".to_string(),
+        128,
+        Metric::Cosine,
+        None,
+        false,
+    ).unwrap();
+
+    let n = 50;
+    let mut docs = Vec::new();
+    let mut vecs = Vec::new();
+
+    for i in 0..n {
+        let mut v = vec![0.0f32; 128];
+        v[i % 128] = 1.0;
+        v[(i + 1) % 128] = 0.5;
+        let v_norm = normalize_copy(&v);
+        docs.push(NativeDocument {
+            id: format!("doc_{}", i),
+            namespace: None,
+            text: format!("Text for doc {}", i),
+            metadata: json!({"idx": i}),
+        });
+        vecs.push(v_norm);
+    }
+
+    col.insert(docs, vecs).unwrap();
+    col.enable_bq();
+    assert!(col.use_bq);
+    assert_eq!(col.bq_vectors.len(), n);
+
+    // Two-stage BQ search
+    let mut q = vec![0.0f32; 128];
+    q[0] = 1.0;
+    q[1] = 0.5;
+    let q_norm = normalize_copy(&q);
+
+    let res = col.query(
+        Some(&q_norm),
+        None,
+        None,
+        None,
+        5,
+        false,
+        None,
+        60,
+        1.0,
+        1.0,
+        false,
+    ).unwrap();
+
+    assert!(!res.is_empty());
+    assert_eq!(res[0].id, "doc_0");
+    assert!((res[0].score - 1.0).abs() < 1e-4);
+}
+
+#[test]
+fn test_hnsw_online_deletion_and_reconnection() {
+    let mut col = NativeCollection::new(
+        "hnsw_del_test".to_string(),
+        4,
+        Metric::Cosine,
+        None,
+        false,
+    ).unwrap();
+
+    let docs = vec![
+        NativeDocument { id: "a".into(), namespace: None, text: "alpha".into(), metadata: json!({}) },
+        NativeDocument { id: "b".into(), namespace: None, text: "beta".into(), metadata: json!({}) },
+        NativeDocument { id: "c".into(), namespace: None, text: "gamma".into(), metadata: json!({}) },
+    ];
+    let vecs = vec![
+        vec![1.0, 0.0, 0.0, 0.0],
+        vec![0.9, 0.1, 0.0, 0.0],
+        vec![0.0, 1.0, 0.0, 0.0],
+    ];
+
+    col.insert(docs, vecs).unwrap();
+    col.build_hnsw(None).unwrap();
+    assert!(col.hnsw.is_some());
+
+    // Query ANN
+    let q = vec![1.0, 0.0, 0.0, 0.0];
+    let res1 = col.query(Some(&q), None, None, None, 2, false, None, 60, 1.0, 1.0, true).unwrap();
+    assert_eq!(res1[0].id, "a");
+
+    // Dynamic deletion of "a"
+    let deleted = col.delete(&["a".to_string()]).unwrap();
+    assert_eq!(deleted, 1);
+    assert_eq!(col.count(), 2);
+
+    // Query ANN again: "a" must not appear, nearest should be "b"
+    let res2 = col.query(Some(&q), None, None, None, 2, false, None, 60, 1.0, 1.0, true).unwrap();
+    assert_eq!(res2[0].id, "b");
+}
+
+#[test]
+fn test_geospatial_filters() {
+    let mut col = NativeCollection::new(
+        "geo_test".to_string(),
+        4,
+        Metric::Cosine,
+        None,
+        false,
+    ).unwrap();
+
+    let docs = vec![
+        NativeDocument {
+            id: "sf".into(),
+            namespace: None,
+            text: "San Francisco City Hall".into(),
+            metadata: json!({"city": "SF", "loc": [37.7792, -122.4191]}),
+        },
+        NativeDocument {
+            id: "oak".into(),
+            namespace: None,
+            text: "Oakland City Center".into(),
+            metadata: json!({"city": "Oakland", "loc": [37.8044, -122.2712]}),
+        },
+        NativeDocument {
+            id: "sjc".into(),
+            namespace: None,
+            text: "San Jose Plaza".into(),
+            metadata: json!({"city": "San Jose", "loc": [37.3382, -121.8863]}),
+        },
+    ];
+    let vecs = vec![
+        vec![1.0, 0.0, 0.0, 0.0],
+        vec![0.0, 1.0, 0.0, 0.0],
+        vec![0.0, 0.0, 1.0, 0.0],
+    ];
+    col.insert(docs, vecs).unwrap();
+
+    // 1. $geo_within: Within 10km of SF Downtown
+    let sf_filter = json!({
+        "loc": {
+            "$geo_within": {
+                "center": [37.7749, -122.4194],
+                "radius_meters": 10000.0
+            }
+        }
+    });
+    let res_sf = col.query(None, Some("City"), None, Some(&sf_filter), 10, false, None, 60, 1.0, 1.0, false).unwrap();
+    assert_eq!(res_sf.len(), 1);
+    assert_eq!(res_sf[0].id, "sf");
+
+    // 2. $geo_box: Bounding box covering SF and Oakland, excluding San Jose
+    let bay_box = json!({
+        "loc": {
+            "$geo_box": {
+                "bottom_left": [37.70, -122.50],
+                "top_right": [37.85, -122.20]
+            }
+        }
+    });
+    let res_box = col.query(None, Some("City"), None, Some(&bay_box), 10, false, None, 60, 1.0, 1.0, false).unwrap();
+    assert_eq!(res_box.len(), 2);
+    let ids: Vec<String> = res_box.into_iter().map(|r| r.id).collect();
+    assert!(ids.contains(&"sf".to_string()));
+    assert!(ids.contains(&"oak".to_string()));
+    assert!(!ids.contains(&"sjc".to_string()));
+}

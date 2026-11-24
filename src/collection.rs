@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::bm25::BM25Index;
+use crate::distance::bq::BQVector;
 use crate::distance::simd::{compute_vector_score, normalize_copy};
 use crate::distance::sq8::SQ8Vector;
 use crate::distance::Metric;
@@ -47,6 +48,8 @@ pub struct NativeCollection {
     pub vectors: Vec<Vec<f32>>,
     pub sq8_vectors: Vec<SQ8Vector>,
     pub use_sq8: bool,
+    pub bq_vectors: Vec<BQVector>,
+    pub use_bq: bool,
     pub id_to_index: HashMap<String, usize>,
     pub tombstones: Vec<bool>,
     pub bm25: BM25Index,
@@ -82,6 +85,8 @@ impl NativeCollection {
             vectors: Vec::new(),
             sq8_vectors: Vec::new(),
             use_sq8: false,
+            bq_vectors: Vec::new(),
+            use_bq: false,
             id_to_index: HashMap::new(),
             tombstones: Vec::new(),
             bm25: BM25Index::default(),
@@ -187,6 +192,9 @@ impl NativeCollection {
                 if self.use_sq8 {
                     self.sq8_vectors[existing_idx] = SQ8Vector::quantize(&vec);
                 }
+                if self.use_bq {
+                    self.bq_vectors[existing_idx] = BQVector::quantize(&vec);
+                }
                 self.documents[existing_idx] = doc;
                 if existing_idx < self.tombstones.len() {
                     self.tombstones[existing_idx] = false;
@@ -201,6 +209,9 @@ impl NativeCollection {
 
             if self.use_sq8 {
                 self.sq8_vectors.push(SQ8Vector::quantize(&vec));
+            }
+            if self.use_bq {
+                self.bq_vectors.push(BQVector::quantize(&vec));
             }
 
             self.secondary_index.index_document(idx as u32, &doc.metadata);
@@ -275,6 +286,7 @@ impl NativeCollection {
     fn delete_internal(&mut self, ids: &[String], log_to_wal: bool) -> Result<usize, SutraError> {
         let mut deleted_count = 0;
         let mut deleted_ids = Vec::new();
+        let is_cosine = self.metric == Metric::Cosine;
 
         for id in ids {
             if let Some(&idx) = self.id_to_index.get(id) {
@@ -282,6 +294,11 @@ impl NativeCollection {
                     self.tombstones[idx] = true;
                     deleted_count += 1;
                     deleted_ids.push(id.clone());
+
+                    // Dynamic online HNSW node deletion and edge healing
+                    if let Some(ref mut hnsw) = self.hnsw {
+                        hnsw.delete_node(idx as u32, &self.vectors, self.metric, is_cosine);
+                    }
                 }
                 self.id_to_index.remove(id);
             }
@@ -365,6 +382,13 @@ impl NativeCollection {
         if !self.use_sq8 {
             self.sq8_vectors = self.vectors.iter().map(|v| SQ8Vector::quantize(v)).collect();
             self.use_sq8 = true;
+        }
+    }
+
+    pub fn enable_bq(&mut self) {
+        if !self.use_bq {
+            self.bq_vectors = self.vectors.iter().map(|v| BQVector::quantize(v)).collect();
+            self.use_bq = true;
         }
     }
 
@@ -455,8 +479,30 @@ impl NativeCollection {
                 }
             }
 
-            // Brute force / exact scoring
-            if self.use_sq8 {
+            // Brute force / exact scoring or two-stage BQ accelerated search
+            if self.use_bq {
+                // Stage 1: Fast Hamming distance scan over 1-bit quantized bitmasks
+                let q_bq = BQVector::quantize(&normalized_q);
+                let mut candidates: Vec<(usize, u32)> = Vec::new();
+                for (i, bqv) in self.bq_vectors.iter().enumerate() {
+                    if mask[i] {
+                        let d = q_bq.hamming_distance(bqv);
+                        candidates.push((i, d));
+                    }
+                }
+                candidates.sort_by_key(|&(_, d)| d);
+
+                // Stage 2: Rerank top M candidates with full precision / SQ8
+                let rerank_count = (top_k * 4).max(32).min(candidates.len());
+                let q_sum = if self.use_sq8 { normalized_q.iter().sum() } else { 0.0 };
+                for &(idx, _) in candidates.iter().take(rerank_count) {
+                    if self.use_sq8 {
+                        dense_scores[idx] = self.sq8_vectors[idx].asymmetric_dot_product(&normalized_q, q_sum);
+                    } else {
+                        dense_scores[idx] = compute_vector_score(&normalized_q, &self.vectors[idx], self.metric, is_cosine)?;
+                    }
+                }
+            } else if self.use_sq8 {
                 let q_sum: f32 = normalized_q.iter().sum();
                 for (i, sq) in self.sq8_vectors.iter().enumerate() {
                     if mask[i] {
@@ -672,6 +718,12 @@ impl NativeCollection {
         self.tombstones = vec![false; self.documents.len()];
         self.bm25 = new_bm25;
         self.secondary_index = new_sec;
+        if self.use_sq8 {
+            self.sq8_vectors = self.vectors.iter().map(|v| SQ8Vector::quantize(v)).collect();
+        }
+        if self.use_bq {
+            self.bq_vectors = self.vectors.iter().map(|v| BQVector::quantize(v)).collect();
+        }
         self.hnsw = None;
         self.ivf = None;
         self.dirty_index = true;
@@ -682,6 +734,8 @@ impl NativeCollection {
         let active_count = self.count();
         let vector_bytes = self.vectors.len() * self.dimension * 4;
         let sq8_bytes = if self.use_sq8 { self.sq8_vectors.len() * self.dimension } else { 0 };
+        let bq_bytes = if self.use_bq { self.bq_vectors.len() * ((self.dimension + 63) / 64) * 8 } else { 0 };
+        let total_vec_bytes = vector_bytes + sq8_bytes + bq_bytes;
 
         serde_json::json!({
             "name": self.name,
@@ -690,9 +744,10 @@ impl NativeCollection {
             "tombstones": self.documents.len() - active_count,
             "dimension": self.dimension,
             "metric": self.metric.as_str(),
-            "vector_memory_bytes": vector_bytes + sq8_bytes,
-            "vector_memory_mb": ((vector_bytes + sq8_bytes) as f64) / (1024.0 * 1024.0),
+            "vector_memory_bytes": total_vec_bytes,
+            "vector_memory_mb": ((total_vec_bytes) as f64) / (1024.0 * 1024.0),
             "quantized_sq8": self.use_sq8,
+            "quantized_bq": self.use_bq,
             "has_hnsw": self.hnsw.is_some(),
             "has_ivf": self.ivf.is_some()
         })
