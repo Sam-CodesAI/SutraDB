@@ -1,20 +1,40 @@
-# सूत्र DB (SutraDB) v5.0 Distributed Edition
+# सूत्र DB (SutraDB) v5.1.0: Zero-Build Embedded Developer Workbench & Distributed Edition
 
 [![PyPI](https://img.shields.io/pypi/v/sutradb-core.svg?style=flat&color=blue&logo=pypi)](https://pypi.org/project/sutradb-core/)
+[![Docker Pulls](https://img.shields.io/docker/pulls/samcodesai/sutradb.svg?style=flat&logo=docker&logoColor=white&color=2496ED)](https://hub.docker.com/r/samcodesai/sutradb)
+[![Docker Image Version](https://img.shields.io/docker/v/samcodesai/sutradb/5.1.0?style=flat&logo=docker&logoColor=white&label=docker%20image&color=2496ED)](https://hub.docker.com/r/samcodesai/sutradb)
+[![GHCR](https://img.shields.io/badge/GHCR-ghcr.io%2Fsam--codesai%2Fsutradb-blue?logo=github)](https://github.com/Sam-CodesAI/SutraDB/pkgs/container/sutradb)
+[![GitHub Release](https://img.shields.io/github/v/release/Sam-CodesAI/SutraDB?style=flat&logo=github&color=purple)](https://github.com/Sam-CodesAI/SutraDB/releases/tag/v5.1.0)
+[![Tests](https://img.shields.io/badge/Tests-182%2F182%20Passing-brightgreen)](https://github.com/Sam-CodesAI/SutraDB)
 [![Rust](https://img.shields.io/badge/Engine-Rust%20SIMD%20%2B%20gRPC-orange?logo=rust)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.14-blue?logo=python)](https://python.org)
-[![Tests](https://img.shields.io/badge/Tests-182%2F182%20Passing-brightgreen)](https://github.com/Sam-CodesAI/SutraDB)
 [![Cluster](https://img.shields.io/badge/Distributed-Multi--Node%20Raft-purple)](https://github.com/Sam-CodesAI/SutraDB)
 [![SIMD](https://img.shields.io/badge/SIMD-AVX512%20%7C%20AVX2%20%7C%20NEON-blue)](https://github.com/Sam-CodesAI/SutraDB)
 [![ColBERT](https://img.shields.io/badge/Multi--Vector-ColBERT%20MaxSim-red)](https://github.com/Sam-CodesAI/SutraDB)
 [![gRPC](https://img.shields.io/badge/Protocol-Binary%20gRPC%20HTTP%2F2-purple?logo=grpc)](https://grpc.io)
 [![Quantization](https://img.shields.io/badge/RAM%20Savings-Up%20to%2064x%20(PQ)-green)](https://github.com/Sam-CodesAI/SutraDB)
-[![Web UI](https://img.shields.io/badge/Dashboard-Embedded%20%2Fui-purple)](https://github.com/Sam-CodesAI/SutraDB)
+[![Workbench](https://img.shields.io/badge/Workbench-Zero--Build%20%2Fui-38bdf8)](https://github.com/Sam-CodesAI/SutraDB)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 > **सूत्र (Sūtra)**: *An aphorism or thread of knowledge designed to hold vast wisdom in the most concise, unbreakable form.*
 
 **SutraDB** is an industrial-grade, ultra-fast vector & BM25 hybrid search engine built with a native **Rust core** and zero-overhead **PyO3 Python bindings**. It combines runtime hardware CPU auto-dispatch (**AVX-512, AVX2, ARM NEON**), Rayon GIL-free multicore parallel processing, an advanced **Linguistic NLP Analyzer Pipeline** (Porter stemming, Spanish/French/German suffix stemmers, CJK bigrams, code identifier splitting), **Product Quantization (PQ)** (up to 64x RAM reduction with Asymmetric Distance Computation), **1-Bit Binary Quantization (BQ)** (32x RAM reduction), **SQ8 Scalar Quantization** (75% RAM reduction), **dynamic online HNSW deletion & healing**, **geo-spatial metadata filtering**, **IVF-Flat** indexing, **multi-tenant namespace isolation**, **zero-copy memory mapping (`memmap2`)**, and official connectors for **LangChain** and **LlamaIndex**.
+
+### ⚡ 5-Second 1-Click Launch (Embedded Workbench)
+
+No compilers, Node, or npm required. Launch the complete dual-daemon stack (Rust gRPC on `:50051` + REST/Workbench on `:8765`):
+
+```bash
+docker run -d \
+  --name sutradb \
+  -p 8765:8765 \
+  -p 50051:50051 \
+  -v sutra_data:/data \
+  samcodesai/sutradb:latest
+
+# Open the Zero-Build Developer Workbench immediately:
+# 👉 http://localhost:8765/ui
+```
 
 Designed specifically for production RAG (Retrieval-Augmented Generation), local AI agents, enterprise document retrieval, and low-latency voice AI where cloud vector database round-trips (>40ms) or Chroma's heavy memory overhead are unacceptable.
 
@@ -421,25 +441,63 @@ for r in results:
 
 ---
 
-## 🌐 Embedded Web Management Dashboard
+## 🛠️ Zero-Build Embedded Developer Workbench (`/ui`)
 
-SutraDB includes a built-in, zero-dependency 2026 dark-mode Bento Grid web management console.
+SutraDB v5.1.0 ships with an industrial, **zero-build, zero-external-CDN Developer Workbench** served natively directly from the engine at `http://localhost:8765/ui`.
 
-Start the microservice:
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│ ⚡ SutraDB Console | Developer Workbench                       v5.1.0  │
+├────────────┬─────────────┬──────────────┬──────────┬──────────┬────────┤
+│ Hybrid Lab │ Batch Ingest│ Doc Explorer │  2D PCA  │ Admin    │ Code   │
+├────────────┴─────────────┴──────────────┴──────────┴──────────┴────────┤
+│ Query: [ "p99 latency in SIMD vector engine"                          ]│
+│ Filter: [ {"status": "resolved", "tier": "gold"}                      ]│
+│ RRF Balance: [===●=======] Dense 0.40 / BM25 0.60    Latency: ⚡ 0.12ms │
+├────────────────────────────────────────────────────────────────────────┤
+│ 1. [RRF: 0.9412] "Hardware SIMD auto-dispatch (AVX-512 / NEON)..."     │
+│ 2. [RRF: 0.8120] "ColBERT token late-interaction MaxSim scoring..."    │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1-Click Launch Options
+
+**Option A: Instant Docker Container (Recommended)**
 ```bash
+docker run -d \
+  --name sutradb \
+  -p 8765:8765 \
+  -p 50051:50051 \
+  -v sutra_data:/data \
+  samcodesai/sutradb:latest
+
+# Open your browser at:
+# 👉 http://localhost:8765/ui
+```
+
+**Option B: Python CLI**
+```bash
+pip install sutradb-core
 python3 -m sutradb.server 8765
 ```
 
-Open your browser at:
-```
-http://localhost:8765/ui  or  http://localhost:8765/dashboard
-```
+---
 
-**Features included out of the box:**
-- ⚡ **Interactive Hybrid Playground:** Test dense vectors, BM25 text queries, and slide RRF weights with live score bar breakdowns.
-- 📊 **2D Vector PCA Projection:** Visualizes high-dimensional embeddings mapped into an interactive in-browser 2D Canvas scatter plot with hover tooltips.
-- 🛠️ **Collection Manager:** 1-click HNSW indexing, Product Quantization (up to 64x RAM savings), 1-Bit BQ (32x savings), SQ8 (75% savings), and WAL compaction.
-- 💻 **Real-Time Code Generator:** Auto-generates exact Python SDK, LangChain, and `curl` code for any query.
+### Interactive Workbench Panels
+
+| Panel | Core Features & Capabilities |
+| :--- | :--- |
+| **⚡ Hybrid Query Lab** | • Real-time Dense Vector + BM25 Lexical search execution.<br>• Interactive Reciprocal Rank Fusion (RRF) balance slider (`0.0` dense-only to `1.0` BM25-only).<br>• Full AST JSON metadata filter expression support (`{"tier": "gold", "price": {"$lte": 100}}`).<br>• Real-time microsecond query latency stopwatch (`⚡ 0.12ms`). |
+| **📥 Ingestion & Batch Upsert** | • Single-document manual insertion with raw vector and metadata editors.<br>• Bulk JSON array and newline-delimited JSONL drag-and-drop or copy-paste ingestion zone.<br>• Automatic schema validation and vector dimension verification. |
+| **🗂️ Document Explorer** | • Paginated collection document browser (`GET /collections/{name}/documents`).<br>• Real-time Document ID filtering and search.<br>• In-place modal metadata patcher (`PATCH /collections/{name}/documents/{id}/metadata`).<br>• 1-click document deletion with automatic secondary index and BM25 term pruning. |
+| **📊 2D Vector Projection (PCA)** | • Zero-dependency in-browser HTML5 Canvas covariance eigenvector decomposition.<br>• Color-coded cluster scatter plot with responsive zoom and pan.<br>• Interactive hover tooltips displaying Document ID, text preview, and metadata. |
+| **🛠️ Collection Administration** | • Live collection inventory with document counters, dimensionality, and storage breakdown.<br>• 1-click index builders: **HNSW Graph**, **SQ8 Quantization** (75% RAM savings), **1-Bit BQ** (32x savings), **PQ** (up to 64x savings), and **WAL Compaction**.<br>• Collection drop confirmation modal. |
+| **💻 Dynamic Code Generator** | • Automatically synchronizes with your active query, filters, and RRF weights.<br>• Live, syntax-highlighted snippets ready to copy for **Python SDK**, **LangChain**, **cURL REST**, and **Rust gRPC**. |
+
+### 🔒 Zero-Build & Air-Gapped Supply-Chain Guarantee
+- **No Node.js / npm required:** Embedded entirely inside `sutradb/ui.py` using standard HTML5, CSS Grid, and vanilla ES6.
+- **Zero External CDNs:** 100% offline and air-gapped compliant. No external fonts, icons, or JavaScript bundles that could leak telemetry or cause supply-chain poisoning.
+- **Unprivileged Runtime:** Packaged inside Docker running strictly under non-root UID `10001:10001`.
 
 ---
 
@@ -481,10 +539,13 @@ service SutraService {
 
 ## 🌐 REST Microservice Endpoints
 
-- `GET /ui` & `GET /dashboard` - Embedded Web Management Dashboard
-- `GET /ui/stats` - Telemetry metrics for console
+- `GET /ui` & `GET /dashboard` - Zero-Build Embedded Developer Workbench
+- `GET /ui/stats` - Telemetry metrics for developer workbench
 - `GET /health` - Health check & collection registry
 - `GET /metrics` - Prometheus metrics exporter
+- `GET /collections/{name}/documents` - Paginated document explorer (`limit`, `offset`)
+- `GET /collections/{name}/documents/{id}` - Single document retrieval
+- `DELETE /collections/{name}/documents/{id}` - Document deletion with index cleanup
 - `GET /collections/{name}/sample_vectors` - Sample vectors for 2D visual projection
 - `POST /collections/{name}/upsert` - Idempotent upsert
 - `PATCH /collections/{name}/documents/{id}/metadata` - In-place metadata patch
@@ -501,8 +562,15 @@ service SutraService {
 SutraDB is packaged as a supply-chain hardened, multi-stage container image conforming strictly to production security invariants:
 - **Unprivileged Execution:** Runs strictly under non-root UID/GID `10001:10001`.
 - **Zero Attack Surface:** All compilers, Rust toolchains, and package managers are excluded from the runtime image (`python:3.12-slim`).
-- **Dual-Daemon Orchestration:** Native binary gRPC daemon on port `50051` and FastAPI REST / Bento Grid Console on port `8765`.
+- **Dual-Daemon Orchestration:** Native binary gRPC daemon on port `50051` and FastAPI REST / Developer Workbench on port `8765`.
 - **Graceful Signal Handling:** Intercepts `SIGTERM` and `SIGINT` to safely flush Write-Ahead Logs and drain active connections without data loss.
+
+### Official Container Images
+
+| Registry | Image Name | Pull Command |
+| :--- | :--- | :--- |
+| **Docker Hub** | `samcodesai/sutradb` | `docker pull samcodesai/sutradb:5.1.0` |
+| **GitHub Packages (GHCR)** | `ghcr.io/sam-codesai/sutradb` | `docker pull ghcr.io/sam-codesai/sutradb:5.1.0` |
 
 ### 1. Docker Compose (Quickstart)
 
@@ -518,13 +586,13 @@ docker compose logs -f
 ### 2. Standalone Docker Run
 
 ```bash
-# Run in dual-daemon mode (default)
+# Run in dual-daemon mode (default with Developer Workbench on :8765)
 docker run -d \
   --name sutradb \
   -p 50051:50051 \
   -p 8765:8765 \
   -v sutra_data:/data \
-  sutradb:latest
+  samcodesai/sutradb:latest
 
 # Run strictly as high-throughput binary gRPC engine
 docker run -d \
@@ -532,15 +600,15 @@ docker run -d \
   -p 50051:50051 \
   -v sutra_data:/data \
   -e SUTRA_MODE=grpc \
-  sutradb:latest
+  samcodesai/sutradb:latest
 
-# Run strictly as REST microservice + Bento Grid UI
+# Run strictly as REST microservice + Developer Workbench
 docker run -d \
   --name sutradb-rest \
   -p 8765:8765 \
   -v sutra_data:/data \
   -e SUTRA_MODE=rest \
-  sutradb:latest
+  samcodesai/sutradb:latest
 ```
 
 ### 3. Kubernetes Deployment (`k8s/`)
