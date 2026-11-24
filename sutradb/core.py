@@ -16,7 +16,7 @@ from sutradb.fusion import reciprocal_rank_fusion, linear_score_fusion
 from sutradb.storage import BinaryStorage, WriteAheadLog
 from sutradb.ann import IVFIndex, IVFConfig, auto_n_lists
 from sutradb.concurrency import ReadWriteLock
-from sutradb.quantization import BQVector
+from sutradb.quantization import BQVector, PQVector, PQCodebook
 
 
 @dataclass
@@ -112,6 +112,9 @@ class Collection:
         self._sq8_enabled: bool = False
         self._bq_enabled: bool = False
         self._bq_vectors: List[BQVector] = []
+        self._pq_enabled: bool = False
+        self._pq_codebook: Optional[PQCodebook] = None
+        self._pq_vectors: List[PQVector] = []
         self._hnsw_index: Optional[Dict[str, Any]] = None
 
         # Durability log
@@ -239,13 +242,20 @@ class Collection:
                 except Exception:
                     self._ann_dirty = True
 
-        # Incremental BQ vector updates
+        # Incremental BQ and PQ vector updates
         if self._bq_enabled:
             for d in updated_docs:
                 idx = self.id_to_index[d.id]
                 self._bq_vectors[idx] = BQVector.quantize(self.vectors[idx])
             if new_vectors:
                 self._bq_vectors.extend([BQVector.quantize(v) for v in new_vectors])
+
+        if self._pq_enabled and self._pq_codebook is not None:
+            for d in updated_docs:
+                idx = self.id_to_index[d.id]
+                self._pq_vectors[idx] = self._pq_codebook.encode(self.vectors[idx])
+            if new_vectors:
+                self._pq_vectors.extend([self._pq_codebook.encode(v) for v in new_vectors])
 
         # If any documents were updated, rebuild the full BM25 index and mark ANN dirty
         if updated_docs:
@@ -301,6 +311,26 @@ class Collection:
         with self._lock.write():
             self._bq_enabled = True
             self._bq_vectors = [BQVector.quantize(v) for v in self.vectors]
+
+    def train_pq(self, m: Optional[int] = None, max_samples: Optional[int] = None) -> None:
+        """Trains a Product Quantization codebook across M sub-spaces (up to 64x RAM reduction)."""
+        with self._lock.write():
+            if len(self.vectors) == 0:
+                raise ValueError("Cannot train PQ on an empty collection.")
+            train_vecs = self.vectors[:max_samples] if max_samples else self.vectors
+            self._pq_codebook = PQCodebook.train(train_vecs, m=m)
+            self._pq_vectors = [self._pq_codebook.encode(v) for v in self.vectors]
+            self._pq_enabled = True
+
+    def enable_pq(self) -> None:
+        """Enables Product Quantization. Automatically trains codebook if not yet initialized."""
+        with self._lock.write():
+            if not self._pq_enabled:
+                if self._pq_codebook is None:
+                    train_vecs = self.vectors
+                    self._pq_codebook = PQCodebook.train(train_vecs)
+                self._pq_vectors = [self._pq_codebook.encode(v) for v in self.vectors]
+                self._pq_enabled = True
 
     def build_hnsw(self, m: int = 16, ef_construction: int = 64, ef_search: int = 32) -> Dict[str, Any]:
         """Builds HNSW graph index for O(log N) ANN vector search."""
@@ -404,8 +434,28 @@ class Collection:
                         ))
                     return results
 
-                # Two-Stage BQ accelerated search or exact vector search
-                if self._bq_enabled:
+                # Two-Stage PQ / BQ accelerated search or exact vector search
+                if self._pq_enabled and self._pq_codebook is not None:
+                    lut = self._pq_codebook.compute_lut(q_vec, metric=self.metric.value)
+                    valid_indices = np.where(mask)[0]
+                    dense_scores = np.full(n, -np.inf, dtype=np.float32)
+                    if len(valid_indices) > 0:
+                        candidates = []
+                        for idx in valid_indices:
+                            s = self._pq_codebook.score_adc(self._pq_vectors[idx], lut, metric=self.metric.value)
+                            candidates.append((idx, s))
+                        candidates.sort(key=lambda x: x[1], reverse=True)
+                        rerank_count = min(len(candidates), max(top_k * 4, 32))
+                        top_candidates = [c[0] for c in candidates[:rerank_count]]
+                        sub_scores = compute_distances(
+                            q_vec,
+                            self.vectors[top_candidates],
+                            metric=self.metric,
+                            is_normalized=(self.metric == Metric.COSINE)
+                        )
+                        for idx, score in zip(top_candidates, sub_scores):
+                            dense_scores[idx] = float(score)
+                elif self._bq_enabled:
                     q_bq = BQVector.quantize(q_vec)
                     valid_indices = np.where(mask)[0]
                     dense_scores = np.full(n, -np.inf, dtype=np.float32)
@@ -604,6 +654,8 @@ class Collection:
                     self._ann_dirty = True
                 if self._bq_enabled:
                     self._bq_vectors = [self._bq_vectors[i] for i in active_indices]
+                if self._pq_enabled:
+                    self._pq_vectors = [self._pq_vectors[i] for i in active_indices]
 
             doc_payloads = [d.to_dict() for d in self.documents]
             bytes_written = BinaryStorage.write(
@@ -675,6 +727,8 @@ class Collection:
                 "vector_memory_mb": round(vector_bytes / (1024 * 1024), 3),
                 "quantized_sq8": self._sq8_enabled,
                 "quantized_bq": self._bq_enabled,
+                "quantized_pq": self._pq_enabled,
+                "pq_m": self._pq_codebook.m if self._pq_codebook else None,
                 "has_hnsw": self._hnsw_index is not None
             }
             if self._ann_index is not None:

@@ -1,4 +1,5 @@
 pub mod bq;
+pub mod pq;
 pub mod simd;
 pub mod sq8;
 

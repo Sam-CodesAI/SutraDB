@@ -1,9 +1,9 @@
 """
-1-Bit Binary Quantization (BQ) and 8-Bit Scalar Quantization (SQ8) for SutraDB.
-Provides 32x RAM reduction and sub-microsecond Hamming distance vector evaluation.
+1-Bit Binary Quantization (BQ), 8-Bit Scalar Quantization (SQ8), and Product Quantization (PQ) for SutraDB.
+Provides up to 64x RAM reduction, Asymmetric Distance Computation (ADC), and sub-microsecond vector search.
 """
 
-from typing import List, Tuple, Union
+from typing import List, Tuple, Union, Optional
 import numpy as np
 
 try:
@@ -94,3 +94,99 @@ class SQ8Vector:
 
     def dequantize(self) -> np.ndarray:
         return self.data.astype(np.float32) * self.scale + self.min_val
+
+
+class PQVector:
+    """Product Quantized Vector storing M bytes of centroid indices."""
+
+    def __init__(self, codes: Union[List[int], np.ndarray]):
+        self.codes = np.asarray(codes, dtype=np.uint8)
+
+    def to_bytes(self) -> bytes:
+        return self.codes.tobytes()
+
+
+class PQCodebook:
+    """
+    Product Quantization Codebook.
+    Decomposes D-dimensional space into M orthogonal sub-spaces of dimension d* = D // M.
+    """
+
+    def __init__(self, dimension: int, m: int, k: int, centroids: np.ndarray):
+        self.dimension = dimension
+        self.m = m
+        self.k = k
+        self.sub_dim = dimension // m
+        self.centroids = np.asarray(centroids, dtype=np.float32)
+
+    @classmethod
+    def suggest_m(cls, dimension: int) -> int:
+        """Suggests optimal M dividing dimension evenly."""
+        for cand in [64, 48, 32, 24, 16, 8, 4, 2]:
+            if cand <= dimension and dimension % cand == 0:
+                return cand
+        return 1
+
+    @classmethod
+    def train(cls, vectors: Union[List[List[float]], np.ndarray], m: Optional[int] = None, k: int = 256, iters: int = 20, seed: int = 42) -> "PQCodebook":
+        vecs = np.asarray(vectors, dtype=np.float32)
+        n, dim = vecs.shape
+        effective_m = m or cls.suggest_m(dim)
+        if dim % effective_m != 0:
+            raise ValueError(f"Vector dimension {dim} must be divisible by M={effective_m}")
+
+        sub_dim = dim // effective_m
+        k = min(k, n)
+        np.random.seed(seed)
+
+        all_centroids = np.empty((effective_m, k, sub_dim), dtype=np.float32)
+        for m_idx in range(effective_m):
+            sub_vecs = vecs[:, m_idx * sub_dim : (m_idx + 1) * sub_dim]
+            init_indices = np.random.choice(n, size=k, replace=False)
+            centroids = sub_vecs[init_indices].copy()
+
+            for _ in range(iters):
+                dists = np.sum((sub_vecs[:, None, :] - centroids[None, :, :]) ** 2, axis=2)
+                assignments = np.argmin(dists, axis=1)
+                new_centroids = np.array([
+                    sub_vecs[assignments == c].mean(axis=0) if np.any(assignments == c) else centroids[c]
+                    for c in range(k)
+                ])
+                centroids = new_centroids
+
+            all_centroids[m_idx] = centroids
+
+        return cls(dim, effective_m, k, all_centroids)
+
+    def encode(self, vector: Union[List[float], np.ndarray]) -> PQVector:
+        vec = np.asarray(vector, dtype=np.float32)
+        codes = np.empty(self.m, dtype=np.uint8)
+        for m_idx in range(self.m):
+            sub_v = vec[m_idx * self.sub_dim : (m_idx + 1) * self.sub_dim]
+            dists = np.sum((self.centroids[m_idx] - sub_v[None, :]) ** 2, axis=1)
+            codes[m_idx] = int(np.argmin(dists))
+        return PQVector(codes)
+
+    def decode(self, pq_vec: PQVector) -> np.ndarray:
+        out = np.empty(self.dimension, dtype=np.float32)
+        for m_idx in range(self.m):
+            c_idx = pq_vec.codes[m_idx]
+            out[m_idx * self.sub_dim : (m_idx + 1) * self.sub_dim] = self.centroids[m_idx, c_idx]
+        return out
+
+    def compute_lut(self, query: Union[List[float], np.ndarray], metric: str = "cosine") -> np.ndarray:
+        q = np.asarray(query, dtype=np.float32)
+        lut = np.empty((self.m, self.k), dtype=np.float32)
+        for m_idx in range(self.m):
+            q_sub = q[m_idx * self.sub_dim : (m_idx + 1) * self.sub_dim]
+            if metric in ("cosine", "dot_product"):
+                lut[m_idx] = np.dot(self.centroids[m_idx], q_sub)
+            else:
+                lut[m_idx] = np.sum((self.centroids[m_idx] - q_sub[None, :]) ** 2, axis=1)
+        return lut
+
+    def score_adc(self, pq_vec: PQVector, lut: np.ndarray, metric: str = "cosine") -> float:
+        total = float(np.sum(lut[np.arange(self.m), pq_vec.codes]))
+        if metric in ("cosine", "dot_product"):
+            return total
+        return float(1.0 / (1.0 + np.sqrt(max(0.0, total))))

@@ -414,3 +414,68 @@ fn test_geospatial_filters() {
     assert!(ids.contains(&"oak".to_string()));
     assert!(!ids.contains(&"sjc".to_string()));
 }
+
+#[test]
+fn test_pq_quantization_and_two_stage_search() {
+    let mut col = NativeCollection::new(
+        "pq_engine_test".to_string(),
+        16,
+        Metric::Cosine,
+        None,
+        false,
+    ).unwrap();
+
+    let n = 40;
+    let mut docs = Vec::new();
+    let mut vecs = Vec::new();
+
+    for i in 0..n {
+        let mut v = vec![0.0f32; 16];
+        v[i % 16] = 1.0;
+        v[(i + 1) % 16] = 0.5;
+        let v_norm = normalize_copy(&v);
+        docs.push(NativeDocument {
+            id: format!("doc_{}", i),
+            namespace: None,
+            text: format!("Document number {}", i),
+            metadata: json!({"index": i}),
+        });
+        vecs.push(v_norm);
+    }
+
+    col.insert(docs, vecs).unwrap();
+
+    // Train PQ with M=4 (4 sub-spaces of 4 dimensions)
+    col.train_pq(Some(4), None).unwrap();
+    assert!(col.use_pq);
+    assert!(col.pq_codebook.is_some());
+    assert_eq!(col.pq_vectors.len(), n);
+
+    let stats = col.stats();
+    assert_eq!(stats["quantized_pq"], true);
+    assert_eq!(stats["pq_m"], 4);
+
+    // Two-stage ADC search
+    let mut q = vec![0.0f32; 16];
+    q[0] = 1.0;
+    q[1] = 0.5;
+    let q_norm = normalize_copy(&q);
+
+    let res = col.query(
+        Some(&q_norm),
+        None,
+        None,
+        None,
+        5,
+        false,
+        None,
+        60,
+        1.0,
+        1.0,
+        false,
+    ).unwrap();
+
+    assert!(!res.is_empty());
+    assert_eq!(res[0].id, "doc_0");
+    assert!((res[0].score - 1.0).abs() < 1e-4);
+}

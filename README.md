@@ -1,16 +1,16 @@
-# सूत्र DB (SutraDB) v3.1 Industrial Edition
+# सूत्र DB (SutraDB) v3.3 Industrial Edition
 
 [![PyPI](https://img.shields.io/pypi/v/sutradb-core.svg?style=flat&color=blue&logo=pypi)](https://pypi.org/project/sutradb-core/)
 [![Rust](https://img.shields.io/badge/Engine-Rust%20SIMD-orange?logo=rust)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.14-blue?logo=python)](https://python.org)
-[![Tests](https://img.shields.io/badge/Tests-58%2F58%20Passing-brightgreen)](https://github.com/Sam-CodesAI/SutraDB)
-[![Quantization](https://img.shields.io/badge/RAM%20Savings-75%25%20(SQ8)-green)](https://github.com/Sam-CodesAI/SutraDB)
+[![Tests](https://img.shields.io/badge/Tests-82%2F82%20Passing-brightgreen)](https://github.com/Sam-CodesAI/SutraDB)
+[![Quantization](https://img.shields.io/badge/RAM%20Savings-Up%20to%2064x%20(PQ)-green)](https://github.com/Sam-CodesAI/SutraDB)
 [![Web UI](https://img.shields.io/badge/Dashboard-Embedded%20%2Fui-purple)](https://github.com/Sam-CodesAI/SutraDB)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 > **सूत्र (Sūtra)**: *An aphorism or thread of knowledge designed to hold vast wisdom in the most concise, unbreakable form.*
 
-**SutraDB** is an industrial-grade, ultra-fast vector & BM25 hybrid search engine built with a native **Rust core** and zero-overhead **PyO3 Python bindings**. It combines hand-tuned SIMD linear algebra (AVX2/NEON), **SQ8 Scalar Quantization** (75% RAM reduction), **HNSW** and **IVF-Flat** indexing, **multi-tenant namespace isolation**, **zero-copy memory mapping (`memmap2`)**, and official connectors for **LangChain** and **LlamaIndex**.
+**SutraDB** is an industrial-grade, ultra-fast vector & BM25 hybrid search engine built with a native **Rust core** and zero-overhead **PyO3 Python bindings**. It combines hand-tuned SIMD linear algebra (AVX2/NEON), **Product Quantization (PQ)** (up to 64x RAM reduction with Asymmetric Distance Computation), **1-Bit Binary Quantization (BQ)** (32x RAM reduction), **SQ8 Scalar Quantization** (75% RAM reduction), **dynamic online HNSW deletion & healing**, **geo-spatial metadata filtering**, **IVF-Flat** indexing, **multi-tenant namespace isolation**, **zero-copy memory mapping (`memmap2`)**, and official connectors for **LangChain** and **LlamaIndex**.
 
 Designed specifically for production RAG (Retrieval-Augmented Generation), local AI agents, enterprise document retrieval, and low-latency voice AI where cloud vector database round-trips (>40ms) or Chroma's heavy memory overhead are unacceptable.
 
@@ -62,10 +62,11 @@ Designed specifically for production RAG (Retrieval-Augmented Generation), local
 
 ---
 
-## ⚡ Industrial Capabilities (v3.2)
+## ⚡ Industrial Capabilities (v3.3)
 
 * **Native Rust SIMD Core:** Pure Rust computation core releasing the Python GIL during query execution and batch ingestion for zero-overhead multicore scaling.
-* **1-Bit Binary Quantization (BQ):** Compresses 64 float32 dimensions into a single 64-bit word (`u64`), delivering a staggering **32x RAM reduction** and sub-microsecond hardware `POPCNT` Hamming distance evaluation. Features two-stage candidate pruning + exact reranking for $>95\%$ recall.
+* **Product Quantization (PQ) with Asymmetric Distance Computation (ADC):** Decomposes high-dimensional vector spaces into $M$ orthogonal sub-spaces with k-means codebooks, achieving up to **64x RAM reduction**. Query vectors compute precomputed Look-Up Tables (LUT) in L1 cache for sub-millisecond ADC similarity calculation with full-precision two-stage reranking.
+* **1-Bit Binary Quantization (BQ):** Compresses 64 float32 dimensions into a single 64-bit word (`u64`), delivering a staggering **32x RAM reduction** and sub-microsecond hardware `POPCNT` Hamming distance evaluation with two-stage candidate pruning + exact reranking for $>95\%$ recall.
 * **SQ8 Scalar Quantization (8-Bit):** Compresses vectors from 32-bit floats to 8-bit unsigned integers, slashing RAM consumption by **75%** while retaining $>98\%$ recall via asymmetric dot product queries.
 * **Dynamic Online HNSW Graph Deletion & Healing:** Instant node removal with real-time edge re-wiring, neighbor reconnection, and entry point re-election without tombstones or graph fragmentation.
 * **Geo-Spatial Filtering (`$geo_within` & `$geo_box`):** Native great-circle Haversine distance in meters and rectangular bounding box queries supporting coordinate arrays `[lat, lon]` and dictionaries `{"lat": ..., "lon": ...}`.
@@ -85,10 +86,10 @@ Designed specifically for production RAG (Retrieval-Augmented Generation), local
 
 Standard 4-vCPU Linux environment (100,000 documents, 128 dimensions):
 
-| Metric | SutraDB v3.0 (सूत्र DB) | ChromaDB | Pinecone (Cloud) |
+| Metric | SutraDB v3.3 (सूत्र DB) | ChromaDB | Pinecone (Cloud) |
 | :--- | :--- | :--- | :--- |
 | **Engine Core** | **Rust SIMD (PyO3)** | Python / C++ | Cloud Managed |
-| **RAM (100K 128-dim vectors)** | **~14 MB (SQ8 mode)** | ~180 MB | N/A (Remote) |
+| **RAM (100K 128-dim vectors)** | **~3.2 MB (PQ) / ~14 MB (SQ8)** | ~180 MB | N/A (Remote) |
 | **Search Latency (P50)** | **< 0.15 ms** | ~4.2 ms | 35 – 65 ms (Network roundtrip) |
 | **Cold Start Time** | **< 1 ms (Zero-copy mmap)** | ~850 ms | N/A |
 | **Multi-Tenant Namespaces** | **Native Built-in** | Separate DBs required | Namespace metadata |
@@ -277,6 +278,23 @@ bay_results = col.query(
 )
 ```
 
+### 9. Product Quantization (PQ) & Asymmetric Distance Computation (ADC)
+
+Compress high-dimensional vectors by up to **64x** using sub-space decomposition and evaluate similarities in sub-milliseconds via L1-cache Look-Up Tables (LUT):
+
+```python
+# 1. Train codebook using k-means across sub-spaces
+codebook = col.train_pq(num_subspaces=16, k_centroids=256, max_iter=20)
+
+# 2. Enable PQ mode for the collection
+col.enable_pq(codebook)
+
+# 3. Two-Stage ADC Query:
+# Stage 1: Asymmetric Distance Computation via precomputed query-to-centroid Look-Up Table (LUT)
+# Stage 2: Top candidate pool reranked with full-precision vectors
+results = col.query(vector=query_vector, top_k=5)
+```
+
 ---
 
 ## 🌐 Embedded Web Management Dashboard
@@ -296,7 +314,7 @@ http://localhost:8765/ui  or  http://localhost:8765/dashboard
 **Features included out of the box:**
 - ⚡ **Interactive Hybrid Playground:** Test dense vectors, BM25 text queries, and slide RRF weights with live score bar breakdowns.
 - 📊 **2D Vector PCA Projection:** Visualizes high-dimensional embeddings mapped into an interactive in-browser 2D Canvas scatter plot with hover tooltips.
-- 🛠️ **Collection Manager:** 1-click HNSW indexing, 1-Bit BQ quantization (32x RAM reduction), SQ8 quantization (75% RAM reduction), and WAL compaction.
+- 🛠️ **Collection Manager:** 1-click HNSW indexing, Product Quantization (up to 64x RAM savings), 1-Bit BQ (32x savings), SQ8 (75% savings), and WAL compaction.
 - 💻 **Real-Time Code Generator:** Auto-generates exact Python SDK, LangChain, and `curl` code for any query.
 
 ---
@@ -311,6 +329,7 @@ http://localhost:8765/ui  or  http://localhost:8765/dashboard
 - `POST /collections/{name}/upsert` - Idempotent upsert
 - `PATCH /collections/{name}/documents/{id}/metadata` - In-place metadata patch
 - `POST /collections/{name}/hnsw` - Trigger HNSW graph build
+- `POST /collections/{name}/pq` - Train & enable Product Quantization (up to 64x RAM reduction)
 - `POST /collections/{name}/bq` - Enable 1-Bit Binary Quantization (32x RAM reduction)
 - `POST /collections/{name}/sq8` - Enable SQ8 vector quantization
 - `POST /collections/{name}/query` - Hybrid, vector, or lexical search
@@ -322,10 +341,10 @@ http://localhost:8765/ui  or  http://localhost:8765/dashboard
 Run both native Rust and Python test suites:
 
 ```bash
-# 1. Rust engine integration tests (17 tests)
+# 1. Rust engine integration tests (19 tests)
 cargo test
 
-# 2. Python test suite (59 tests)
+# 2. Python test suite (63 tests)
 pytest -v
 ```
 

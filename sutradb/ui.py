@@ -514,6 +514,7 @@ for doc in results:
           <td>
             <button style="font-size: 11px; padding: 4px 8px;" onclick="buildHNSW('${c.name}')">HNSW</button>
             <button style="font-size: 11px; padding: 4px 8px;" onclick="enableBQ('${c.name}')">1-Bit BQ</button>
+            <button style="font-size: 11px; padding: 4px 8px;" onclick="enablePQ('${c.name}')">PQ</button>
             <button style="font-size: 11px; padding: 4px 8px;" onclick="enableSQ8('${c.name}')">SQ8</button>
             <button style="font-size: 11px; padding: 4px 8px;" onclick="compactCollection('${c.name}')">Compact</button>
           </td>
@@ -542,6 +543,11 @@ for doc in results:
     async function enableBQ(name) {
       const res = await fetch('/collections/' + name + '/bq', { method: 'POST' });
       if (res.ok) alert('1-Bit Binary Quantization (BQ) enabled for ' + name + ' (32x RAM savings active)');
+    }
+
+    async function enablePQ(name) {
+      const res = await fetch('/collections/' + name + '/pq', { method: 'POST' });
+      if (res.ok) alert('Product Quantization (PQ) enabled for ' + name + ' (up to 64x RAM savings active)');
     }
 
     async function compactCollection(name) {

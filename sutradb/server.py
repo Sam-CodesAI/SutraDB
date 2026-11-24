@@ -445,6 +445,20 @@ def create_app(data_dir: Optional[str] = None, db: Optional[SutraDB] = None) -> 
         col.enable_bq()
         return {"message": "1-Bit Binary Quantization (BQ) enabled (32x RAM reduction)", "stats": col.stats()}
 
+    @app.post("/collections/{name}/pq", tags=["Indexing"])
+    def enable_pq(name: str):
+        active_db: SutraDB = app.state.db
+        try:
+            col = active_db.get_collection(name)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
+
+        try:
+            col.enable_pq()
+            return {"message": "Product Quantization (PQ) enabled (up to 64x RAM reduction)", "stats": col.stats()}
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
     @app.post("/collections/{name}/save", tags=["Persistence"])
     def save_collection(name: str):
         active_db: SutraDB = app.state.db

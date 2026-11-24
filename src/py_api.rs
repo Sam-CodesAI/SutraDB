@@ -135,6 +135,19 @@ impl PyNativeCollection {
         });
     }
 
+    #[pyo3(signature = (m=None, max_samples=None))]
+    fn train_pq(&mut self, py: Python, m: Option<usize>, max_samples: Option<usize>) -> PyResult<()> {
+        py.allow_threads(|| {
+            self.inner.train_pq(m, max_samples).map_err(Into::into)
+        })
+    }
+
+    fn enable_pq(&mut self, py: Python) -> PyResult<()> {
+        py.allow_threads(|| {
+            self.inner.enable_pq().map_err(Into::into)
+        })
+    }
+
     #[pyo3(signature = (
         vector=None,
         text=None,

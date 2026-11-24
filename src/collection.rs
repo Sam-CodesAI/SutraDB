@@ -5,6 +5,7 @@ use serde_json::Value;
 
 use crate::bm25::BM25Index;
 use crate::distance::bq::BQVector;
+use crate::distance::pq::{PQCodebook, PQConfig, PQVector};
 use crate::distance::simd::{compute_vector_score, normalize_copy};
 use crate::distance::sq8::SQ8Vector;
 use crate::distance::Metric;
@@ -50,6 +51,9 @@ pub struct NativeCollection {
     pub use_sq8: bool,
     pub bq_vectors: Vec<BQVector>,
     pub use_bq: bool,
+    pub pq_codebook: Option<PQCodebook>,
+    pub pq_vectors: Vec<PQVector>,
+    pub use_pq: bool,
     pub id_to_index: HashMap<String, usize>,
     pub tombstones: Vec<bool>,
     pub bm25: BM25Index,
@@ -87,6 +91,9 @@ impl NativeCollection {
             use_sq8: false,
             bq_vectors: Vec::new(),
             use_bq: false,
+            pq_codebook: None,
+            pq_vectors: Vec::new(),
+            use_pq: false,
             id_to_index: HashMap::new(),
             tombstones: Vec::new(),
             bm25: BM25Index::default(),
@@ -195,6 +202,11 @@ impl NativeCollection {
                 if self.use_bq {
                     self.bq_vectors[existing_idx] = BQVector::quantize(&vec);
                 }
+                if self.use_pq {
+                    if let Some(ref cb) = self.pq_codebook {
+                        self.pq_vectors[existing_idx] = cb.encode(&vec);
+                    }
+                }
                 self.documents[existing_idx] = doc;
                 if existing_idx < self.tombstones.len() {
                     self.tombstones[existing_idx] = false;
@@ -212,6 +224,11 @@ impl NativeCollection {
             }
             if self.use_bq {
                 self.bq_vectors.push(BQVector::quantize(&vec));
+            }
+            if self.use_pq {
+                if let Some(ref cb) = self.pq_codebook {
+                    self.pq_vectors.push(cb.encode(&vec));
+                }
             }
 
             self.secondary_index.index_document(idx as u32, &doc.metadata);
@@ -392,6 +409,54 @@ impl NativeCollection {
         }
     }
 
+    pub fn train_pq(&mut self, m: Option<usize>, max_train_samples: Option<usize>) -> Result<(), SutraError> {
+        let active_count = self.count();
+        if active_count == 0 {
+            return Err(SutraError::IndexNotTrained("Cannot train PQ on empty collection".into()));
+        }
+
+        let m_val = m.unwrap_or_else(|| PQCodebook::suggest_m(self.dimension));
+        let active_vectors: Vec<Vec<f32>> = self
+            .vectors
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i >= self.tombstones.len() || !self.tombstones[*i])
+            .map(|(_, v)| v.clone())
+            .collect();
+
+        let train_samples = if let Some(limit) = max_train_samples {
+            active_vectors.iter().take(limit).cloned().collect()
+        } else {
+            active_vectors.clone()
+        };
+
+        let cfg = PQConfig {
+            m: m_val,
+            k: 256.min(train_samples.len()),
+            kmeans_iters: 20,
+            seed: 42,
+        };
+
+        let codebook = PQCodebook::train(&train_samples, self.dimension, cfg)?;
+        self.pq_vectors = self.vectors.iter().map(|v| codebook.encode(v)).collect();
+        self.pq_codebook = Some(codebook);
+        self.use_pq = true;
+        Ok(())
+    }
+
+    pub fn enable_pq(&mut self) -> Result<(), SutraError> {
+        if !self.use_pq {
+            if self.pq_codebook.is_none() {
+                self.train_pq(None, None)?;
+            } else {
+                let cb = self.pq_codebook.as_ref().unwrap();
+                self.pq_vectors = self.vectors.iter().map(|v| cb.encode(v)).collect();
+                self.use_pq = true;
+            }
+        }
+        Ok(())
+    }
+
     pub fn query(
         &mut self,
         vector: Option<&[f32]>,
@@ -479,8 +544,25 @@ impl NativeCollection {
                 }
             }
 
-            // Brute force / exact scoring or two-stage BQ accelerated search
-            if self.use_bq {
+            // Brute force / exact scoring or two-stage PQ / BQ accelerated search
+            if self.use_pq && self.pq_codebook.is_some() {
+                let cb = self.pq_codebook.as_ref().unwrap();
+                let lut = cb.compute_lut(&normalized_q, self.metric);
+                let mut candidates: Vec<(usize, f32)> = Vec::new();
+
+                for (i, pqv) in self.pq_vectors.iter().enumerate() {
+                    if mask[i] {
+                        let score = cb.score_adc(pqv, &lut, self.metric);
+                        candidates.push((i, score));
+                    }
+                }
+
+                candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let rerank_count = (top_k * 4).max(32).min(candidates.len());
+                for &(idx, _) in candidates.iter().take(rerank_count) {
+                    dense_scores[idx] = compute_vector_score(&normalized_q, &self.vectors[idx], self.metric, is_cosine)?;
+                }
+            } else if self.use_bq {
                 // Stage 1: Fast Hamming distance scan over 1-bit quantized bitmasks
                 let q_bq = BQVector::quantize(&normalized_q);
                 let mut candidates: Vec<(usize, u32)> = Vec::new();
@@ -724,6 +806,11 @@ impl NativeCollection {
         if self.use_bq {
             self.bq_vectors = self.vectors.iter().map(|v| BQVector::quantize(v)).collect();
         }
+        if self.use_pq {
+            if let Some(ref cb) = self.pq_codebook {
+                self.pq_vectors = self.vectors.iter().map(|v| cb.encode(v)).collect();
+            }
+        }
         self.hnsw = None;
         self.ivf = None;
         self.dirty_index = true;
@@ -735,7 +822,12 @@ impl NativeCollection {
         let vector_bytes = self.vectors.len() * self.dimension * 4;
         let sq8_bytes = if self.use_sq8 { self.sq8_vectors.len() * self.dimension } else { 0 };
         let bq_bytes = if self.use_bq { self.bq_vectors.len() * ((self.dimension + 63) / 64) * 8 } else { 0 };
-        let total_vec_bytes = vector_bytes + sq8_bytes + bq_bytes;
+        let pq_bytes = if self.use_pq && self.pq_codebook.is_some() {
+            self.pq_vectors.len() * self.pq_codebook.as_ref().unwrap().m
+        } else {
+            0
+        };
+        let total_vec_bytes = vector_bytes + sq8_bytes + bq_bytes + pq_bytes;
 
         serde_json::json!({
             "name": self.name,
@@ -748,6 +840,8 @@ impl NativeCollection {
             "vector_memory_mb": ((total_vec_bytes) as f64) / (1024.0 * 1024.0),
             "quantized_sq8": self.use_sq8,
             "quantized_bq": self.use_bq,
+            "quantized_pq": self.use_pq,
+            "pq_m": self.pq_codebook.as_ref().map(|cb| cb.m),
             "has_hnsw": self.hnsw.is_some(),
             "has_ivf": self.ivf.is_some()
         })
