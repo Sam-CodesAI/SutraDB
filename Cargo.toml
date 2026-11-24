@@ -1,0 +1,32 @@
+[package]
+name = "sutradb-core"
+version = "3.0.0"
+edition = "2021"
+authors = ["Samarth Nimangre <samarthknimangre@gmail.com>"]
+description = "High-performance, zero-dependency hybrid vector search & BM25 lexical engine in Rust."
+license = "MIT"
+
+[lib]
+name = "_sutradb"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py310"] }
+rayon = "1.10"
+parking_lot = "0.12"
+memmap2 = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+crc32fast = "1.4"
+rand = "0.8"
+thiserror = "2.0"
+uuid = { version = "1.10", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

@@ -49,6 +49,7 @@ class QueryRequest(BaseModel):
     vector: Optional[List[float]] = Field(None, description="Query dense embedding vector")
     text: Optional[str] = Field(None, description="Lexical search query string")
     filter: Optional[Dict[str, Any]] = Field(None, description="Compound metadata filter dictionary")
+    namespace: Optional[str] = Field(None, description="Multi-tenant namespace filter")
     top_k: int = Field(10, gt=0, description="Max results to return")
     hybrid: bool = Field(True, description="Enable hybrid dense + BM25 search")
     alpha: Optional[float] = Field(None, description="Convex linear weight if not using RRF")
@@ -58,12 +59,24 @@ class QueryRequest(BaseModel):
     use_ann: bool = Field(False, description="Use IVF-Flat ANN index if trained")
 
 
+class HNSWRequest(BaseModel):
+    m: int = Field(16, ge=4, le=128, description="Links per node")
+    ef_construction: int = Field(64, ge=8, description="Beam width during construction")
+    ef_search: int = Field(32, ge=4, description="Beam width during search")
+
+
+class MetadataUpdateRequest(BaseModel):
+    metadata: Dict[str, Any] = Field(..., description="New metadata dictionary")
+
+
 class BatchDeleteRequest(BaseModel):
     ids: List[str] = Field(..., min_length=1, description="List of document IDs to delete")
 
 
-def create_app(data_dir: str = "./sutra_data", db: Optional[SutraDB] = None) -> FastAPI:
+def create_app(data_dir: Optional[str] = None, db: Optional[SutraDB] = None) -> FastAPI:
     """Creates and configures the production FastAPI ASGI application."""
+    import os
+    effective_data_dir = data_dir if data_dir is not None else os.getenv("SUTRA_DATA_DIR", "./sutra_data")
     app = FastAPI(
         title="SutraDB API",
         version=__version__,
@@ -71,7 +84,7 @@ def create_app(data_dir: str = "./sutra_data", db: Optional[SutraDB] = None) -> 
     )
 
     # Injected or initialized database instance
-    app.state.db = db if db is not None else SutraDB(persist_directory=data_dir)
+    app.state.db = db if db is not None else SutraDB(persist_directory=effective_data_dir)
 
     # CORS Middleware
     app.add_middleware(
@@ -132,6 +145,24 @@ def create_app(data_dir: str = "./sutra_data", db: Optional[SutraDB] = None) -> 
             "version": __version__,
             "collections": active_db.list_collections()
         }
+
+    @app.get("/metrics", tags=["Observability"])
+    def prometheus_metrics():
+        active_db: SutraDB = app.state.db
+        lines = [
+            "# HELP sutradb_collections_total Total number of collections",
+            "# TYPE sutradb_collections_total gauge",
+            f"sutradb_collections_total {len(active_db.list_collections())}",
+        ]
+        for name in active_db.list_collections():
+            try:
+                col = active_db.get_collection(name)
+                st = col.stats()
+                lines.append(f'sutradb_documents_count{{collection="{name}"}} {st.get("count", 0)}')
+                lines.append(f'sutradb_vector_memory_bytes{{collection="{name}"}} {st.get("vector_memory_bytes", 0)}')
+            except Exception:
+                continue
+        return Response(content="\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
 
     @app.get("/collections", tags=["Collections"])
     def list_collections():
@@ -268,6 +299,7 @@ def create_app(data_dir: str = "./sutra_data", db: Optional[SutraDB] = None) -> 
                 vector=payload.vector,
                 text=payload.text,
                 filter=payload.filter,
+                namespace=payload.namespace,
                 top_k=payload.top_k,
                 hybrid=payload.hybrid,
                 alpha=payload.alpha,
@@ -282,6 +314,74 @@ def create_app(data_dir: str = "./sutra_data", db: Optional[SutraDB] = None) -> 
             }
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post("/collections/{name}/upsert", tags=["Documents"])
+    async def upsert_documents(name: str, request: Request):
+        active_db: SutraDB = app.state.db
+        try:
+            col = active_db.get_collection(name)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
+
+        try:
+            body = await request.json()
+        except Exception as e:
+            if _is_payload_too_large(e):
+                raise
+            raise HTTPException(status_code=400, detail=f"Invalid JSON body: {str(e)}")
+
+        docs = []
+        if isinstance(body, dict):
+            docs = body.get("documents", [body] if ("vector" in body or "text" in body) else [])
+        elif isinstance(body, list):
+            docs = body
+
+        if not docs:
+            raise HTTPException(status_code=400, detail="Missing 'documents' list")
+
+        try:
+            total_count = col.upsert(docs)
+            return {"upserted": len(docs), "total_count": total_count}
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.patch("/collections/{name}/documents/{id}/metadata", tags=["Documents"])
+    def update_document_metadata(name: str, id: str, payload: MetadataUpdateRequest):
+        active_db: SutraDB = app.state.db
+        try:
+            col = active_db.get_collection(name)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
+
+        updated = col.update_metadata(id, payload.metadata)
+        if not updated:
+            raise HTTPException(status_code=404, detail=f"Document '{id}' not found in collection '{name}'")
+        return {"updated": True, "message": f"Document '{id}' metadata updated"}
+
+    @app.post("/collections/{name}/hnsw", tags=["Indexing"])
+    def build_hnsw(name: str, payload: Optional[HNSWRequest] = None):
+        active_db: SutraDB = app.state.db
+        try:
+            col = active_db.get_collection(name)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
+
+        m = payload.m if payload else 16
+        ef_c = payload.ef_construction if payload else 64
+        ef_s = payload.ef_search if payload else 32
+        res = col.build_hnsw(m=m, ef_construction=ef_c, ef_search=ef_s)
+        return {"message": "HNSW index built", "config": res}
+
+    @app.post("/collections/{name}/sq8", tags=["Indexing"])
+    def enable_sq8(name: str):
+        active_db: SutraDB = app.state.db
+        try:
+            col = active_db.get_collection(name)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
+
+        col.enable_sq8()
+        return {"message": "SQ8 quantization enabled", "stats": col.stats()}
 
     @app.post("/collections/{name}/save", tags=["Persistence"])
     def save_collection(name: str):
@@ -570,5 +670,7 @@ def run_server(
 
 
 if __name__ == "__main__":
-    port_arg = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
-    run_server(port=port_arg)
+    import os
+    port_arg = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.getenv("PORT", "8765"))
+    data_dir_arg = sys.argv[2] if len(sys.argv) > 2 else os.getenv("SUTRA_DATA_DIR", "./sutra_data")
+    run_server(port=port_arg, data_dir=data_dir_arg)

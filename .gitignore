@@ -28,6 +28,9 @@ rag_data/
 *.sutra
 *.tmp
 
+# Rust target
+target/
+
 # Pytest / Coverage
 .pytest_cache/
 .coverage

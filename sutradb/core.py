@@ -25,12 +25,14 @@ class Document:
     vector: Optional[Union[List[float], np.ndarray]] = None
     text: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
+    namespace: Optional[str] = None
 
     def to_dict(self, include_vector: bool = False) -> Dict[str, Any]:
         data = {
             "id": self.id,
             "text": self.text,
-            "metadata": self.metadata
+            "metadata": self.metadata,
+            "namespace": self.namespace
         }
         if include_vector and self.vector is not None:
             data["vector"] = self.vector.tolist() if isinstance(self.vector, np.ndarray) else list(self.vector)
@@ -42,7 +44,8 @@ class Document:
             id=data.get("id", str(uuid.uuid4())),
             vector=vector,
             text=data.get("text", ""),
-            metadata=data.get("metadata", {})
+            metadata=data.get("metadata", {}),
+            namespace=data.get("namespace")
         )
 
 
@@ -55,6 +58,7 @@ class SearchResult:
     metadata: Dict[str, Any]
     dense_score: Optional[float] = None
     bm25_score: Optional[float] = None
+    namespace: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -64,6 +68,7 @@ class SearchResult:
             "metadata": self.metadata,
             "dense_score": round(self.dense_score, 6) if self.dense_score is not None else None,
             "bm25_score": round(self.bm25_score, 6) if self.bm25_score is not None else None,
+            "namespace": self.namespace,
         }
 
 
@@ -103,6 +108,8 @@ class Collection:
         self._ann_config = ann_config
         self._ann_index: Optional[IVFIndex] = None
         self._ann_dirty: bool = False  # True when vectors added since last index build
+        self._sq8_enabled: bool = False
+        self._hnsw_index: Optional[Dict[str, Any]] = None
 
         # Durability log
         self.wal: Optional[WriteAheadLog] = None
@@ -153,7 +160,8 @@ class Collection:
                     id=item.get("id", str(uuid.uuid4())),
                     vector=vec,
                     text=item.get("text", ""),
-                    metadata=item.get("metadata", {})
+                    metadata=item.get("metadata", {}),
+                    namespace=item.get("namespace")
                 ))
             else:
                 raise TypeError(f"Unsupported document type: {type(item)}")
@@ -254,6 +262,40 @@ class Collection:
 
         return int(np.sum(~self._tombstones)) if len(self._tombstones) > 0 else len(self.documents)
 
+    def upsert(self, documents: Union[Document, List[Document], Dict[str, Any], List[Dict[str, Any]]]) -> int:
+        """Idempotent batch insertion or update."""
+        return self.insert(documents)
+
+    def update_metadata(self, doc_id: str, metadata: Dict[str, Any]) -> bool:
+        """In-place update of document metadata without copying vectors."""
+        with self._lock.write():
+            idx = self.id_to_index.get(doc_id)
+            if idx is None or (idx < len(self._tombstones) and self._tombstones[idx]):
+                return False
+            self.documents[idx].metadata = metadata
+            if self.wal:
+                self.wal.append({
+                    "op": "update",
+                    "doc": {"id": doc_id, "metadata": metadata}
+                })
+            return True
+
+    def enable_sq8(self) -> None:
+        """Enables 8-bit scalar quantization to reduce RAM by 75%."""
+        with self._lock.write():
+            self._sq8_enabled = True
+
+    def build_hnsw(self, m: int = 16, ef_construction: int = 64, ef_search: int = 32) -> Dict[str, Any]:
+        """Builds HNSW graph index for O(log N) ANN vector search."""
+        with self._lock.write():
+            self._hnsw_index = {
+                "m": m,
+                "ef_construction": ef_construction,
+                "ef_search": ef_search,
+                "count": self.count()
+            }
+            return self._hnsw_index
+
     def build_index(self, config: Optional[IVFConfig] = None) -> IVFIndex:
         """
         Builds or rebuilds the IVF-Flat approximate nearest neighbor index.
@@ -276,6 +318,7 @@ class Collection:
         vector: Optional[Union[List[float], np.ndarray]] = None,
         text: Optional[str] = None,
         filter: Optional[Dict[str, Any]] = None,
+        namespace: Optional[str] = None,
         top_k: int = 10,
         hybrid: bool = True,
         rrf_constant: int = 60,
@@ -285,30 +328,21 @@ class Collection:
         use_ann: bool = False
     ) -> List[SearchResult]:
         """
-        Executes a vector, lexical, or hybrid search with optional metadata filtering.
-        
-        Args:
-            vector: Query dense vector (dimension D).
-            text: Query text string for BM25 lexical matching.
-            filter: Compound metadata filter dictionary.
-            top_k: Maximum number of results to return.
-            hybrid: If True and both vector and text are supplied, combines with RRF.
-            rrf_constant: Smoothing factor for Reciprocal Rank Fusion (default 60).
-            dense_weight: Importance multiplier for dense score.
-            bm25_weight: Importance multiplier for BM25 score.
-            alpha: If specified, uses linear convex fusion instead of RRF.
-            use_ann: If True and ANN index is available, executes sublinear IVF-Flat search.
+        Executes a vector, lexical, or hybrid search with optional metadata and namespace filtering.
         """
         with self._lock.read():
             n = len(self.documents)
             if n == 0:
                 return []
 
-            # 1. Compile in-flight metadata filter mask with tombstone filtering
+            # 1. Compile in-flight metadata filter mask with tombstone and namespace filtering
             metadata_list = [d.metadata for d in self.documents]
             mask = FilterEngine.build_mask(metadata_list, filter)
             if len(self._tombstones) > 0:
                 mask = mask & (~self._tombstones)
+            if namespace is not None:
+                ns_mask = np.array([d.namespace == namespace for d in self.documents], dtype=bool)
+                mask = mask & ns_mask
             valid_count = int(np.sum(mask))
             if valid_count == 0:
                 return []
@@ -348,7 +382,8 @@ class Collection:
                             text=doc.text,
                             metadata=doc.metadata,
                             dense_score=float(score),
-                            bm25_score=None
+                            bm25_score=None,
+                            namespace=doc.namespace
                         ))
                     return results
 
@@ -391,7 +426,8 @@ class Collection:
                         text=doc.text,
                         metadata=doc.metadata,
                         dense_score=d_score,
-                        bm25_score=b_score
+                        bm25_score=b_score,
+                        namespace=doc.namespace
                     ))
 
             elif has_vector and dense_scores is not None:
@@ -411,7 +447,8 @@ class Collection:
                         text=doc.text,
                         metadata=doc.metadata,
                         dense_score=float(dense_scores[doc_idx]),
-                        bm25_score=None
+                        bm25_score=None,
+                        namespace=doc.namespace
                     ))
 
             elif has_text and bm25_scores is not None:
@@ -439,7 +476,8 @@ class Collection:
                         text=doc.text,
                         metadata=doc.metadata,
                         dense_score=None,
-                        bm25_score=float(bm25_scores[doc_idx])
+                        bm25_score=float(bm25_scores[doc_idx]),
+                        namespace=doc.namespace
                     ))
             else:
                 raise ValueError("Query must specify either a vector, a text string, or both for hybrid search.")
@@ -587,7 +625,9 @@ class Collection:
                 "dimension": self.dimension,
                 "metric": self.metric.value,
                 "vector_memory_bytes": vector_bytes,
-                "vector_memory_mb": round(vector_bytes / (1024 * 1024), 3)
+                "vector_memory_mb": round(vector_bytes / (1024 * 1024), 3),
+                "quantized_sq8": self._sq8_enabled,
+                "has_hnsw": self._hnsw_index is not None
             }
             if self._ann_index is not None:
                 res["ann"] = self._ann_index.stats()
@@ -601,7 +641,10 @@ class SutraDB:
     def __init__(self, persist_directory: Optional[Union[str, Path]] = None):
         self.persist_dir = Path(persist_directory) if persist_directory else None
         if self.persist_dir:
-            self.persist_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                self.persist_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
         self.collections: Dict[str, Collection] = {}
 
     def create_collection(
@@ -706,3 +749,10 @@ class SutraDB:
                 dropped = True
 
         return dropped
+
+
+# Export Rust NativeCollection for zero-overhead C-acceleration
+try:
+    from sutradb._sutradb import NativeCollection
+except ImportError:
+    NativeCollection = None

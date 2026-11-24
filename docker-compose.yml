@@ -1,0 +1,35 @@
+version: "3.8"
+
+services:
+  sutradb:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sutradb:3.0.0
+    container_name: sutradb-server
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - SUTRA_DATA_DIR=/data
+    volumes:
+      - sutra_storage:/data
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 4096M
+        reservations:
+          cpus: "0.5"
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8765/health').read()"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  sutra_storage:
+    driver: local

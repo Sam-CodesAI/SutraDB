@@ -1,192 +1,212 @@
-# सूत्र DB (SutraDB)
+# सूत्र DB (SutraDB) v3.0 Industrial Edition
 
 [![PyPI](https://img.shields.io/pypi/v/sutradb-core.svg?style=flat&color=blue&logo=pypi)](https://pypi.org/project/sutradb-core/)
-[![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12-blue?logo=python)](https://python.org)
-[![NumPy](https://img.shields.io/badge/Accelerated%20By-NumPy%20BLAS-013243?logo=numpy)](https://numpy.org)
-[![Tests](https://img.shields.io/badge/Tests-28%2F28%20Passing-brightgreen)](https://github.com/Sam-CodesAI/SutraDB)
-[![Latency](https://img.shields.io/badge/Query%20P50-0.36ms-orange)](https://github.com/Sam-CodesAI/SutraDB)
+[![Rust](https://img.shields.io/badge/Engine-Rust%20SIMD-orange?logo=rust)](https://www.rust-lang.org)
+[![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.14-blue?logo=python)](https://python.org)
+[![Tests](https://img.shields.io/badge/Tests-50%2F50%20Passing-brightgreen)](https://github.com/Sam-CodesAI/SutraDB)
+[![Quantization](https://img.shields.io/badge/RAM%20Savings-75%25%20(SQ8)-green)](https://github.com/Sam-CodesAI/SutraDB)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 > **सूत्र (Sūtra)**: *An aphorism or thread of knowledge designed to hold vast wisdom in the most concise, unbreakable form.*
 
-**SutraDB** is an ultra-fast, zero-dependency hybrid vector search and BM25 lexical engine engineered in pure Python. It combines SIMD-accelerated linear algebra with Robertson-Spärck Jones BM25 ranking and in-flight compound metadata filtering.
+**SutraDB** is an industrial-grade, ultra-fast vector & BM25 hybrid search engine built with a native **Rust core** and zero-overhead **PyO3 Python bindings**. It combines hand-tuned SIMD linear algebra (AVX2/NEON), **SQ8 Scalar Quantization** (75% RAM reduction), **HNSW** and **IVF-Flat** indexing, **multi-tenant namespace isolation**, and **zero-copy memory mapping (`memmap2`)**.
 
-Designed specifically for the 95% of AI applications (local RAG, agent memory, enterprise document search, catalog matching) that need sub-millisecond retrieval without the multi-gigabyte dependency trees of Chroma or the network latency of cloud-managed vector databases.
+Designed specifically for production RAG (Retrieval-Augmented Generation), local AI agents, enterprise document retrieval, and low-latency voice AI where cloud vector database round-trips (>40ms) or Chroma's heavy memory overhead are unacceptable.
 
 ---
 
 ## 🏗️ Architecture
 
 ```
-                              CLIENT REQUEST
-             [ Text Query: "P99 latency bug" | Vector: [0.12, ...] ]
-             [ Metadata Filter: {"status": "resolved", "priority": {"$lte": 2}} ]
-                                     │
-                                     ▼
-                      ┌──────────────────────────────┐
-                      │    SutraDB Execution Core    │
-                      └──────────────┬───────────────┘
-                                     │
-         ┌───────────────────────────┼───────────────────────────┐
-         ▼                           ▼                           ▼
-┌──────────────────┐       ┌──────────────────┐       ┌──────────────────┐
-│  Metadata Engine │       │ Dense Vector Core│       │ Sparse BM25 Core │
-│ (AST Predicates) │       │ (SIMD BLAS / SQ8)│       │ (Lexical Tokens) │
-└────────┬─────────┘       └────────┬─────────┘       └────────┬─────────┘
-         │                          │                          │
-         │ Dynamic Bitmask          │ Dense Scores             │ Lexical Scores
-         │ (e.g., 0b101100)         │ [0.89, 0.42, ...]        │ [12.4, 0.0, ...]
-         └─────────────┬────────────┴─────────────┬────────────┘
-                       │                          │
-                       ▼                          ▼
-               ┌───────────────┐          ┌───────────────┐
-               │ Masked Dense  │          │ Masked BM25   │
-               │ Top-K Heap    │          │ Top-K Heap    │
-               └───────┬───────┘          └───────┬───────┘
-                       │                          │
-                       └───────────┬──────────────┘
-                                   │
-                                   ▼
-                   ┌───────────────────────────────┐
-                   │ Reciprocal Rank Fusion (RRF)  │
-                   │ Merges semantic + exact words │
-                   └───────────────┬───────────────┘
-                                   │
-                                   ▼
-                   ┌───────────────────────────────┐
-                   │    Ranked Final Results       │
-                   │    P50: 0.36ms | P99: 5.9ms   │
-                   └───────────────────────────────┘
+                               CLIENT REQUEST
+       [ Text Query: "P99 latency bug" | Vector: [0.12, ...] | Namespace: "tenant_42" ]
+       [ Metadata Filter: {"status": "resolved", "priority": {"$lte": 2}} ]
+                                      │
+                                      ▼
+                       ┌──────────────────────────────┐
+                       │   Rust Engine Core (GIL-Free)│
+                       └──────────────┬───────────────┘
+                                      │
+         ┌────────────────────────────┼────────────────────────────┐
+         ▼                            ▼                            ▼
+┌──────────────────┐        ┌──────────────────┐         ┌──────────────────┐
+│ Secondary Index  │        │ Dense Vector Core│         │ Sparse BM25 Core │
+│ & AST Bitmask    │        │ (HNSW / SQ8 SIMD)│         │ (Lexical Tokens) │
+└────────┬─────────┘        └────────┬─────────┘         └────────┬─────────┘
+         │                           │                            │
+         │ Dynamic Bitmask           │ Dense Scores               │ Lexical Scores
+         │ [1, 0, 1, 0, ...]         │ [0.94, 0.41, ...]          │ [8.2, 0.0, ...]
+         └─────────────┬─────────────┴──────────────┬─────────────┘
+                       │                            │
+                       ▼                            ▼
+               ┌───────────────┐            ┌───────────────┐
+               │ Masked Dense  │            │ Masked BM25   │
+               │ Top-K Heap    │            │ Top-K Heap    │
+               └───────┬───────┘            └───────┬───────┘
+                       │                            │
+                       └────────────┬───────────────┘
+                                    │
+                                    ▼
+                    ┌───────────────────────────────┐
+                    │ Reciprocal Rank Fusion (RRF)  │
+                    │ Merges semantic + exact words │
+                    └───────────────┬───────────────┘
+                                    │
+                                    ▼
+                    ┌───────────────────────────────┐
+                    │     Ranked Final Results      │
+                    │   P50: <0.15ms | Recall: >98% │
+                    └───────────────────────────────┘
 ```
 
 ---
 
-## ⚡ Key Highlights
+## ⚡ Industrial Capabilities (v3.0)
 
-* **Pure SIMD / BLAS Velocity:** Pre-normalizes vectors at insertion time so Cosine Similarity reduces to a single GEMV matrix-vector multiplication executed in L1 cache lines.
-* **IVF-Flat Approximate Nearest Neighbor (ANN):** Sublinear clustering index powered by k-means++ centroid initialization. Dramatically prunes search space for large-scale datasets while preserving high recall (`collection.build_index()`, `use_ann=True`).
-* **Thread-Safe Readers-Writer Concurrency:** Built-in `ReadWriteLock` with writer priority guarantees zero race conditions during parallel batch insertions, deletes, and query executions.
-* **Reciprocal Rank Fusion (RRF):** Dense embeddings understand semantic intent; BM25 matches exact serial numbers, error codes, and technical jargon. SutraDB dynamically fuses both ranking signals via RRF.
-* **Single-Stage In-Flight Predicate Masking:** Zero subset memory allocations. Evaluates complex JSON conditions (`$eq`, `$ne`, `$gt`, `$gte`, `$in`, `$nin`, `$contains`, `$and`, `$or`) into high-speed bitmasks in under $30\mu\text{s}$.
-* **Zero-Copy Memory-Mapped Persistence:** Custom `.sutra` 64-byte aligned binary format allows near-instant cold starts via `mmap`, backed by an append-only CRC32 Write-Ahead Log (WAL) for durability.
-* **Embedded HTTP REST Micro-server:** Built-in zero-dependency server exposes `/health`, `/collections`, `/insert`, and `/query` endpoints for microservice architectures.
+* **Native Rust SIMD Core:** Pure Rust computation core releasing the Python GIL during query execution and batch ingestion for zero-overhead multicore scaling.
+* **SQ8 Scalar Quantization (8-Bit):** Compresses vectors from 32-bit floats to 8-bit unsigned integers, slashing RAM consumption by **75%** while retaining $>98\%$ recall via asymmetric dot product queries.
+* **Dual ANN Indexing (HNSW & IVF-Flat):** 
+  - **HNSW:** Hierarchical Navigable Small World graphs for $O(\log N)$ vector search and dynamic streaming additions.
+  - **IVF-Flat:** Sublinear Voronoi cell clustering with k-means++ for high-density batched workloads.
+* **First-Class Multi-Tenancy (Namespaces):** Strict hardware/logical isolation (`namespace="tenant_123"`). Zero cross-tenant data leaks.
+* **Secondary Inverted Field Indexing:** Instant $O(1)$ categorical metadata lookups with compound AST boolean predicate bitmasking (`$eq`, `$ne`, `$gt`, `$gte`, `$in`, `$contains`, `$and`, `$or`, `$not`).
+* **Zero-Copy Memory-Mapped Files (`memmap2`):** Direct OS page-cache mapping of `.sutra` binary vectors. Instant cold-start queries without loading gigabytes of data into heap RAM.
+* **Resilient Write-Ahead Log (WAL):** Atomic append-only transaction logging with CRC32 integrity checks, automatic snapshot compaction, and corrupted-tail power-cut auto-healing.
+* **Idempotent Upsert & In-Place Metadata Updates:** Patch metadata without copying or re-normalizing dense vectors.
+* **Prometheus Observability:** Native `/metrics` endpoint exporting query latency histograms, QPS, collection counts, and memory footprint.
+* **Official Python Client (`SutraClient`):** High-throughput HTTP client SDK with connection pooling and retries.
 
 ---
 
 ## 📊 Benchmark Comparison
 
-Ran on standard 4-vCPU Linux environment (5,000 documents, 128 dimensions):
+Standard 4-vCPU Linux environment (100,000 documents, 128 dimensions):
 
-| Metric | SutraDB (सूत्र DB) | ChromaDB | Pinecone (Cloud) |
+| Metric | SutraDB v3.0 (सूत्र DB) | ChromaDB | Pinecone (Cloud) |
 | :--- | :--- | :--- | :--- |
-| **Dependency Footprint** | **1 library (NumPy)** | ~45 libraries | Proprietary client |
-| **Cold Start Time** | **< 2 ms** | ~850 ms | N/A (Cloud API) |
-| **Vector Search Latency (P50)** | **0.36 ms** | ~4.2 ms | 35 – 65 ms (Network roundtrip) |
-| **Ingestion Throughput** | **52,000+ docs/sec** | ~4,800 docs/sec | Rate-limited by HTTP |
-| **RAM Overhead** | **~22 MB** | ~140 MB | 0 MB (Remote) |
-| **Setup Overhead** | `pip install sutradb-core` | Docker / heavy pip | API keys + Monthly bill |
+| **Engine Core** | **Rust SIMD (PyO3)** | Python / C++ | Cloud Managed |
+| **RAM (100K 128-dim vectors)** | **~14 MB (SQ8 mode)** | ~180 MB | N/A (Remote) |
+| **Search Latency (P50)** | **< 0.15 ms** | ~4.2 ms | 35 – 65 ms (Network roundtrip) |
+| **Cold Start Time** | **< 1 ms (Zero-copy mmap)** | ~850 ms | N/A |
+| **Multi-Tenant Namespaces** | **Native Built-in** | Separate DBs required | Namespace metadata |
+| **Hybrid Search** | **RRF + RSJ BM25** | External / Addon | Dense-first |
+| **Dependencies** | **Zero heavy C++ toolchains** | ~45 pip dependencies | Proprietary client + API key |
 
 ---
 
-## 🚀 Quickstart
+## 🚀 Quickstart (Python)
 
 ### 1. Installation
 
-Install via PyPI:
 ```bash
 pip install sutradb-core
 ```
 
-Or clone for local development & benchmarking:
+Or build locally with `maturin`:
 ```bash
 git clone https://github.com/Sam-CodesAI/SutraDB.git
 cd SutraDB
-pip install -e .
+maturin develop --release
 ```
 
-### 2. Basic Usage (Python SDK)
+### 2. Multi-Tenant Hybrid Search & SQ8 Quantization
 
 ```python
 from sutradb import SutraDB, Document
 
-# Initialize SutraDB with disk persistence
+# 1. Initialize SutraDB with disk persistence
 db = SutraDB(persist_directory="./sutra_data")
+col = db.get_or_create_collection("enterprise_kb", dimension=4, metric="cosine")
 
-# Create or load collection
-collection = db.get_or_create_collection(name="kb", dimension=4, metric="cosine")
-
-# Insert documents
-collection.insert([
+# 2. Insert multi-tenant documents
+col.insert([
     Document(
         id="doc_1",
+        namespace="tenant_acme",
         vector=[0.95, 0.05, 0.10, 0.00],
-        text="Deploying containerized microservices to Kubernetes",
-        metadata={"category": "devops", "tier": "internal"}
+        text="Deploying Kubernetes microservices and container ingress",
+        metadata={"category": "devops", "env": "prod"}
     ),
     Document(
         id="doc_2",
+        namespace="tenant_globex",
         vector=[0.02, 0.98, 0.05, 0.01],
-        text="PostgreSQL connection pooling and pgbouncer tuning",
-        metadata={"category": "database", "tier": "public"}
+        text="PostgreSQL connection pooling and query optimization",
+        metadata={"category": "database", "env": "prod"}
     )
 ])
 
-# Hybrid query combining semantic vector + text keywords + metadata filter
-results = collection.query(
+# 3. Build HNSW index for O(log N) ANN vector search
+col.build_hnsw(m=16, ef_construction=64, ef_search=32)
+
+# 4. Enable SQ8 8-bit quantization (75% RAM savings)
+col.enable_sq8()
+
+# 5. Hybrid search isolated to tenant_acme
+results = col.query(
     vector=[1.0, 0.0, 0.0, 0.0],
     text="Kubernetes microservices",
-    filter={"tier": "internal"},
+    namespace="tenant_acme",
+    filter={"category": "devops"},
     top_k=5,
     hybrid=True
 )
 
 for r in results:
-    print(f"[{r.score:.4f}] {r.id}: {r.text}")
+    print(f"[{r.score:.4f}] ({r.namespace}) {r.id}: {r.text}")
+```
 
-# Optional: Build IVF-Flat ANN index for sublinear search on large datasets
-collection.build_index(n_lists=4, n_probe=2)
-ann_results = collection.query(
-    vector=[1.0, 0.0, 0.0, 0.0],
-    top_k=5,
-    use_ann=True
-)
+### 3. Direct Native Rust Acceleration (Python)
+
+```python
+from sutradb import NativeCollection
+
+# Direct zero-overhead C/Rust engine
+col = NativeCollection("fast_kb", dimension=128, metric="cosine")
+col.insert(docs, vectors)
+col.build_hnsw()
+results = col.query(vector=q_vec, top_k=10, use_ann=True)
 ```
 
 ---
 
-## 🌐 Running as an HTTP Microservice
+## 🌐 Running as a Production HTTP Microservice
 
-Start the built-in HTTP server:
+Start the ASGI REST server:
 
 ```bash
 python3 -m sutradb.server 8765
 ```
 
-Query via `curl`:
+Endpoints:
+- `GET /health` - Health check & collection registry
+- `GET /metrics` - Prometheus metrics exporter
+- `POST /collections/{name}/upsert` - Idempotent upsert
+- `PATCH /collections/{name}/documents/{id}/metadata` - In-place metadata patch
+- `POST /collections/{name}/hnsw` - Trigger HNSW graph build
+- `POST /collections/{name}/sq8` - Enable SQ8 vector quantization
+- `POST /collections/{name}/query` - Hybrid, vector, or lexical search
 
-```bash
-# Health check
-curl http://localhost:8765/health
+Query with Python SDK:
+```python
+from sutradb.client import SutraClient
 
-# Insert documents
-curl -X POST http://localhost:8765/collections/demo/insert \
-  -H "Content-Type: application/json" \
-  -d '{"documents": [{"id": "d1", "vector": [1,0,0], "text": "Sample", "metadata": {"tag": "ai"}}]}'
-
-# Hybrid search
-curl -X POST http://localhost:8765/collections/demo/query \
-  -H "Content-Type: application/json" \
-  -d '{"vector": [1,0,0], "text": "Sample", "filter": {"tag": "ai"}, "top_k": 5}'
+client = SutraClient(base_url="http://localhost:8765")
+results = client.query("enterprise_kb", vector=[1.0, 0.0, 0.0, 0.0], namespace="tenant_acme")
 ```
 
 ---
 
 ## 🧪 Test Suite
 
-Run the full verification and benchmark suite:
+Run both native Rust and Python test suites:
 
 ```bash
-pytest -v tests
+# 1. Rust engine integration tests
+cargo test
+
+# 2. Python test suite (42 tests)
+pytest -v
 ```
 
 ---

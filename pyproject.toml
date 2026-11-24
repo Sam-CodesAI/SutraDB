@@ -1,11 +1,11 @@
 [build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
 
 [project]
 name = "sutradb-core"
-version = "2.2.1"
-description = "High-performance, zero-dependency hybrid vector search & BM25 lexical engine with IVF-Flat ANN indexing in pure Python."
+version = "3.0.0"
+description = "Industrial-grade, zero-dependency hybrid vector search & BM25 lexical engine with HNSW, SQ8, and IVF-Flat indexing in Rust."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -18,9 +18,12 @@ keywords = [
     "semantic-search",
     "bm25",
     "hybrid-search",
+    "hnsw",
+    "sq8",
     "rag",
     "llm",
-    "machine-learning"
+    "machine-learning",
+    "rust"
 ]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
@@ -30,13 +33,16 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
     "Topic :: Database",
     "Topic :: Scientific/Engineering :: Artificial Intelligence"
 ]
 dependencies = [
     "numpy>=1.24.0",
     "fastapi>=0.100.0",
-    "uvicorn>=0.20.0"
+    "uvicorn>=0.20.0",
+    "pydantic>=2.0.0",
+    "httpx>=0.24.0"
 ]
 
 [project.urls]
@@ -49,12 +55,14 @@ Documentation = "https://github.com/Sam-CodesAI/SutraDB#readme"
 dev = [
     "pytest>=8.0.0",
     "httpx>=0.24.0",
-    "psutil>=5.9.0"
+    "psutil>=5.9.0",
+    "maturin>=1.5.0"
 ]
 
 [project.scripts]
 sutradb = "sutradb.server:run_server"
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["sutradb*"]
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "sutradb._sutradb"
+python-source = "."
