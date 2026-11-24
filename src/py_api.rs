@@ -22,17 +22,41 @@ pub struct PyNativeCollection {
 #[pymethods]
 impl PyNativeCollection {
     #[new]
-    #[pyo3(signature = (name, dimension, metric="cosine", storage_path=None, enable_wal=false))]
+    #[pyo3(signature = (name, dimension, metric="cosine", storage_path=None, enable_wal=false, analyzer=None))]
     fn new(
         name: String,
         dimension: usize,
         metric: &str,
         storage_path: Option<String>,
         enable_wal: bool,
+        analyzer: Option<Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
         let m = Metric::from_str(metric)?;
         let path = storage_path.map(PathBuf::from);
-        let col = NativeCollection::new(name, dimension, m, path, enable_wal)?;
+
+        let mut config = crate::bm25::AnalyzerConfig::default();
+        if let Some(dict) = analyzer {
+            if let Some(lc) = dict.get_item("lowercase")? {
+                config.lowercase = lc.extract::<bool>()?;
+            }
+            if let Some(st) = dict.get_item("stemmer")? {
+                config.stemmer = st.extract::<bool>()?;
+            }
+            if let Some(sw) = dict.get_item("stopwords")? {
+                config.stopwords = sw.extract::<bool>()?;
+            }
+            if let Some(lang) = dict.get_item("language")? {
+                config.language = lang.extract::<String>()?;
+            }
+            if let Some(si) = dict.get_item("split_identifiers")? {
+                config.split_identifiers = si.extract::<bool>()?;
+            }
+            if let Some(cjk) = dict.get_item("cjk_bigrams")? {
+                config.cjk_bigrams = cjk.extract::<bool>()?;
+            }
+        }
+        let anz = crate::bm25::Analyzer::new(config);
+        let col = NativeCollection::with_analyzer(name, dimension, m, path, enable_wal, anz)?;
         Ok(Self { inner: col })
     }
 
@@ -290,6 +314,37 @@ fn tokenize_text(text: &str) -> Vec<String> {
     crate::bm25::tokenizer::tokenize(text)
 }
 
+#[pyfunction]
+fn detect_simd() -> String {
+    crate::distance::simd::detect_simd_capabilities().to_string()
+}
+
+#[pyfunction]
+fn stem_word(word: &str, language: &str) -> String {
+    crate::bm25::stemmer::stem(word, language)
+}
+
+#[pyfunction]
+#[pyo3(signature = (text, language="english"))]
+fn analyze_text(text: &str, language: &str) -> Vec<String> {
+    let mut config = crate::bm25::AnalyzerConfig::default();
+    config.language = language.to_string();
+    let anz = crate::bm25::Analyzer::new(config);
+    anz.analyze(text)
+}
+
+#[pyfunction]
+#[pyo3(signature = (query, vectors, metric="cosine", is_normalized=false))]
+fn batch_vector_distances(
+    query: Vec<f32>,
+    vectors: Vec<Vec<f32>>,
+    metric: &str,
+    is_normalized: bool,
+) -> PyResult<Vec<f32>> {
+    let m = Metric::from_str(metric)?;
+    Ok(crate::distance::simd::batch_distances(&query, &vectors, m, is_normalized))
+}
+
 pub fn register_module(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyNativeCollection>()?;
     m.add_function(wrap_pyfunction!(simd_dot, m)?)?;
@@ -300,5 +355,9 @@ pub fn register_module(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bq_hamming, m)?)?;
     m.add_function(wrap_pyfunction!(haversine, m)?)?;
     m.add_function(wrap_pyfunction!(tokenize_text, m)?)?;
+    m.add_function(wrap_pyfunction!(detect_simd, m)?)?;
+    m.add_function(wrap_pyfunction!(stem_word, m)?)?;
+    m.add_function(wrap_pyfunction!(analyze_text, m)?)?;
+    m.add_function(wrap_pyfunction!(batch_vector_distances, m)?)?;
     Ok(())
 }

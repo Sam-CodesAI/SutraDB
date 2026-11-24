@@ -72,6 +72,24 @@ impl NativeCollection {
         storage_path: Option<PathBuf>,
         enable_wal: bool,
     ) -> Result<Self, SutraError> {
+        Self::with_analyzer(
+            name,
+            dimension,
+            metric,
+            storage_path,
+            enable_wal,
+            crate::bm25::Analyzer::default(),
+        )
+    }
+
+    pub fn with_analyzer(
+        name: String,
+        dimension: usize,
+        metric: Metric,
+        storage_path: Option<PathBuf>,
+        enable_wal: bool,
+        analyzer: crate::bm25::Analyzer,
+    ) -> Result<Self, SutraError> {
         let mut wal = None;
         if enable_wal {
             if let Some(ref sp) = storage_path {
@@ -96,7 +114,7 @@ impl NativeCollection {
             use_pq: false,
             id_to_index: HashMap::new(),
             tombstones: Vec::new(),
-            bm25: BM25Index::default(),
+            bm25: BM25Index::with_analyzer(1.5, 0.75, analyzer),
             hnsw: None,
             ivf: None,
             secondary_index: SecondaryIndex::new(),
@@ -586,15 +604,37 @@ impl NativeCollection {
                 }
             } else if self.use_sq8 {
                 let q_sum: f32 = normalized_q.iter().sum();
-                for (i, sq) in self.sq8_vectors.iter().enumerate() {
-                    if mask[i] {
-                        dense_scores[i] = sq.asymmetric_dot_product(&normalized_q, q_sum);
+                if self.sq8_vectors.len() >= 64 {
+                    use rayon::prelude::*;
+                    dense_scores = self.sq8_vectors.par_iter().enumerate().map(|(i, sq)| {
+                        if mask[i] {
+                            sq.asymmetric_dot_product(&normalized_q, q_sum)
+                        } else {
+                            0.0
+                        }
+                    }).collect();
+                } else {
+                    for (i, sq) in self.sq8_vectors.iter().enumerate() {
+                        if mask[i] {
+                            dense_scores[i] = sq.asymmetric_dot_product(&normalized_q, q_sum);
+                        }
                     }
                 }
             } else {
-                for (i, v) in self.vectors.iter().enumerate() {
-                    if mask[i] {
-                        dense_scores[i] = compute_vector_score(&normalized_q, v, self.metric, is_cosine)?;
+                if self.vectors.len() >= 64 {
+                    use rayon::prelude::*;
+                    dense_scores = self.vectors.par_iter().enumerate().map(|(i, v)| {
+                        if mask[i] {
+                            compute_vector_score(&normalized_q, v, self.metric, is_cosine).unwrap_or(0.0)
+                        } else {
+                            0.0
+                        }
+                    }).collect();
+                } else {
+                    for (i, v) in self.vectors.iter().enumerate() {
+                        if mask[i] {
+                            dense_scores[i] = compute_vector_score(&normalized_q, v, self.metric, is_cosine)?;
+                        }
                     }
                 }
             }
@@ -843,7 +883,15 @@ impl NativeCollection {
             "quantized_pq": self.use_pq,
             "pq_m": self.pq_codebook.as_ref().map(|cb| cb.m),
             "has_hnsw": self.hnsw.is_some(),
-            "has_ivf": self.ivf.is_some()
+            "has_ivf": self.ivf.is_some(),
+            "simd_level": crate::distance::simd::detect_simd_capabilities().to_string(),
+            "analyzer": {
+                "language": self.bm25.analyzer.config.language,
+                "stemmer": self.bm25.analyzer.config.stemmer,
+                "stopwords": self.bm25.analyzer.config.stopwords,
+                "split_identifiers": self.bm25.analyzer.config.split_identifiers,
+                "cjk_bigrams": self.bm25.analyzer.config.cjk_bigrams,
+            }
         })
     }
 }

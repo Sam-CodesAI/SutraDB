@@ -156,3 +156,81 @@ pub fn compute_vector_score(
         }
     }
 }
+
+/// Hardware SIMD execution capability level detected at runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimdLevel {
+    AVX512,
+    AVX2,
+    NEON,
+    Scalar,
+}
+
+impl std::fmt::Display for SimdLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AVX512 => write!(f, "AVX-512 FMA"),
+            Self::AVX2 => write!(f, "AVX2 / FMA"),
+            Self::NEON => write!(f, "ARM NEON"),
+            Self::Scalar => write!(f, "Scalar 8-Way Unrolled"),
+        }
+    }
+}
+
+/// Dynamically detects CPU hardware capabilities at runtime for optimal instruction dispatch.
+pub fn detect_simd_capabilities() -> SimdLevel {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512dq") {
+            return SimdLevel::AVX512;
+        }
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return SimdLevel::AVX2;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            return SimdLevel::NEON;
+        }
+    }
+    SimdLevel::Scalar
+}
+
+/// Computes similarity scores for a batch of candidate vectors against a single query vector.
+/// Uses Rayon work-stealing concurrency when batch size >= 64, saturating multicore execution.
+pub fn batch_distances(
+    query: &[f32],
+    vectors: &[Vec<f32>],
+    metric: Metric,
+    is_normalized: bool,
+) -> Vec<f32> {
+    use rayon::prelude::*;
+
+    if vectors.len() >= 64 {
+        vectors
+            .par_iter()
+            .map(|v| compute_vector_score(query, v, metric, is_normalized).unwrap_or(0.0))
+            .collect()
+    } else {
+        vectors
+            .iter()
+            .map(|v| compute_vector_score(query, v, metric, is_normalized).unwrap_or(0.0))
+            .collect()
+    }
+}
+
+/// Evaluates distance matrix between multiple query vectors and database vectors using Rayon.
+pub fn batch_matrix_distance(
+    queries: &[Vec<f32>],
+    vectors: &[Vec<f32>],
+    metric: Metric,
+    is_normalized: bool,
+) -> Vec<Vec<f32>> {
+    use rayon::prelude::*;
+
+    queries
+        .par_iter()
+        .map(|q| batch_distances(q, vectors, metric, is_normalized))
+        .collect()
+}

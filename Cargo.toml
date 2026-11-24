@@ -1,6 +1,6 @@
 [package]
 name = "sutradb-core"
-version = "3.3.0"
+version = "3.4.0"
 edition = "2021"
 authors = ["Samarth Nimangre <samarthknimangre@gmail.com>"]
 description = "High-performance, zero-dependency hybrid vector search & BM25 lexical engine in Rust."
@@ -13,7 +13,6 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 pyo3 = { version = "0.23", features = ["extension-module", "abi3-py310"] }
 rayon = "1.10"
-parking_lot = "0.12"
 memmap2 = "0.9"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

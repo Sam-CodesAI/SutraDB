@@ -479,3 +479,76 @@ fn test_pq_quantization_and_two_stage_search() {
     assert_eq!(res[0].id, "doc_0");
     assert!((res[0].score - 1.0).abs() < 1e-4);
 }
+
+#[test]
+fn test_nlp_analyzer_stemming_and_stopwords() {
+    use _sutradb::bm25::analyzer::Analyzer;
+
+    let analyzer = Analyzer::default();
+    let text = "Deploying containerized microservices and connection pools in Kubernetes";
+    let tokens = analyzer.analyze(text);
+
+    // Stopwords "and" & "in" should be filtered out
+    assert!(!tokens.contains(&"and".to_string()));
+    assert!(!tokens.contains(&"in".to_string()));
+
+    // Words should be stemmed
+    assert!(tokens.contains(&"deploi".to_string()));
+    assert!(tokens.contains(&"microservic".to_string()));
+    assert!(tokens.contains(&"connect".to_string()));
+    assert!(tokens.contains(&"pool".to_string()));
+    assert!(tokens.contains(&"kubernet".to_string()));
+
+    // Test code identifier splitting
+    let code_tokens = analyzer.analyze("getUserProfile and fetch_jwt_token");
+    assert!(code_tokens.contains(&"get".to_string()));
+    assert!(code_tokens.contains(&"user".to_string()));
+    assert!(code_tokens.contains(&"profil".to_string()));
+    assert!(code_tokens.contains(&"fetch".to_string()));
+    assert!(code_tokens.contains(&"jwt".to_string()));
+    assert!(code_tokens.contains(&"token".to_string()));
+}
+
+#[test]
+fn test_nlp_multilingual_and_cjk_support() {
+    use _sutradb::bm25::analyzer::{Analyzer, AnalyzerConfig};
+
+    // Spanish
+    let mut es_config = AnalyzerConfig::default();
+    es_config.language = "spanish".to_string();
+    let es_analyzer = Analyzer::new(es_config);
+    let es_tokens = es_analyzer.analyze("Optimización y despliegue de servidores");
+    // "y" and "de" are stopwords
+    assert!(!es_tokens.contains(&"y".to_string()));
+    assert!(!es_tokens.contains(&"de".to_string()));
+    assert!(es_tokens.contains(&"optim".to_string()));
+
+    // CJK bigrams
+    let cjk_analyzer = Analyzer::default();
+    let cjk_tokens = cjk_analyzer.analyze("自然语言处理");
+    assert!(cjk_tokens.contains(&"自然".to_string()));
+    assert!(cjk_tokens.contains(&"语言".to_string()));
+    assert!(cjk_tokens.contains(&"处理".to_string()));
+}
+
+#[test]
+fn test_simd_auto_dispatch_and_batch_distances() {
+    use _sutradb::distance::simd::{detect_simd_capabilities, batch_distances};
+
+    let simd_level = detect_simd_capabilities();
+    println!("Detected CPU SIMD Level: {}", simd_level);
+
+    let query = vec![1.0f32, 0.0, 0.0, 0.0];
+    let mut vectors = Vec::new();
+    for i in 0..100 {
+        let mut v = vec![0.0f32; 4];
+        v[i % 4] = 1.0;
+        vectors.push(v);
+    }
+
+    let distances = batch_distances(&query, &vectors, Metric::Cosine, true);
+    assert_eq!(distances.len(), 100);
+    assert_eq!(distances[0], 1.0);
+    assert_eq!(distances[1], 0.0);
+    assert_eq!(distances[4], 1.0);
+}

@@ -1,9 +1,15 @@
 pub mod tokenizer;
+pub mod stemmer;
+pub mod stopwords;
+pub mod analyzer;
+
 pub use tokenizer::tokenize;
+pub use analyzer::{Analyzer, AnalyzerConfig};
 
 use std::collections::HashMap;
 
-/// In-memory BM25Okapi lexical index with Robertson-Spärck Jones IDF
+/// In-memory BM25Okapi lexical index with Robertson-Spärck Jones IDF,
+/// multi-lingual linguistic analyzer (Porter stemming, stopwords, CJK, identifier splitting),
 /// and in-flight bitmasking support.
 #[derive(Debug, Clone)]
 pub struct BM25Index {
@@ -12,6 +18,7 @@ pub struct BM25Index {
     pub doc_count: u32,
     pub doc_lengths: Vec<u32>,
     pub total_length: u64,
+    pub analyzer: Analyzer,
     // term -> list of (doc_index, term_frequency)
     pub inverted_index: HashMap<String, Vec<(u32, u32)>>,
     // term -> number of docs containing term
@@ -27,12 +34,17 @@ impl Default for BM25Index {
 
 impl BM25Index {
     pub fn new(k1: f32, b: f32) -> Self {
+        Self::with_analyzer(k1, b, Analyzer::default())
+    }
+
+    pub fn with_analyzer(k1: f32, b: f32, analyzer: Analyzer) -> Self {
         Self {
             k1,
             b,
             doc_count: 0,
             doc_lengths: Vec::new(),
             total_length: 0,
+            analyzer,
             inverted_index: HashMap::new(),
             doc_frequencies: HashMap::new(),
             idf_cache: HashMap::new(),
@@ -51,7 +63,7 @@ impl BM25Index {
         let start_idx = self.doc_count;
         for (i, text) in corpus.iter().enumerate() {
             let doc_idx = start_idx + i as u32;
-            let tokens = tokenize(text);
+            let tokens = self.analyzer.analyze(text);
             let len = tokens.len() as u32;
             self.doc_lengths.push(len);
             self.total_length += len as u64;
@@ -98,7 +110,7 @@ impl BM25Index {
         }
 
         let mut scores = vec![0.0f32; self.doc_count as usize];
-        let query_terms = tokenize(query);
+        let query_terms = self.analyzer.analyze(query);
         if query_terms.is_empty() {
             return scores;
         }

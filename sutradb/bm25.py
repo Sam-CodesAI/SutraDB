@@ -9,29 +9,7 @@ import re
 from typing import Dict, List, Optional, Set, Tuple
 import numpy as np
 
-# Standard lightweight English stopwords
-STOPWORDS: Set[str] = {
-    "a", "about", "above", "after", "again", "against", "all", "am", "an", "and",
-    "any", "are", "aren't", "as", "at", "be", "because", "been", "before", "being",
-    "below", "between", "both", "but", "by", "can't", "cannot", "could", "couldn't",
-    "did", "didn't", "do", "does", "doesn't", "doing", "don't", "down", "during",
-    "each", "few", "for", "from", "further", "had", "hadn't", "has", "hasn't",
-    "have", "haven't", "having", "he", "he'd", "he'll", "he's", "her", "here",
-    "here's", "hers", "herself", "him", "himself", "his", "how", "how's", "i",
-    "i'd", "i'll", "i'm", "i've", "if", "in", "into", "is", "isn't", "it", "it's",
-    "its", "itself", "let's", "me", "more", "most", "mustn't", "my", "myself",
-    "no", "nor", "not", "of", "off", "on", "once", "only", "or", "other", "ought",
-    "our", "ours", "ourselves", "out", "over", "own", "same", "shan't", "she",
-    "she'd", "she'll", "she's", "should", "shouldn't", "so", "some", "such",
-    "than", "that", "that's", "the", "their", "theirs", "them", "themselves",
-    "then", "there", "there's", "these", "they", "they'd", "they'll", "they're",
-    "they've", "this", "those", "through", "to", "too", "under", "until", "up",
-    "very", "was", "wasn't", "we", "we'd", "we'll", "we're", "we've", "were",
-    "weren't", "what", "what's", "when", "when's", "where", "where's", "which",
-    "while", "who", "who's", "whom", "why", "why's", "with", "won't", "would",
-    "wouldn't", "you", "you'd", "you'll", "you're", "you've", "your", "yours",
-    "yourself", "yourselves"
-}
+from .nlp import Analyzer, AnalyzerConfig, STOPWORDS, tokenize as nlp_tokenize
 
 _WORD_PATTERN = re.compile(r"\b[a-zA-Z0-9_\-\.\$]+\b")
 
@@ -47,11 +25,12 @@ def tokenize(text: str, filter_stopwords: bool = False) -> List[str]:
 
 
 class BM25Index:
-    """In-memory BM25Okapi index with dynamic document updates."""
+    """In-memory BM25Okapi index with linguistic analyzer & dynamic document updates."""
 
-    def __init__(self, k1: float = 1.5, b: float = 0.75):
+    def __init__(self, k1: float = 1.5, b: float = 0.75, analyzer: Optional[Analyzer] = None):
         self.k1 = k1
         self.b = b
+        self.analyzer = analyzer or Analyzer()
         self.doc_count: int = 0
         self.doc_lengths: List[int] = []
         self.avg_doc_length: float = 0.0
@@ -64,13 +43,13 @@ class BM25Index:
         self.idf_cache: Dict[str, float] = {}
 
     def add_documents(self, corpus: List[str]) -> None:
-        """Indexes a batch of raw text strings."""
+        """Indexes a batch of raw text strings using the linguistic analyzer."""
         start_idx = self.doc_count
         total_len = sum(self.doc_lengths)
 
         for i, text in enumerate(corpus):
             doc_idx = start_idx + i
-            tokens = tokenize(text)
+            tokens = self.analyzer.analyze(text)
             doc_len = len(tokens)
             self.doc_lengths.append(doc_len)
             total_len += doc_len
@@ -115,7 +94,7 @@ class BM25Index:
             return np.empty(0, dtype=np.float32)
 
         scores = np.zeros(self.doc_count, dtype=np.float32)
-        query_terms = tokenize(query)
+        query_terms = self.analyzer.analyze(query)
         if not query_terms:
             return scores
 

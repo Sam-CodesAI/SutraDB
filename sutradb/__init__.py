@@ -16,8 +16,9 @@ from sutradb.ann import IVFIndex, IVFConfig, auto_n_lists
 from sutradb.integrations.langchain import SutraDBVectorStore
 from sutradb.integrations.llamaindex import SutraDBLlamaIndexVectorStore
 from sutradb.quantization import BQVector, SQ8Vector, PQVector, PQCodebook
+from sutradb.nlp import Analyzer, AnalyzerConfig, PorterStemmer
 
-__version__ = "3.3.0"
+__version__ = "3.4.0"
 __all__ = [
     "SutraDB",
     "Collection",
@@ -31,6 +32,9 @@ __all__ = [
     "SQ8Vector",
     "PQVector",
     "PQCodebook",
+    "Analyzer",
+    "AnalyzerConfig",
+    "PorterStemmer",
     "Metric",
     "FilterEngine",
     "BM25Index",

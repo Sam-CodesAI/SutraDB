@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "sutradb-core"
-version = "3.3.0"
+version = "3.4.0"
 description = "Industrial-grade, zero-dependency hybrid vector search & BM25 lexical engine with HNSW, SQ8, and IVF-Flat indexing in Rust."
 readme = "README.md"
 requires-python = ">=3.10"

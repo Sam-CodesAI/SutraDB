@@ -1,16 +1,17 @@
-# सूत्र DB (SutraDB) v3.3 Industrial Edition
+# सूत्र DB (SutraDB) v3.4 Hardware & NLP Scaling Edition
 
 [![PyPI](https://img.shields.io/pypi/v/sutradb-core.svg?style=flat&color=blue&logo=pypi)](https://pypi.org/project/sutradb-core/)
-[![Rust](https://img.shields.io/badge/Engine-Rust%20SIMD-orange?logo=rust)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/Engine-Rust%20SIMD%20%2B%20Rayon-orange?logo=rust)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.14-blue?logo=python)](https://python.org)
-[![Tests](https://img.shields.io/badge/Tests-82%2F82%20Passing-brightgreen)](https://github.com/Sam-CodesAI/SutraDB)
+[![Tests](https://img.shields.io/badge/Tests-97%2F97%20Passing-brightgreen)](https://github.com/Sam-CodesAI/SutraDB)
+[![SIMD](https://img.shields.io/badge/SIMD-AVX512%20%7C%20AVX2%20%7C%20NEON-blue)](https://github.com/Sam-CodesAI/SutraDB)
 [![Quantization](https://img.shields.io/badge/RAM%20Savings-Up%20to%2064x%20(PQ)-green)](https://github.com/Sam-CodesAI/SutraDB)
 [![Web UI](https://img.shields.io/badge/Dashboard-Embedded%20%2Fui-purple)](https://github.com/Sam-CodesAI/SutraDB)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 > **सूत्र (Sūtra)**: *An aphorism or thread of knowledge designed to hold vast wisdom in the most concise, unbreakable form.*
 
-**SutraDB** is an industrial-grade, ultra-fast vector & BM25 hybrid search engine built with a native **Rust core** and zero-overhead **PyO3 Python bindings**. It combines hand-tuned SIMD linear algebra (AVX2/NEON), **Product Quantization (PQ)** (up to 64x RAM reduction with Asymmetric Distance Computation), **1-Bit Binary Quantization (BQ)** (32x RAM reduction), **SQ8 Scalar Quantization** (75% RAM reduction), **dynamic online HNSW deletion & healing**, **geo-spatial metadata filtering**, **IVF-Flat** indexing, **multi-tenant namespace isolation**, **zero-copy memory mapping (`memmap2`)**, and official connectors for **LangChain** and **LlamaIndex**.
+**SutraDB** is an industrial-grade, ultra-fast vector & BM25 hybrid search engine built with a native **Rust core** and zero-overhead **PyO3 Python bindings**. It combines runtime hardware CPU auto-dispatch (**AVX-512, AVX2, ARM NEON**), Rayon GIL-free multicore parallel processing, an advanced **Linguistic NLP Analyzer Pipeline** (Porter stemming, Spanish/French/German suffix stemmers, CJK bigrams, code identifier splitting), **Product Quantization (PQ)** (up to 64x RAM reduction with Asymmetric Distance Computation), **1-Bit Binary Quantization (BQ)** (32x RAM reduction), **SQ8 Scalar Quantization** (75% RAM reduction), **dynamic online HNSW deletion & healing**, **geo-spatial metadata filtering**, **IVF-Flat** indexing, **multi-tenant namespace isolation**, **zero-copy memory mapping (`memmap2`)**, and official connectors for **LangChain** and **LlamaIndex**.
 
 Designed specifically for production RAG (Retrieval-Augmented Generation), local AI agents, enterprise document retrieval, and low-latency voice AI where cloud vector database round-trips (>40ms) or Chroma's heavy memory overhead are unacceptable.
 
@@ -62,8 +63,15 @@ Designed specifically for production RAG (Retrieval-Augmented Generation), local
 
 ---
 
-## ⚡ Industrial Capabilities (v3.3)
+## ⚡ Industrial Capabilities (v3.4)
 
+* **Hardware SIMD Auto-Dispatch & Multicore Rayon Acceleration:** Dynamic runtime detection of AVX-512, AVX2, and ARM NEON CPU vector extensions. Batch distances and unindexed candidate scoring automatically scale across all available CPU cores using Rayon parallel iterators with zero GIL contention.
+* **Linguistic NLP Analyzer Pipeline for BM25:** Production-ready multi-lingual text processing with zero external C dependencies:
+  - Algorithmic Porter Stemmer for English.
+  - Suffix stemmers for Spanish, French, and German.
+  - Pre-compiled zero-allocation stopword pruning across multiple languages.
+  - CJK (Chinese, Japanese, Korean) bigram sliding window tokenization (`自然语言` -> `["自然", "语言"]`).
+  - Code & identifier sub-token splitting (`getUserProfile` -> `["get", "user", "profile"]`, `fetch_jwt_token` -> `["fetch", "jwt", "token"]`).
 * **Native Rust SIMD Core:** Pure Rust computation core releasing the Python GIL during query execution and batch ingestion for zero-overhead multicore scaling.
 * **Product Quantization (PQ) with Asymmetric Distance Computation (ADC):** Decomposes high-dimensional vector spaces into $M$ orthogonal sub-spaces with k-means codebooks, achieving up to **64x RAM reduction**. Query vectors compute precomputed Look-Up Tables (LUT) in L1 cache for sub-millisecond ADC similarity calculation with full-precision two-stage reranking.
 * **1-Bit Binary Quantization (BQ):** Compresses 64 float32 dimensions into a single 64-bit word (`u64`), delivering a staggering **32x RAM reduction** and sub-microsecond hardware `POPCNT` Hamming distance evaluation with two-stage candidate pruning + exact reranking for $>95\%$ recall.
@@ -86,14 +94,14 @@ Designed specifically for production RAG (Retrieval-Augmented Generation), local
 
 Standard 4-vCPU Linux environment (100,000 documents, 128 dimensions):
 
-| Metric | SutraDB v3.3 (सूत्र DB) | ChromaDB | Pinecone (Cloud) |
+| Metric | SutraDB v3.4 (सूत्र DB) | ChromaDB | Pinecone (Cloud) |
 | :--- | :--- | :--- | :--- |
-| **Engine Core** | **Rust SIMD (PyO3)** | Python / C++ | Cloud Managed |
+| **Engine Core** | **Rust SIMD + Rayon (PyO3)** | Python / C++ | Cloud Managed |
 | **RAM (100K 128-dim vectors)** | **~3.2 MB (PQ) / ~14 MB (SQ8)** | ~180 MB | N/A (Remote) |
 | **Search Latency (P50)** | **< 0.15 ms** | ~4.2 ms | 35 – 65 ms (Network roundtrip) |
 | **Cold Start Time** | **< 1 ms (Zero-copy mmap)** | ~850 ms | N/A |
 | **Multi-Tenant Namespaces** | **Native Built-in** | Separate DBs required | Namespace metadata |
-| **Hybrid Search** | **RRF + RSJ BM25** | External / Addon | Dense-first |
+| **Hybrid Search** | **Linguistic Analyzer + BM25** | External / Addon | Dense-first |
 | **Dependencies** | **Zero heavy C++ toolchains** | ~45 pip dependencies | Proprietary client + API key |
 
 ---
@@ -295,6 +303,41 @@ col.enable_pq(codebook)
 results = col.query(vector=query_vector, top_k=5)
 ```
 
+### 10. Linguistic NLP Pipeline & Hardware SIMD Dispatch
+
+Configure advanced stemming, stopword pruning, identifier splitting, and CJK tokenization directly on collections:
+
+```python
+from sutradb import SutraDB, Analyzer, AnalyzerConfig
+
+# 1. Initialize collection with custom multi-lingual analyzer
+db = SutraDB()
+col = db.create_collection(
+    name="multilingual_kb",
+    dimension=128,
+    analyzer={
+        "language": "english",          # "english", "spanish", "french", "german"
+        "stemmer": True,                # Algorithmic Porter / Romance suffix stemmer
+        "stopwords": True,              # Pre-compiled stopword removal
+        "split_identifiers": True,      # getUserProfile -> ["get", "user", "profile"]
+        "cjk_bigrams": True             # 自然语言处理 -> ["自然", "语言", "处理"]
+    }
+)
+
+# 2. Inspect host CPU SIMD acceleration features at runtime
+from sutradb._sutradb import detect_simd, batch_vector_distances
+simd_level = detect_simd()
+print(f"Host SIMD Acceleration: {simd_level}")  # e.g., "AVX-512", "AVX2", "ARM NEON"
+
+# 3. Multicore batch distance calculation (GIL-free via Rayon)
+distances = batch_vector_distances(
+    query=[0.1] * 128,
+    vectors=[[0.2] * 128 for _ in range(10000)],
+    metric="cosine",
+    is_normalized=True
+)
+```
+
 ---
 
 ## 🌐 Embedded Web Management Dashboard
@@ -341,10 +384,10 @@ http://localhost:8765/ui  or  http://localhost:8765/dashboard
 Run both native Rust and Python test suites:
 
 ```bash
-# 1. Rust engine integration tests (19 tests)
+# 1. Rust engine integration tests (28 tests)
 cargo test
 
-# 2. Python test suite (63 tests)
+# 2. Python test suite (69 tests)
 pytest -v
 ```
 

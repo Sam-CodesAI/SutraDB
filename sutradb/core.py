@@ -12,6 +12,7 @@ import numpy as np
 from sutradb.distance import Metric, compute_distances, normalize_matrix, normalize_vector
 from sutradb.filters import FilterEngine
 from sutradb.bm25 import BM25Index
+from sutradb.nlp import Analyzer, AnalyzerConfig
 from sutradb.fusion import reciprocal_rank_fusion, linear_score_fusion
 from sutradb.storage import BinaryStorage, WriteAheadLog
 from sutradb.ann import IVFIndex, IVFConfig, auto_n_lists
@@ -83,7 +84,8 @@ class Collection:
         metric: Union[Metric, str] = Metric.COSINE,
         storage_path: Optional[Union[str, Path]] = None,
         enable_wal: bool = False,
-        ann_config: Optional[IVFConfig] = None
+        ann_config: Optional[IVFConfig] = None,
+        analyzer: Optional[Union[Analyzer, AnalyzerConfig, Dict[str, Any]]] = None
     ):
         self.name = name
         self.dimension = int(dimension)
@@ -99,8 +101,17 @@ class Collection:
         # Soft-deletion tombstones (True if deleted, False if active)
         self._tombstones: np.ndarray = np.zeros(0, dtype=bool)
         
-        # BM25 lexical engine
-        self.bm25_index = BM25Index()
+        # Linguistic text analyzer and BM25 lexical engine
+        if isinstance(analyzer, Analyzer):
+            self.analyzer = analyzer
+        elif isinstance(analyzer, AnalyzerConfig):
+            self.analyzer = Analyzer(analyzer)
+        elif isinstance(analyzer, dict):
+            self.analyzer = Analyzer(AnalyzerConfig(**analyzer))
+        else:
+            self.analyzer = Analyzer()
+
+        self.bm25_index = BM25Index(analyzer=self.analyzer)
 
         # Thread safety: ReadWriteLock allows concurrent reads, exclusive writes
         self._lock = ReadWriteLock()
@@ -729,7 +740,14 @@ class Collection:
                 "quantized_bq": self._bq_enabled,
                 "quantized_pq": self._pq_enabled,
                 "pq_m": self._pq_codebook.m if self._pq_codebook else None,
-                "has_hnsw": self._hnsw_index is not None
+                "has_hnsw": self._hnsw_index is not None,
+                "analyzer": {
+                    "language": self.analyzer.config.language,
+                    "stemmer": self.analyzer.config.stemmer,
+                    "stopwords": self.analyzer.config.stopwords,
+                    "split_identifiers": self.analyzer.config.split_identifiers,
+                    "cjk_bigrams": self.analyzer.config.cjk_bigrams,
+                }
             }
             if self._ann_index is not None:
                 res["ann"] = self._ann_index.stats()
@@ -754,7 +772,8 @@ class SutraDB:
         name: str,
         dimension: int,
         metric: Union[Metric, str] = Metric.COSINE,
-        enable_wal: bool = False
+        enable_wal: bool = False,
+        analyzer: Optional[Union[Analyzer, AnalyzerConfig, Dict[str, Any]]] = None
     ) -> Collection:
         """Creates and registers a new collection."""
         if name in self.collections:
@@ -769,7 +788,8 @@ class SutraDB:
             dimension=dimension,
             metric=metric,
             storage_path=storage_path,
-            enable_wal=enable_wal
+            enable_wal=enable_wal,
+            analyzer=analyzer
         )
         self.collections[name] = col
         return col
@@ -814,13 +834,14 @@ class SutraDB:
         name: str,
         dimension: int,
         metric: Union[Metric, str] = Metric.COSINE,
-        enable_wal: bool = False
+        enable_wal: bool = False,
+        analyzer: Optional[Union[Analyzer, AnalyzerConfig, Dict[str, Any]]] = None
     ) -> Collection:
         """Retrieves or initializes a collection."""
         try:
             return self.get_collection(name)
         except KeyError:
-            return self.create_collection(name, dimension, metric, enable_wal=enable_wal)
+            return self.create_collection(name, dimension, metric, enable_wal=enable_wal, analyzer=analyzer)
 
     def list_collections(self) -> List[str]:
         """Returns a list of all active collection names."""
