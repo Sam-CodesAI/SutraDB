@@ -1,5 +1,6 @@
+#[allow(clippy::all, dead_code, unused_imports, non_snake_case)]
 pub mod proto {
-    tonic::include_proto!("sutra");
+    include!("sutra_gen.rs");
 }
 
 pub mod service;
