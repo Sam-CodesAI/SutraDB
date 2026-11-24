@@ -102,18 +102,28 @@ fn test_filter_engine_ast() {
     let meta = json!({
         "tier": "enterprise",
         "priority": 1,
-        "tags": ["cloud", "devops"]
+        "tags": ["cloud", "devops", "ai"],
+        "user": {
+            "profile": {
+                "city": "Seattle",
+                "score": 98.5
+            }
+        }
     });
 
     let filter_pass = json!({
         "tier": "enterprise",
         "priority": {"$lte": 2},
-        "tags": {"$contains": "cloud"}
+        "tags": {"$contains": "cloud"},
+        "user.profile.city": "Seattle",
+        "user.profile.score": {"$gt": 90.0},
+        "tags": {"$all": ["cloud", "ai"]},
+        "tags": {"$size": 3}
     });
     assert!(FilterEngine::evaluate(Some(&meta), Some(&filter_pass)));
 
     let filter_fail = json!({
-        "tier": "community"
+        "user.profile.city": "New York"
     });
     assert!(!FilterEngine::evaluate(Some(&meta), Some(&filter_fail)));
 }

@@ -1,15 +1,16 @@
-# सूत्र DB (SutraDB) v3.0 Industrial Edition
+# सूत्र DB (SutraDB) v3.1 Industrial Edition
 
 [![PyPI](https://img.shields.io/pypi/v/sutradb-core.svg?style=flat&color=blue&logo=pypi)](https://pypi.org/project/sutradb-core/)
 [![Rust](https://img.shields.io/badge/Engine-Rust%20SIMD-orange?logo=rust)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.14-blue?logo=python)](https://python.org)
-[![Tests](https://img.shields.io/badge/Tests-50%2F50%20Passing-brightgreen)](https://github.com/Sam-CodesAI/SutraDB)
+[![Tests](https://img.shields.io/badge/Tests-58%2F58%20Passing-brightgreen)](https://github.com/Sam-CodesAI/SutraDB)
 [![Quantization](https://img.shields.io/badge/RAM%20Savings-75%25%20(SQ8)-green)](https://github.com/Sam-CodesAI/SutraDB)
+[![Web UI](https://img.shields.io/badge/Dashboard-Embedded%20%2Fui-purple)](https://github.com/Sam-CodesAI/SutraDB)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 > **सूत्र (Sūtra)**: *An aphorism or thread of knowledge designed to hold vast wisdom in the most concise, unbreakable form.*
 
-**SutraDB** is an industrial-grade, ultra-fast vector & BM25 hybrid search engine built with a native **Rust core** and zero-overhead **PyO3 Python bindings**. It combines hand-tuned SIMD linear algebra (AVX2/NEON), **SQ8 Scalar Quantization** (75% RAM reduction), **HNSW** and **IVF-Flat** indexing, **multi-tenant namespace isolation**, and **zero-copy memory mapping (`memmap2`)**.
+**SutraDB** is an industrial-grade, ultra-fast vector & BM25 hybrid search engine built with a native **Rust core** and zero-overhead **PyO3 Python bindings**. It combines hand-tuned SIMD linear algebra (AVX2/NEON), **SQ8 Scalar Quantization** (75% RAM reduction), **HNSW** and **IVF-Flat** indexing, **multi-tenant namespace isolation**, **zero-copy memory mapping (`memmap2`)**, and official connectors for **LangChain** and **LlamaIndex**.
 
 Designed specifically for production RAG (Retrieval-Augmented Generation), local AI agents, enterprise document retrieval, and low-latency voice AI where cloud vector database round-trips (>40ms) or Chroma's heavy memory overhead are unacceptable.
 
@@ -168,32 +169,100 @@ col.build_hnsw()
 results = col.query(vector=q_vec, top_k=10, use_ann=True)
 ```
 
+### 4. Official LangChain VectorStore Integration
+
+```python
+from sutradb import SutraDBVectorStore
+from langchain_openai import OpenAIEmbeddings
+
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+store = SutraDBVectorStore(
+    collection_name="production_rag",
+    dimension=1536,
+    embedding_function=embeddings,
+    persist_directory="./sutra_data",
+    hybrid=True,  # Combines dense embeddings + BM25Okapi via RRF
+)
+
+# Standard similarity search or Maximal Marginal Relevance (MMR)
+results = store.similarity_search("How to optimize vector search?", k=5)
+diverse_results = store.max_marginal_relevance_search("P99 latency", k=4, fetch_k=20)
+retriever = store.as_retriever(k=3)
+```
+
+### 5. Official LlamaIndex VectorStore Integration
+
+```python
+from sutradb import SutraDBLlamaIndexVectorStore
+from llama_index.core import VectorStoreIndex, StorageContext
+
+vector_store = SutraDBLlamaIndexVectorStore(
+    collection_name="knowledge_vault",
+    dimension=1536,
+    hybrid=True,
+)
+storage_context = StorageContext.from_defaults(vector_store=vector_store)
+index = VectorStoreIndex.from_documents(documents, storage_context=storage_context)
+
+# Query with hybrid mode
+query_engine = index.as_query_engine(vector_store_query_mode="hybrid")
+response = query_engine.query("Explain memory mapping persistence")
+```
+
+### 6. Nested JSON Metadata & Array Filtering
+
+Filter nested object paths with dot-notation and advanced operators:
+
+```python
+results = col.query(
+    text="distributed microservices",
+    filter={
+        "user.profile.city": "San Francisco",
+        "user.profile.score": {"$gte": 90.0},
+        "tags": {"$all": ["cloud", "docker"]},
+        "tags": {"$size": 3},
+        "env": {"$in": ["prod", "staging"]}
+    },
+    top_k=5
+)
+```
+
 ---
 
-## 🌐 Running as a Production HTTP Microservice
+## 🌐 Embedded Web Management Dashboard
 
-Start the ASGI REST server:
+SutraDB includes a built-in, zero-dependency 2026 dark-mode Bento Grid web management console.
 
+Start the microservice:
 ```bash
 python3 -m sutradb.server 8765
 ```
 
-Endpoints:
+Open your browser at:
+```
+http://localhost:8765/ui  or  http://localhost:8765/dashboard
+```
+
+**Features included out of the box:**
+- ⚡ **Interactive Hybrid Playground:** Test dense vectors, BM25 text queries, and slide RRF weights with live score bar breakdowns.
+- 📊 **2D Vector PCA Projection:** Visualizes high-dimensional embeddings mapped into an interactive in-browser 2D Canvas scatter plot with hover tooltips.
+- 🛠️ **Collection Manager:** 1-click HNSW indexing, SQ8 8-bit quantization (75% RAM savings), and WAL compaction.
+- 💻 **Real-Time Code Generator:** Auto-generates exact Python SDK, LangChain, and `curl` code for any query.
+
+---
+
+## 🌐 REST Microservice Endpoints
+
+- `GET /ui` & `GET /dashboard` - Embedded Web Management Dashboard
+- `GET /ui/stats` - Telemetry metrics for console
 - `GET /health` - Health check & collection registry
 - `GET /metrics` - Prometheus metrics exporter
+- `GET /collections/{name}/sample_vectors` - Sample vectors for 2D visual projection
 - `POST /collections/{name}/upsert` - Idempotent upsert
 - `PATCH /collections/{name}/documents/{id}/metadata` - In-place metadata patch
 - `POST /collections/{name}/hnsw` - Trigger HNSW graph build
 - `POST /collections/{name}/sq8` - Enable SQ8 vector quantization
 - `POST /collections/{name}/query` - Hybrid, vector, or lexical search
-
-Query with Python SDK:
-```python
-from sutradb.client import SutraClient
-
-client = SutraClient(base_url="http://localhost:8765")
-results = client.query("enterprise_kb", vector=[1.0, 0.0, 0.0, 0.0], namespace="tenant_acme")
-```
 
 ---
 
@@ -202,10 +271,10 @@ results = client.query("enterprise_kb", vector=[1.0, 0.0, 0.0, 0.0], namespace="
 Run both native Rust and Python test suites:
 
 ```bash
-# 1. Rust engine integration tests
+# 1. Rust engine integration tests (8 tests)
 cargo test
 
-# 2. Python test suite (42 tests)
+# 2. Python test suite (50 tests)
 pytest -v
 ```
 

@@ -13,12 +13,13 @@ from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel, Field
 import uvicorn
 
 from sutradb import __version__
 from sutradb.core import SutraDB, Collection
+from sutradb.ui import get_dashboard_html
 
 # Bounded payload maximum size (10MB)
 MAX_PAYLOAD_SIZE = 10 * 1024 * 1024
@@ -145,6 +146,56 @@ def create_app(data_dir: Optional[str] = None, db: Optional[SutraDB] = None) -> 
             "version": __version__,
             "collections": active_db.list_collections()
         }
+
+    @app.get("/ui", response_class=HTMLResponse, tags=["Dashboard"])
+    @app.get("/dashboard", response_class=HTMLResponse, tags=["Dashboard"])
+    def web_dashboard():
+        """Serves the interactive embedded Web UI management console."""
+        return HTMLResponse(content=get_dashboard_html(version=__version__))
+
+    @app.get("/ui/stats", tags=["Dashboard"])
+    def dashboard_stats():
+        """Aggregated stats for the web console."""
+        active_db: SutraDB = app.state.db
+        total_docs = 0
+        cols_summary = []
+        for name in active_db.list_collections():
+            try:
+                col = active_db.get_collection(name)
+                st = col.stats()
+                total_docs += st.get("count", 0)
+                cols_summary.append(st)
+            except Exception:
+                continue
+        return {
+            "version": __version__,
+            "total_collections": len(cols_summary),
+            "total_documents": total_docs,
+            "collections": cols_summary,
+        }
+
+    @app.get("/collections/{name}/sample_vectors", tags=["Collections"])
+    def get_sample_vectors(name: str, limit: int = 100):
+        """Returns sample vectors for in-browser PCA 2D projection."""
+        active_db: SutraDB = app.state.db
+        try:
+            col = active_db.get_collection(name)
+            docs = col.get_all()[:limit]
+            return {
+                "collection": name,
+                "count": len(docs),
+                "vectors": [
+                    {
+                        "id": d.id,
+                        "vector": [float(x) for x in (d.vector[:min(len(d.vector), 128)])],
+                        "text": d.text[:100] if d.text else "",
+                        "metadata": d.metadata,
+                    }
+                    for d in docs
+                ],
+            }
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
 
     @app.get("/metrics", tags=["Observability"])
     def prometheus_metrics():
@@ -452,6 +503,15 @@ class SutraHTTPHandler(BaseHTTPRequestHandler):
         """Routes GET requests."""
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
+
+        if path in ("/ui", "/dashboard"):
+            html = get_dashboard_html(__version__)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html.encode("utf-8"))))
+            self.end_headers()
+            self.wfile.write(html.encode("utf-8"))
+            return
 
         if path == "" or path == "/health":
             self._send_json(200, {

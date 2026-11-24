@@ -13,8 +13,10 @@ from sutradb.filters import FilterEngine
 from sutradb.bm25 import BM25Index
 from sutradb.fusion import reciprocal_rank_fusion, linear_score_fusion
 from sutradb.ann import IVFIndex, IVFConfig, auto_n_lists
+from sutradb.integrations.langchain import SutraDBVectorStore
+from sutradb.integrations.llamaindex import SutraDBLlamaIndexVectorStore
 
-__version__ = "3.0.0"
+__version__ = "3.1.0"
 __all__ = [
     "SutraDB",
     "Collection",
@@ -22,6 +24,8 @@ __all__ = [
     "SearchResult",
     "NativeCollection",
     "SutraClient",
+    "SutraDBVectorStore",
+    "SutraDBLlamaIndexVectorStore",
     "Metric",
     "FilterEngine",
     "BM25Index",

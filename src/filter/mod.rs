@@ -88,6 +88,35 @@ impl FilterEngine {
                             }
                             _ => return false,
                         },
+                        "$all" => match (field_value, target) {
+                            (Some(Value::Array(field_arr)), Value::Array(target_arr)) => {
+                                if !target_arr.iter().all(|t| field_arr.contains(t)) {
+                                    return false;
+                                }
+                            }
+                            _ => return false,
+                        },
+                        "$size" => match (field_value, target) {
+                            (Some(Value::Array(field_arr)), Value::Number(num)) => {
+                                if let Some(expected_len) = num.as_u64() {
+                                    if field_arr.len() != expected_len as usize {
+                                        return false;
+                                    }
+                                } else {
+                                    return false;
+                                }
+                            }
+                            (Some(Value::String(s)), Value::Number(num)) => {
+                                if let Some(expected_len) = num.as_u64() {
+                                    if s.len() != expected_len as usize {
+                                        return false;
+                                    }
+                                } else {
+                                    return false;
+                                }
+                            }
+                            _ => return false,
+                        },
                         "$exists" => {
                             let exists = field_value.is_some() && !field_value.unwrap().is_null();
                             let expected = target.as_bool().unwrap_or(false);
@@ -102,6 +131,31 @@ impl FilterEngine {
             }
             _ => field_value == Some(condition),
         }
+    }
+
+    pub fn resolve_path<'a>(val: Option<&'a Value>, path: &str) -> Option<&'a Value> {
+        let mut curr = val?;
+        if let Value::Object(map) = curr {
+            if let Some(v) = map.get(path) {
+                return Some(v);
+            }
+        }
+        for part in path.split('.') {
+            match curr {
+                Value::Object(map) => {
+                    curr = map.get(part)?;
+                }
+                Value::Array(arr) => {
+                    if let Ok(idx) = part.parse::<usize>() {
+                        curr = arr.get(idx)?;
+                    } else {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+        }
+        Some(curr)
     }
 
     pub fn evaluate(metadata: Option<&Value>, filter: Option<&Value>) -> bool {
@@ -141,7 +195,7 @@ impl FilterEngine {
                     }
                 }
                 _ => {
-                    let field_val = metadata.and_then(|m| m.get(key));
+                    let field_val = Self::resolve_path(metadata, key);
                     if !Self::match_value(field_val, val) {
                         return false;
                     }

@@ -494,6 +494,13 @@ class Collection:
                 return None
             return self.documents[idx]
 
+    def get_all(self) -> List[Document]:
+        """Retrieves all active (non-tombstoned) documents currently stored."""
+        with self._lock.read():
+            if len(self._tombstones) == 0:
+                return list(self.documents)
+            return [doc for i, doc in enumerate(self.documents) if not self._tombstones[i]]
+
     def delete(self, doc_ids: Union[str, List[str]]) -> int:
         """
         Soft-deletes one or more documents by ID using tombstones.

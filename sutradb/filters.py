@@ -1,11 +1,34 @@
 """
 Compound metadata filtering engine for SutraDB.
-Evaluates JSON predicate ASTs ($eq, $ne, $gt, $gte, $lt, $lte, $in, $nin, $contains, $exists, $and, $or)
-and generates high-speed boolean bitmasks.
+Evaluates JSON predicate ASTs ($eq, $ne, $gt, $gte, $lt, $lte, $in, $nin, $contains, $all, $size, $regex, $exists, $and, $or)
+and generates high-speed boolean bitmasks with nested dot-notation path resolution.
 """
 
 from typing import Any, Dict, List, Optional
+import re
 import numpy as np
+
+
+def resolve_nested_path(data: Optional[Dict[str, Any]], path: str) -> Any:
+    """Resolves dot-delimited path (e.g. 'user.profile.city' or 'tags.0') in nested dict/list."""
+    if not isinstance(data, dict):
+        return None
+    if path in data:
+        return data[path]
+
+    curr: Any = data
+    for part in path.split("."):
+        if isinstance(curr, dict) and part in curr:
+            curr = curr[part]
+        elif isinstance(curr, (list, tuple)) and part.isdigit():
+            idx = int(part)
+            if 0 <= idx < len(curr):
+                curr = curr[idx]
+            else:
+                return None
+        else:
+            return None
+    return curr
 
 
 class FilterEngine:
@@ -62,6 +85,21 @@ class FilterEngine:
                         return False
                 else:
                     return False
+            elif op == "$all":
+                if not isinstance(field_value, (list, tuple, set)) or not isinstance(target, (list, tuple, set)):
+                    return False
+                if not all(item in field_value for item in target):
+                    return False
+            elif op == "$size":
+                if not isinstance(field_value, (list, tuple, set, str, dict)):
+                    return False
+                if len(field_value) != target:
+                    return False
+            elif op == "$regex":
+                if field_value is None:
+                    return False
+                if not re.search(str(target), str(field_value)):
+                    return False
             elif op == "$exists":
                 has_value = field_value is not None
                 if has_value != bool(target):
@@ -75,7 +113,7 @@ class FilterEngine:
     def evaluate(cls, metadata: Optional[Dict[str, Any]], filter_spec: Optional[Dict[str, Any]]) -> bool:
         """
         Evaluates a complete filter specification against a document metadata dictionary.
-        Supports compound logical operators: $and, $or, $not.
+        Supports compound logical operators: $and, $or, $not, and dot-notation paths.
         """
         if not filter_spec:
             return True
@@ -102,7 +140,7 @@ class FilterEngine:
                     return False
 
             else:
-                field_val = metadata.get(key)
+                field_val = resolve_nested_path(metadata, key)
                 if not cls.match_value(field_val, value):
                     return False
 
