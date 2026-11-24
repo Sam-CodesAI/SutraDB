@@ -1,46 +1,12 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# SutraDB v5.0 Industrial Hardened Multi-Stage Production Dockerfile
+# SutraDB v5.1.0 Industrial Hardened Production Dockerfile
 # Conforms strictly to supply-chain hardening standards:
-# - Multi-stage isolated compilation (no compilers or protoc in runner image)
 # - Unprivileged non-root service execution (UID 10001:10001)
-# - Dual binary gRPC (50051) + REST/Bento Web UI (8765) runtime
+# - No compilers or build toolchains in production runtime
+# - Dual binary gRPC (50051) + REST/Workbench (8765) runtime
 # - Minimal attack surface based on python:3.12-slim
 # ─────────────────────────────────────────────────────────────────────────────
 
-# STAGE 1: Compiler & Builder
-FROM python:3.12-slim AS builder
-
-ENV DEBIAN_FRONTEND=noninteractive \
-    RUSTUP_HOME=/usr/local/rustup \
-    CARGO_HOME=/usr/local/cargo \
-    PATH="/usr/local/cargo/bin:${PATH}"
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    build-essential \
-    protobuf-compiler \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-
-RUN pip install --no-cache-dir --upgrade pip maturin
-
-WORKDIR /build
-
-COPY Cargo.toml Cargo.lock pyproject.toml README.md LICENSE build.rs ./
-COPY proto ./proto
-COPY src ./src
-COPY sutradb ./sutradb
-
-# Build standalone high-throughput binary gRPC server with release profile
-RUN cargo build --release --bin sutradb-server && \
-    mkdir -p /binaries && \
-    cp target/release/sutradb-server /binaries/sutradb-server && \
-    maturin build --release --out /wheels && \
-    cargo clean
-
-# STAGE 2: Hardened Production Runtime
 FROM python:3.12-slim AS runner
 
 ENV PYTHONUNBUFFERED=1 \
@@ -58,12 +24,12 @@ RUN groupadd -g 10001 nonroot && \
 
 WORKDIR /app
 
-# Copy compiled binary gRPC server from builder stage
-COPY --from=builder /binaries/sutradb-server /usr/local/bin/sutradb-server
+# Copy pre-compiled standalone binary gRPC server
+COPY dist/bin/sutradb-server /usr/local/bin/sutradb-server
 
-# Copy built wheel from builder stage and install runtime dependencies
-COPY --from=builder /wheels /wheels
-RUN pip install --no-cache-dir /wheels/*.whl && \
+# Copy pre-compiled release wheel and install runtime dependencies
+COPY dist/wheels /wheels
+RUN pip install --no-cache-dir --no-index --find-links=/wheels /wheels/sutradb_core*.whl && \
     rm -rf /wheels
 
 # Copy operational scripts
@@ -77,7 +43,7 @@ RUN mkdir -p /data /app && chown -R nonroot:nonroot /data /app
 # Switch to unprivileged non-root user
 USER 10001:10001
 
-# Expose gRPC port (50051) and REST/UI port (8765)
+# Expose gRPC port (50051) and REST/Workbench port (8765)
 EXPOSE 50051 8765
 
 VOLUME ["/data"]

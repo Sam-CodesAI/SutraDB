@@ -7,7 +7,7 @@ use _sutradb::grpc::{SutraGrpcService, SutraServiceServer};
 #[derive(Parser, Debug)]
 #[command(name = "sutradb-server")]
 #[command(author = "Samarth Nimangre <samarthknimangre@gmail.com>")]
-#[command(version = "5.0.0")]
+#[command(version = "5.1.0")]
 #[command(about = "SutraDB Industrial High-Throughput Binary gRPC Vector Engine", long_about = None)]
 struct Args {
     /// Host interface to bind to

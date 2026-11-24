@@ -289,6 +289,24 @@ def create_app(data_dir: Optional[str] = None, db: Optional[SutraDB] = None) -> 
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+    @app.get("/collections/{name}/documents", tags=["Documents"])
+    def list_documents(name: str, limit: int = 50, offset: int = 0):
+        active_db: SutraDB = app.state.db
+        try:
+            col = active_db.get_collection(name)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
+
+        docs = col.get_all()
+        total = len(docs)
+        sliced = docs[offset:offset + limit]
+        return {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "documents": [doc.to_dict(include_vector=False) for doc in sliced]
+        }
+
     @app.get("/collections/{name}/documents/{id}", tags=["Documents"])
     def get_document(name: str, id: str):
         active_db: SutraDB = app.state.db
@@ -565,6 +583,22 @@ class SutraHTTPHandler(BaseHTTPRequestHandler):
             try:
                 col = self.db.get_collection(col_name)
                 self._send_json(200, col.stats())
+            except KeyError:
+                self._send_json(404, {"error": f"Collection '{col_name}' not found"})
+            return
+
+        # /collections/<name>/documents (list)
+        if len(parts) == 4 and parts[1] == "collections" and parts[3] == "documents":
+            col_name = parts[2]
+            try:
+                col = self.db.get_collection(col_name)
+                docs = col.get_all()
+                self._send_json(200, {
+                    "total": len(docs),
+                    "limit": 50,
+                    "offset": 0,
+                    "documents": [doc.to_dict(include_vector=False) for doc in docs[:50]]
+                })
             except KeyError:
                 self._send_json(404, {"error": f"Collection '{col_name}' not found"})
             return

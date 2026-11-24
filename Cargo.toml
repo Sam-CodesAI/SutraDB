@@ -1,6 +1,6 @@
 [package]
 name = "sutradb-core"
-version = "5.0.0"
+version = "5.1.0"
 edition = "2021"
 authors = ["Samarth Nimangre <samarthknimangre@gmail.com>"]
 description = "High-performance, zero-dependency hybrid vector search & BM25 lexical engine in Rust."
