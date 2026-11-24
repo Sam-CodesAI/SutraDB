@@ -57,6 +57,13 @@ jobs:
           command: build
           args: --release --out dist
 
+      - name: Build sdist
+        if: matrix.os == 'ubuntu-latest'
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+
       - name: Upload Wheels
         uses: actions/upload-artifact@v4
         with:
@@ -81,4 +88,5 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
-        continue-on-error: true
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
