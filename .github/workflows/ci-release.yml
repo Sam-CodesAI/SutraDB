@@ -32,7 +32,7 @@ jobs:
 
       - name: Build Local Wheel & Run Pytest
         run: |
-          maturin develop
+          pip install .
           pytest -v
 
   build-wheels:
@@ -81,3 +81,4 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        continue-on-error: true
