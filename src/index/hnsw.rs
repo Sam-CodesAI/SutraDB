@@ -193,6 +193,9 @@ impl HNSWIndex {
         }
 
         if node_level > self.max_level {
+            for l in (self.max_level + 1)..=node_level {
+                self.layers[l].insert(doc_id, Vec::new());
+            }
             self.max_level = node_level;
             self.entry_point = Some(doc_id);
         }

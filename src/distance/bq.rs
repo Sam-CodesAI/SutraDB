@@ -31,9 +31,13 @@ impl BQVector {
     /// Computes the bitwise Hamming distance between two binary quantized vectors using POPCNT.
     #[inline]
     pub fn hamming_distance(&self, other: &BQVector) -> u32 {
+        assert_eq!(
+            self.dimension, other.dimension,
+            "Dimension mismatch in BQVector hamming_distance: {} vs {}",
+            self.dimension, other.dimension
+        );
         let mut dist = 0u32;
-        let n = self.bits.len().min(other.bits.len());
-        for i in 0..n {
+        for i in 0..self.bits.len() {
             dist += (self.bits[i] ^ other.bits[i]).count_ones();
         }
         dist
@@ -42,9 +46,13 @@ impl BQVector {
     /// Computes Hamming distance directly between raw u64 slices.
     #[inline]
     pub fn hamming_distance_words(a: &[u64], b: &[u64]) -> u32 {
+        assert_eq!(
+            a.len(), b.len(),
+            "Slice length mismatch in hamming_distance_words: {} vs {}",
+            a.len(), b.len()
+        );
         let mut dist = 0u32;
-        let n = a.len().min(b.len());
-        for i in 0..n {
+        for i in 0..a.len() {
             dist += (a[i] ^ b[i]).count_ones();
         }
         dist

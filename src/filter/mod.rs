@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use serde_json::Value;
 
+pub mod index;
+pub use index::SecondaryMetadataIndex;
+
 /// Evaluates JSON condition AST against metadata values.
 pub struct FilterEngine;
 
@@ -20,12 +23,24 @@ impl FilterEngine {
                 for (op, target) in map {
                     match op.as_str() {
                         "$eq" => {
-                            if field_value != Some(target) {
+                            if target.is_null() {
+                                if let Some(v) = field_value {
+                                    if !v.is_null() {
+                                        return false;
+                                    }
+                                }
+                            } else if field_value != Some(target) {
                                 return false;
                             }
                         }
                         "$ne" => {
-                            if field_value == Some(target) {
+                            if target.is_null() {
+                                match field_value {
+                                    None => return false,
+                                    Some(v) if v.is_null() => return false,
+                                    _ => {}
+                                }
+                            } else if field_value == Some(target) {
                                 return false;
                             }
                         }
@@ -206,6 +221,10 @@ impl FilterEngine {
                 }
                 true
             }
+            Value::Null => match field_value {
+                None => true,
+                Some(v) => v.is_null(),
+            },
             _ => field_value == Some(condition),
         }
     }
@@ -292,6 +311,32 @@ impl FilterEngine {
     }
 }
 
+/// Detects if a filter JSON AST uses complex operators that require full per-document AST inspection
+/// (such as $geo_within, $geo_box, $regex, $contains, $all, $size).
+pub fn has_complex_operators(filter: &Value) -> bool {
+    match filter {
+        Value::Object(map) => {
+            for (k, v) in map {
+                if k == "$geo_within"
+                    || k == "$geo_box"
+                    || k == "$regex"
+                    || k == "$contains"
+                    || k == "$all"
+                    || k == "$size"
+                {
+                    return true;
+                }
+                if has_complex_operators(v) {
+                    return true;
+                }
+            }
+            false
+        }
+        Value::Array(arr) => arr.iter().any(has_complex_operators),
+        _ => false,
+    }
+}
+
 fn compare_values<F>(a: Option<&Value>, b: &Value, op: F) -> bool
 where
     F: Fn(f64, f64) -> bool,
@@ -341,6 +386,18 @@ impl SecondaryIndex {
 
     pub fn lookup(&self, field: &str, value: &str) -> Option<&Vec<u32>> {
         self.index.get(field).and_then(|m| m.get(value))
+    }
+
+    pub fn remove_document(&mut self, doc_id: u32) {
+        for map in self.index.values_mut() {
+            for doc_list in map.values_mut() {
+                doc_list.retain(|&x| x != doc_id);
+            }
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.index.clear();
     }
 }
 

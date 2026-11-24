@@ -5,7 +5,7 @@ Supports SIMD-accelerated vector search, BM25 lexical search, and compound hybri
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import uuid
 import numpy as np
 
@@ -17,7 +17,7 @@ from sutradb.fusion import reciprocal_rank_fusion, linear_score_fusion
 from sutradb.storage import BinaryStorage, WriteAheadLog
 from sutradb.ann import IVFIndex, IVFConfig, auto_n_lists
 from sutradb.concurrency import ReadWriteLock
-from sutradb.quantization import BQVector, PQVector, PQCodebook
+from sutradb.quantization import BQVector, SQ8Vector, PQVector, PQCodebook
 
 
 @dataclass
@@ -28,13 +28,17 @@ class Document:
     text: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
     namespace: Optional[str] = None
+    sparse_vector: Optional[Dict[Union[int, str], float]] = None
+    colbert_tokens: Optional[List[List[float]]] = None
 
     def to_dict(self, include_vector: bool = False) -> Dict[str, Any]:
         data = {
             "id": self.id,
             "text": self.text,
             "metadata": self.metadata,
-            "namespace": self.namespace
+            "namespace": self.namespace,
+            "sparse_vector": self.sparse_vector,
+            "colbert_tokens": self.colbert_tokens
         }
         if include_vector and self.vector is not None:
             data["vector"] = self.vector.tolist() if isinstance(self.vector, np.ndarray) else list(self.vector)
@@ -47,7 +51,9 @@ class Document:
             vector=vector,
             text=data.get("text", ""),
             metadata=data.get("metadata", {}),
-            namespace=data.get("namespace")
+            namespace=data.get("namespace"),
+            sparse_vector=data.get("sparse_vector"),
+            colbert_tokens=data.get("colbert_tokens")
         )
 
 
@@ -60,6 +66,8 @@ class SearchResult:
     metadata: Dict[str, Any]
     dense_score: Optional[float] = None
     bm25_score: Optional[float] = None
+    sparse_score: Optional[float] = None
+    colbert_score: Optional[float] = None
     namespace: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -70,6 +78,8 @@ class SearchResult:
             "metadata": self.metadata,
             "dense_score": round(self.dense_score, 6) if self.dense_score is not None else None,
             "bm25_score": round(self.bm25_score, 6) if self.bm25_score is not None else None,
+            "sparse_score": round(self.sparse_score, 6) if self.sparse_score is not None else None,
+            "colbert_score": round(self.colbert_score, 6) if self.colbert_score is not None else None,
             "namespace": self.namespace,
         }
 
@@ -85,12 +95,14 @@ class Collection:
         storage_path: Optional[Union[str, Path]] = None,
         enable_wal: bool = False,
         ann_config: Optional[IVFConfig] = None,
-        analyzer: Optional[Union[Analyzer, AnalyzerConfig, Dict[str, Any]]] = None
+        analyzer: Optional[Union[Analyzer, AnalyzerConfig, Dict[str, Any]]] = None,
+        embedding_function: Optional[Any] = None
     ):
         self.name = name
         self.dimension = int(dimension)
         self.metric = Metric(metric) if isinstance(metric, str) else metric
         self.storage_path = Path(storage_path) if storage_path else None
+        self.embedding_function = embedding_function
 
         # Dense vector storage (N x D)
         self.vectors: np.ndarray = np.empty((0, self.dimension), dtype=np.float32)
@@ -121,6 +133,7 @@ class Collection:
         self._ann_index: Optional[IVFIndex] = None
         self._ann_dirty: bool = False  # True when vectors added since last index build
         self._sq8_enabled: bool = False
+        self._sq8_vectors: List[SQ8Vector] = []
         self._bq_enabled: bool = False
         self._bq_vectors: List[BQVector] = []
         self._pq_enabled: bool = False
@@ -144,13 +157,31 @@ class Collection:
             return
         for entry in entries:
             op = entry.get("op")
-            if op in ("insert", "update"):
+            if op == "insert":
                 raw_docs = entry.get("docs", [])
                 if not raw_docs and "doc" in entry:
                     raw_docs = [entry["doc"]]
                 vectors = [np.array(d["vector"], dtype=np.float32) for d in raw_docs]
                 docs = [Document.from_dict(d, v) for d, v in zip(raw_docs, vectors)]
                 self._insert_internal(docs, log_to_wal=False)
+            elif op == "update":
+                raw_docs = entry.get("docs", [])
+                if not raw_docs and "doc" in entry:
+                    raw_docs = [entry["doc"]]
+                for d in raw_docs:
+                    doc_id = d.get("id")
+                    if doc_id is not None and doc_id in self.id_to_index:
+                        idx = self.id_to_index[doc_id]
+                        if idx < len(self._tombstones) and self._tombstones[idx]:
+                            continue
+                        if "metadata" in d and d["metadata"] is not None:
+                            self.documents[idx].metadata = d["metadata"]
+                        if "text" in d and d["text"] is not None:
+                            self.documents[idx].text = d["text"]
+                        if "vector" in d and d["vector"] is not None:
+                            vec = np.asarray(d["vector"], dtype=np.float32)
+                            self.vectors[idx] = vec
+                            self.documents[idx].vector = vec
             elif op == "delete":
                 ids = entry.get("ids", [])
                 if not ids and "id" in entry:
@@ -178,13 +209,147 @@ class Collection:
                     vector=vec,
                     text=item.get("text", ""),
                     metadata=item.get("metadata", {}),
-                    namespace=item.get("namespace")
+                    namespace=item.get("namespace"),
+                    sparse_vector=item.get("sparse_vector"),
+                    colbert_tokens=item.get("colbert_tokens")
                 ))
             else:
                 raise TypeError(f"Unsupported document type: {type(item)}")
 
+        # Automated embedding for documents missing vector embeddings
+        docs_missing_vecs = [d for d in parsed_docs if d.vector is None]
+        if docs_missing_vecs:
+            if self.embedding_function is None:
+                from sutradb.embeddings import DefaultEmbeddingFunction
+                self.embedding_function = DefaultEmbeddingFunction(dimension=self.dimension)
+            texts_to_embed = [d.text for d in docs_missing_vecs]
+            computed_vecs = self.embedding_function.embed_documents(texts_to_embed)
+
+            sparse_fn = getattr(self.embedding_function, "encode_sparse", None)
+            colbert_fn = getattr(self.embedding_function, "encode_colbert", None)
+            computed_sparse = sparse_fn(texts_to_embed) if callable(sparse_fn) else None
+            computed_colbert = colbert_fn(texts_to_embed) if callable(colbert_fn) else None
+
+            for i, d in enumerate(docs_missing_vecs):
+                d.vector = computed_vecs[i]
+                if d.sparse_vector is None and computed_sparse:
+                    d.sparse_vector = computed_sparse[i]
+                if d.colbert_tokens is None and computed_colbert:
+                    d.colbert_tokens = computed_colbert[i]
+
         with self._lock.write():
             return self._insert_internal(parsed_docs, log_to_wal=True)
+
+    def add_texts(
+        self,
+        texts: Union[str, Sequence[str]],
+        metadatas: Optional[Union[Dict[str, Any], Sequence[Dict[str, Any]]]] = None,
+        ids: Optional[Union[str, Sequence[str]]] = None,
+        namespace: Optional[str] = None
+    ) -> List[str]:
+        """
+        Ingests raw text strings directly into the collection with automated embedding.
+        Auto-generates dense vectors (and sparse/ColBERT representations if supported).
+        Returns the list of document IDs.
+        """
+        if isinstance(texts, str):
+            text_list = [texts]
+        else:
+            text_list = list(texts)
+
+        n = len(text_list)
+        if n == 0:
+            return []
+
+        if metadatas is None:
+            meta_list = [{} for _ in range(n)]
+        elif isinstance(metadatas, dict):
+            meta_list = [metadatas]
+        else:
+            meta_list = list(metadatas)
+
+        if ids is None:
+            id_list = [str(uuid.uuid4()) for _ in range(n)]
+        elif isinstance(ids, str):
+            id_list = [ids]
+        else:
+            id_list = list(ids)
+
+        if len(meta_list) != n:
+            raise ValueError(f"Length of metadatas ({len(meta_list)}) does not match texts ({n})")
+        if len(id_list) != n:
+            raise ValueError(f"Length of ids ({len(id_list)}) does not match texts ({n})")
+
+        if self.embedding_function is None:
+            from sutradb.embeddings import DefaultEmbeddingFunction
+            self.embedding_function = DefaultEmbeddingFunction(dimension=self.dimension)
+
+        dense_vecs = self.embedding_function.embed_documents(text_list)
+        sparse_fn = getattr(self.embedding_function, "encode_sparse", None)
+        colbert_fn = getattr(self.embedding_function, "encode_colbert", None)
+        sparse_vecs = sparse_fn(text_list) if callable(sparse_fn) else [None] * n
+        colbert_toks = colbert_fn(text_list) if callable(colbert_fn) else [None] * n
+
+        docs = [
+            Document(
+                id=doc_id,
+                vector=vec,
+                text=txt,
+                metadata=meta,
+                namespace=namespace,
+                sparse_vector=sp,
+                colbert_tokens=cb
+            )
+            for doc_id, vec, txt, meta, sp, cb in zip(id_list, dense_vecs, text_list, meta_list, sparse_vecs, colbert_toks)
+        ]
+
+        self.insert(docs)
+        return id_list
+
+    def search(
+        self,
+        query: str,
+        top_k: int = 10,
+        filter: Optional[Dict[str, Any]] = None,
+        namespace: Optional[str] = None,
+        hybrid: bool = True,
+        dense_weight: float = 1.0,
+        bm25_weight: float = 1.0,
+        sparse_weight: float = 1.0,
+        colbert_weight: float = 1.0,
+        use_ann: bool = False
+    ) -> List[SearchResult]:
+        """
+        Executes an end-to-end multi-modal search directly from a query text string.
+        Automatically vectorizes the query with the collection's embedding function
+        and performs hybrid search across Dense + BM25 + Sparse + ColBERT modalities.
+        """
+        if self.embedding_function is None:
+            from sutradb.embeddings import DefaultEmbeddingFunction
+            self.embedding_function = DefaultEmbeddingFunction(dimension=self.dimension)
+
+        q_vec = self.embedding_function.embed_query(query)
+
+        sparse_fn = getattr(self.embedding_function, "encode_sparse", None)
+        colbert_fn = getattr(self.embedding_function, "encode_colbert", None)
+        sp_query = sparse_fn([query])[0] if callable(sparse_fn) else None
+        cb_query = colbert_fn([query])[0] if callable(colbert_fn) else None
+
+        return self.query(
+            vector=q_vec,
+            text=query,
+            sparse_vector=sp_query,
+            colbert_tokens=cb_query,
+            namespace=namespace,
+            filter=filter,
+            top_k=top_k,
+            hybrid=hybrid,
+            dense_weight=dense_weight,
+            bm25_weight=bm25_weight,
+            sparse_weight=sparse_weight,
+            colbert_weight=colbert_weight,
+            use_ann=use_ann
+        )
 
     def _insert_internal(self, documents: List[Document], log_to_wal: bool = True) -> int:
         if not documents:
@@ -253,7 +418,14 @@ class Collection:
                 except Exception:
                     self._ann_dirty = True
 
-        # Incremental BQ and PQ vector updates
+        # Incremental SQ8, BQ and PQ vector updates
+        if self._sq8_enabled:
+            for d in updated_docs:
+                idx = self.id_to_index[d.id]
+                self._sq8_vectors[idx] = SQ8Vector.quantize(self.vectors[idx])
+            if new_vectors:
+                self._sq8_vectors.extend([SQ8Vector.quantize(v) for v in new_vectors])
+
         if self._bq_enabled:
             for d in updated_docs:
                 idx = self.id_to_index[d.id]
@@ -270,7 +442,7 @@ class Collection:
 
         # If any documents were updated, rebuild the full BM25 index and mark ANN dirty
         if updated_docs:
-            self.bm25_index = BM25Index()
+            self.bm25_index = BM25Index(analyzer=self.analyzer)
             self.bm25_index.add_documents([d.text for d in self.documents])
             if self._ann_index is not None:
                 self._ann_dirty = True
@@ -316,6 +488,8 @@ class Collection:
         """Enables 8-bit scalar quantization to reduce RAM by 75%."""
         with self._lock.write():
             self._sq8_enabled = True
+            if len(self.vectors) > 0:
+                self._sq8_vectors = [SQ8Vector.quantize(v) for v in self.vectors]
 
     def enable_bq(self) -> None:
         """Enables 1-bit binary quantization (BQ) for 32x RAM reduction and sub-microsecond candidate pruning."""
@@ -375,6 +549,8 @@ class Collection:
         self,
         vector: Optional[Union[List[float], np.ndarray]] = None,
         text: Optional[str] = None,
+        sparse_vector: Optional[Dict[Union[int, str], float]] = None,
+        colbert_tokens: Optional[List[List[float]]] = None,
         filter: Optional[Dict[str, Any]] = None,
         namespace: Optional[str] = None,
         top_k: int = 10,
@@ -382,11 +558,14 @@ class Collection:
         rrf_constant: int = 60,
         dense_weight: float = 1.0,
         bm25_weight: float = 1.0,
+        sparse_weight: float = 1.0,
+        colbert_weight: float = 1.0,
         alpha: Optional[float] = None,
         use_ann: bool = False
     ) -> List[SearchResult]:
         """
-        Executes a vector, lexical, or hybrid search with optional metadata and namespace filtering.
+        Executes a vector, lexical, or hybrid search across Dense, BM25, Neural Sparse,
+        and ColBERT Multi-Vector modalities with metadata and namespace filtering.
         """
         with self._lock.read():
             n = len(self.documents)
@@ -408,11 +587,16 @@ class Collection:
             # 2. Vector distance scoring
             has_vector = vector is not None
             has_text = bool(text and text.strip())
+            has_sparse = bool(sparse_vector and len(sparse_vector) > 0)
+            has_colbert = bool(colbert_tokens and len(colbert_tokens) > 0)
 
             dense_scores: Optional[np.ndarray] = None
             can_use_ann = (
                 use_ann and
                 has_vector and
+                not has_text and
+                not has_sparse and
+                not has_colbert and
                 self._ann_index is not None and
                 self._ann_index.is_trained and
                 not self._ann_dirty
@@ -420,9 +604,11 @@ class Collection:
 
             if has_vector:
                 q_vec = np.asarray(vector, dtype=np.float32)
+                if self.metric == Metric.COSINE:
+                    q_vec = normalize_vector(q_vec)
 
                 # Pure vector search with active ANN index
-                if can_use_ann and not (hybrid and has_text):
+                if can_use_ann and not hybrid:
                     ann_indices, ann_scores = self._ann_index.search(
                         q_vec,
                         self.vectors,
@@ -486,6 +672,14 @@ class Collection:
                         )
                         for idx, score in zip(top_candidates, sub_scores):
                             dense_scores[idx] = float(score)
+                elif self._sq8_enabled and len(self._sq8_vectors) > 0:
+                    valid_indices = np.where(mask)[0]
+                    dense_scores = np.full(n, -np.inf, dtype=np.float32)
+                    if len(valid_indices) > 0:
+                        q_sum = float(np.sum(q_vec))
+                        for idx in valid_indices:
+                            sq = self._sq8_vectors[idx]
+                            dense_scores[idx] = sq.score(q_vec, query_sum=q_sum, metric=self.metric.value)
                 else:
                     dense_scores = compute_distances(
                         q_vec,
@@ -499,33 +693,149 @@ class Collection:
             if has_text:
                 bm25_scores = self.bm25_index.score_query(text, mask=mask)
 
-            # 4. Route search execution based on mode
+            # 4. Neural Sparse scoring
+            sparse_scores: Optional[np.ndarray] = None
+            if has_sparse:
+                sparse_scores = np.zeros(n, dtype=np.float32)
+                valid_indices = np.where(mask)[0]
+                for idx in valid_indices:
+                    doc_sp = self.documents[idx].sparse_vector
+                    if doc_sp:
+                        score = 0.0
+                        for k, v in sparse_vector.items():
+                            val = doc_sp.get(k)
+                            if val is None and isinstance(k, str) and k.isdigit():
+                                val = doc_sp.get(int(k))
+                            elif val is None and isinstance(k, int):
+                                val = doc_sp.get(str(k))
+                            if val is not None:
+                                score += float(val) * float(v)
+                        sparse_scores[idx] = score
+
+            # 5. ColBERT Multi-Vector scoring (MaxSim late interaction)
+            colbert_scores: Optional[np.ndarray] = None
+            if has_colbert:
+                colbert_scores = np.zeros(n, dtype=np.float32)
+                q_tokens = np.asarray(colbert_tokens, dtype=np.float32)
+                if q_tokens.ndim == 2 and q_tokens.shape[0] > 0:
+                    q_norms = np.linalg.norm(q_tokens, axis=1, keepdims=True)
+                    q_norms[q_norms < 1e-12] = 1.0
+                    q_normed = q_tokens / q_norms
+
+                    valid_indices = np.where(mask)[0]
+                    for idx in valid_indices:
+                        d_tok_raw = self.documents[idx].colbert_tokens
+                        if d_tok_raw:
+                            d_tokens = np.asarray(d_tok_raw, dtype=np.float32)
+                            if d_tokens.ndim == 2 and d_tokens.shape[0] > 0:
+                                d_norms = np.linalg.norm(d_tokens, axis=1, keepdims=True)
+                                d_norms[d_norms < 1e-12] = 1.0
+                                d_normed = d_tokens / d_norms
+                                sim_matrix = q_normed @ d_normed.T
+                                colbert_scores[idx] = float(np.sum(np.max(sim_matrix, axis=1)))
+
+            # 6. Route search execution based on active modalities
+            active_modalities = (
+                (1 if has_vector and dense_scores is not None else 0)
+                + (1 if has_text and bm25_scores is not None else 0)
+                + (1 if has_sparse and sparse_scores is not None else 0)
+                + (1 if has_colbert and colbert_scores is not None else 0)
+            )
+
+            if active_modalities == 0:
+                raise ValueError("Query must specify at least one modality: vector, text, sparse_vector, or colbert_tokens.")
+
             results: List[SearchResult] = []
 
-            if hybrid and has_vector and has_text and dense_scores is not None and bm25_scores is not None:
-                # Hybrid search combining dense + lexical
-                if alpha is not None:
-                    fused = linear_score_fusion(dense_scores, bm25_scores, alpha=alpha, top_k=top_k, mask=mask)
-                else:
-                    fused = reciprocal_rank_fusion(
-                        dense_scores,
-                        bm25_scores,
-                        top_k=top_k,
-                        k_constant=rrf_constant,
-                        dense_weight=dense_weight,
-                        bm25_weight=bm25_weight,
-                        mask=mask
-                    )
+            if hybrid and active_modalities >= 2:
+                # Fast-path for standard bi-modal dense + bm25 search using dedicated fusion algorithms
+                if (
+                    active_modalities == 2
+                    and has_vector
+                    and has_text
+                    and not has_sparse
+                    and not has_colbert
+                    and dense_scores is not None
+                    and bm25_scores is not None
+                ):
+                    if alpha is not None:
+                        fused = linear_score_fusion(dense_scores, bm25_scores, alpha=alpha, top_k=top_k, mask=mask)
+                    else:
+                        fused = reciprocal_rank_fusion(
+                            dense_scores,
+                            bm25_scores,
+                            top_k=top_k,
+                            k_constant=rrf_constant,
+                            dense_weight=dense_weight,
+                            bm25_weight=bm25_weight,
+                            mask=mask
+                        )
+                    for doc_idx, final_score, d_score, b_score in fused:
+                        doc = self.documents[doc_idx]
+                        results.append(SearchResult(
+                            id=doc.id,
+                            score=final_score,
+                            text=doc.text,
+                            metadata=doc.metadata,
+                            dense_score=d_score,
+                            bm25_score=b_score,
+                            sparse_score=None,
+                            colbert_score=None,
+                            namespace=doc.namespace
+                        ))
+                    return results
 
-                for doc_idx, final_score, d_score, b_score in fused:
+                # Multi-modal Reciprocal Rank Fusion (Dense + BM25 + Sparse + ColBERT)
+                valid_indices = np.where(mask)[0]
+                M = min(top_k * 4, 200)
+
+                def get_ranks(scores_arr: np.ndarray, check_positive: bool = True) -> Dict[int, int]:
+                    vals = scores_arr[valid_indices]
+                    k_cand = min(M, len(vals))
+                    order = np.argsort(-vals)[:k_cand]
+                    cands = [int(valid_indices[i]) for i in order]
+                    ranks: Dict[int, int] = {}
+                    for rank, doc_idx in enumerate(cands, start=1):
+                        if not check_positive or scores_arr[doc_idx] > 0.0:
+                            ranks[doc_idx] = rank
+                    if not ranks and len(cands) > 0:
+                        ranks = {doc_idx: rank for rank, doc_idx in enumerate(cands, start=1)}
+                    return ranks
+
+                dense_ranks = get_ranks(dense_scores, check_positive=True) if (has_vector and dense_scores is not None) else {}
+                bm25_ranks = get_ranks(bm25_scores, check_positive=True) if (has_text and bm25_scores is not None) else {}
+                sparse_ranks = get_ranks(sparse_scores, check_positive=True) if (has_sparse and sparse_scores is not None) else {}
+                colbert_ranks = get_ranks(colbert_scores, check_positive=True) if (has_colbert and colbert_scores is not None) else {}
+
+                candidate_union = list(dict.fromkeys(
+                    list(dense_ranks.keys()) + list(bm25_ranks.keys()) + list(sparse_ranks.keys()) + list(colbert_ranks.keys())
+                ))
+
+                scored: List[Tuple[int, float]] = []
+                for doc_idx in candidate_union:
+                    s = 0.0
+                    if doc_idx in dense_ranks:
+                        s += dense_weight / (rrf_constant + dense_ranks[doc_idx])
+                    if doc_idx in bm25_ranks:
+                        s += bm25_weight / (rrf_constant + bm25_ranks[doc_idx])
+                    if doc_idx in sparse_ranks:
+                        s += sparse_weight / (rrf_constant + sparse_ranks[doc_idx])
+                    if doc_idx in colbert_ranks:
+                        s += colbert_weight / (rrf_constant + colbert_ranks[doc_idx])
+                    scored.append((doc_idx, s))
+
+                scored.sort(key=lambda x: x[1], reverse=True)
+                for doc_idx, final_score in scored[:top_k]:
                     doc = self.documents[doc_idx]
                     results.append(SearchResult(
                         id=doc.id,
                         score=final_score,
                         text=doc.text,
                         metadata=doc.metadata,
-                        dense_score=d_score,
-                        bm25_score=b_score,
+                        dense_score=float(dense_scores[doc_idx]) if dense_scores is not None else None,
+                        bm25_score=float(bm25_scores[doc_idx]) if bm25_scores is not None else None,
+                        sparse_score=float(sparse_scores[doc_idx]) if sparse_scores is not None else None,
+                        colbert_score=float(colbert_scores[doc_idx]) if colbert_scores is not None else None,
                         namespace=doc.namespace
                     ))
 
@@ -576,6 +886,45 @@ class Collection:
                         metadata=doc.metadata,
                         dense_score=None,
                         bm25_score=float(bm25_scores[doc_idx]),
+                        namespace=doc.namespace
+                    ))
+
+            elif has_sparse and sparse_scores is not None:
+                valid_indices = np.where(mask)[0]
+                scores_valid = sparse_scores[valid_indices]
+                positive_mask = scores_valid > 0.0
+                if not np.any(positive_mask):
+                    return []
+                matched_indices = valid_indices[positive_mask]
+                matched_scores = scores_valid[positive_mask]
+                k = min(top_k, len(matched_indices))
+                top_local = np.argsort(-matched_scores)[:k]
+                for local_i in top_local:
+                    doc_idx = matched_indices[local_i]
+                    doc = self.documents[doc_idx]
+                    results.append(SearchResult(
+                        id=doc.id,
+                        score=float(sparse_scores[doc_idx]),
+                        text=doc.text,
+                        metadata=doc.metadata,
+                        sparse_score=float(sparse_scores[doc_idx]),
+                        namespace=doc.namespace
+                    ))
+
+            elif has_colbert and colbert_scores is not None:
+                valid_indices = np.where(mask)[0]
+                scores_valid = colbert_scores[valid_indices]
+                k = min(top_k, len(valid_indices))
+                top_local = np.argsort(-scores_valid)[:k]
+                for local_i in top_local:
+                    doc_idx = valid_indices[local_i]
+                    doc = self.documents[doc_idx]
+                    results.append(SearchResult(
+                        id=doc.id,
+                        score=float(colbert_scores[doc_idx]),
+                        text=doc.text,
+                        metadata=doc.metadata,
+                        colbert_score=float(colbert_scores[doc_idx]),
                         namespace=doc.namespace
                     ))
             else:
@@ -658,11 +1007,13 @@ class Collection:
                 self.documents = [self.documents[i] for i in active_indices]
                 self.id_to_index = {doc.id: i for i, doc in enumerate(self.documents)}
                 self._tombstones = np.zeros(len(self.documents), dtype=bool)
-                self.bm25_index = BM25Index()
+                self.bm25_index = BM25Index(analyzer=self.analyzer)
                 if self.documents:
                     self.bm25_index.add_documents([d.text for d in self.documents])
                 if self._ann_index is not None:
                     self._ann_dirty = True
+                if self._sq8_enabled and self._sq8_vectors:
+                    self._sq8_vectors = [self._sq8_vectors[i] for i in active_indices]
                 if self._bq_enabled:
                     self._bq_vectors = [self._bq_vectors[i] for i in active_indices]
                 if self._pq_enabled:
@@ -709,12 +1060,24 @@ class Collection:
             self._tombstones = np.zeros(len(self.documents), dtype=bool)
 
             # Re-index BM25
-            self.bm25_index = BM25Index()
+            self.bm25_index = BM25Index(analyzer=self.analyzer)
             self.bm25_index.add_documents([d.text for d in self.documents])
 
-            # Invalidate ANN index on load
+            # Invalidate ANN index and re-sync quantized vectors on load
             if self._ann_index is not None:
                 self._ann_dirty = True
+            if self._sq8_enabled:
+                self._sq8_vectors = [SQ8Vector.quantize(v) for v in self.vectors]
+            else:
+                self._sq8_vectors.clear()
+            if self._bq_enabled:
+                self._bq_vectors = [BQVector.quantize(v) for v in self.vectors]
+            else:
+                self._bq_vectors.clear()
+            if self._pq_enabled and self._pq_codebook is not None:
+                self._pq_vectors = [self._pq_codebook.encode(v) for v in self.vectors]
+            else:
+                self._pq_vectors.clear()
 
             # Replay WAL if any newer entries occurred
             if self.wal:
@@ -770,14 +1133,21 @@ class SutraDB:
     def create_collection(
         self,
         name: str,
-        dimension: int,
+        dimension: Optional[int] = None,
         metric: Union[Metric, str] = Metric.COSINE,
         enable_wal: bool = False,
-        analyzer: Optional[Union[Analyzer, AnalyzerConfig, Dict[str, Any]]] = None
+        analyzer: Optional[Union[Analyzer, AnalyzerConfig, Dict[str, Any]]] = None,
+        embedding_function: Optional[Any] = None
     ) -> Collection:
         """Creates and registers a new collection."""
         if name in self.collections:
             raise ValueError(f"Collection '{name}' already exists.")
+
+        if dimension is None:
+            if embedding_function is not None and hasattr(embedding_function, "dimension"):
+                dimension = int(embedding_function.dimension)
+            else:
+                dimension = 384
 
         storage_path = None
         if self.persist_dir:
@@ -789,7 +1159,8 @@ class SutraDB:
             metric=metric,
             storage_path=storage_path,
             enable_wal=enable_wal,
-            analyzer=analyzer
+            analyzer=analyzer,
+            embedding_function=embedding_function
         )
         self.collections[name] = col
         return col
@@ -832,16 +1203,24 @@ class SutraDB:
     def get_or_create_collection(
         self,
         name: str,
-        dimension: int,
+        dimension: Optional[int] = None,
         metric: Union[Metric, str] = Metric.COSINE,
         enable_wal: bool = False,
-        analyzer: Optional[Union[Analyzer, AnalyzerConfig, Dict[str, Any]]] = None
+        analyzer: Optional[Union[Analyzer, AnalyzerConfig, Dict[str, Any]]] = None,
+        embedding_function: Optional[Any] = None
     ) -> Collection:
         """Retrieves or initializes a collection."""
         try:
             return self.get_collection(name)
         except KeyError:
-            return self.create_collection(name, dimension, metric, enable_wal=enable_wal, analyzer=analyzer)
+            return self.create_collection(
+                name,
+                dimension,
+                metric,
+                enable_wal=enable_wal,
+                analyzer=analyzer,
+                embedding_function=embedding_function
+            )
 
     def list_collections(self) -> List[str]:
         """Returns a list of all active collection names."""

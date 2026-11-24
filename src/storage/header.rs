@@ -70,7 +70,7 @@ impl SutraHeader {
 
         let metadata_length = u64::from_le_bytes(buf[32..40].try_into().unwrap());
         let crc32 = u32::from_le_bytes(buf[40..44].try_into().unwrap());
-        let quant_mode = buf[44];
+        let quant_mode = if magic == *HEADER_MAGIC_V2 { 0 } else { buf[44] };
 
         Ok(Self {
             magic,

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use crate::distance::Metric;
 
 /// 8-bit Scalar Quantized Vector (SQ8).
 /// Compresses 32-bit floats into 8-bit unsigned integers:
@@ -111,5 +112,17 @@ impl SQ8Vector {
             dist_sq += d * d;
         }
         dist_sq
+    }
+
+    /// Computes asymmetric similarity score according to the specified Metric.
+    #[inline]
+    pub fn score(&self, query: &[f32], query_sum: f32, metric: Metric) -> f32 {
+        match metric {
+            Metric::Cosine | Metric::DotProduct => self.asymmetric_dot_product(query, query_sum),
+            Metric::Euclidean => {
+                let dist_sq = self.asymmetric_euclidean_squared(query);
+                1.0 / (1.0 + dist_sq.sqrt())
+            }
+        }
     }
 }

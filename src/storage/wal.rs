@@ -53,6 +53,14 @@ impl WriteAheadLog {
         self.file.write_all(&header)?;
         self.file.write_all(&payload)?;
         self.file.flush()?;
+        self.file.sync_data()?;
+        Ok(())
+    }
+
+    /// Flushes userspace buffers and issues a hardware sync for durable persistence.
+    pub fn flush(&mut self) -> Result<(), SutraError> {
+        self.file.flush()?;
+        self.file.sync_data()?;
         Ok(())
     }
 

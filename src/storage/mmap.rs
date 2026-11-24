@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::path::Path;
 use memmap2::Mmap;
+use crc32fast::Hasher;
 use crate::error::SutraError;
 use super::header::{SutraHeader, HEADER_SIZE};
 
@@ -28,9 +29,21 @@ impl MmapVectorStorage {
 
         let vector_offset = HEADER_SIZE;
         let metadata_offset = vector_offset + vector_bytes_len;
+        let payload_end = metadata_offset + (header.metadata_length as usize);
 
-        if mmap.len() < metadata_offset + (header.metadata_length as usize) {
+        if mmap.len() < payload_end {
             return Err(SutraError::InvalidHeader("File truncated".into()));
+        }
+
+        let mut hasher = Hasher::new();
+        hasher.update(&mmap[HEADER_SIZE..payload_end]);
+        let computed_crc = hasher.finalize();
+
+        if computed_crc != header.crc32 {
+            return Err(SutraError::InvalidHeader(format!(
+                "CRC32 checksum mismatch: expected {}, got {}",
+                header.crc32, computed_crc
+            )));
         }
 
         Ok(Self {

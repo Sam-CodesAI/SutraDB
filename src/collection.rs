@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -16,7 +17,7 @@ use crate::index::hnsw::{HNSWConfig, HNSWIndex};
 use crate::index::ivf::{auto_n_lists, IVFConfig, IVFIndex};
 use crate::storage::{BinaryStorage, MmapVectorStorage, WalRecord, WriteAheadLog};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NativeDocument {
     pub id: String,
     #[serde(default)]
@@ -25,6 +26,10 @@ pub struct NativeDocument {
     pub text: String,
     #[serde(default)]
     pub metadata: Value,
+    #[serde(default)]
+    pub sparse_vector: Option<crate::sparse::SparseVector>,
+    #[serde(default)]
+    pub colbert_tokens: Option<Vec<Vec<f32>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +40,10 @@ pub struct NativeSearchResult {
     pub metadata: Value,
     pub dense_score: Option<f32>,
     pub bm25_score: Option<f32>,
+    #[serde(default)]
+    pub sparse_score: Option<f32>,
+    #[serde(default)]
+    pub colbert_score: Option<f32>,
     #[serde(default)]
     pub namespace: Option<String>,
 }
@@ -60,6 +69,9 @@ pub struct NativeCollection {
     pub hnsw: Option<HNSWIndex>,
     pub ivf: Option<IVFIndex>,
     pub secondary_index: SecondaryIndex,
+    pub metadata_index: crate::filter::SecondaryMetadataIndex,
+    pub sparse_index: crate::sparse::SparseIndex,
+    pub colbert_index: crate::colbert::ColbertIndex,
     pub wal: Option<WriteAheadLog>,
     pub dirty_index: bool,
 }
@@ -118,6 +130,9 @@ impl NativeCollection {
             hnsw: None,
             ivf: None,
             secondary_index: SecondaryIndex::new(),
+            metadata_index: crate::filter::SecondaryMetadataIndex::new(),
+            sparse_index: crate::sparse::SparseIndex::new(),
+            colbert_index: crate::colbert::ColbertIndex::new(dimension),
             wal,
             dirty_index: false,
         };
@@ -135,7 +150,7 @@ impl NativeCollection {
         let records = wal.replay()?;
         for r in records {
             match r.op.as_str() {
-                "insert" | "update" => {
+                "insert" => {
                     let mut docs = Vec::new();
                     let mut vecs = Vec::new();
                     for d_val in r.docs {
@@ -150,10 +165,54 @@ impl NativeCollection {
                             None => vec![0.0; self.dimension],
                         };
 
-                        docs.push(NativeDocument { id, namespace, text, metadata });
+                        let sparse_vector = d_val.get("sparse_vector").and_then(|v| {
+                            if let Some(map) = v.as_object() {
+                                let mut pairs: Vec<(u32, f32)> = map.iter().filter_map(|(k, val)| {
+                                    let idx = k.parse::<u32>().ok()?;
+                                    let f = val.as_f64()? as f32;
+                                    Some((idx, f))
+                                }).collect();
+                                pairs.sort_by_key(|p| p.0);
+                                let idxs = pairs.iter().map(|p| p.0).collect();
+                                let vals = pairs.iter().map(|p| p.1).collect();
+                                Some(crate::sparse::SparseVector::new(idxs, vals))
+                            } else {
+                                None
+                            }
+                        });
+
+                        let colbert_tokens: Option<Vec<Vec<f32>>> = d_val.get("colbert_tokens").and_then(|v| {
+                            v.as_array().map(|arr| {
+                                arr.iter().filter_map(|tok_arr| {
+                                    tok_arr.as_array().map(|vec_arr| {
+                                        vec_arr.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect()
+                                    })
+                                }).collect()
+                            })
+                        });
+
+                        docs.push(NativeDocument { id, namespace, text, metadata, sparse_vector, colbert_tokens });
                         vecs.push(vec);
                     }
                     self.insert_internal(docs, vecs, false)?;
+                }
+                "update" => {
+                    for d_val in r.docs {
+                        if let Some(id) = d_val.get("id").and_then(|v| v.as_str()) {
+                            let metadata = d_val.get("metadata").cloned().unwrap_or(Value::Object(serde_json::Map::new()));
+                            if let Some(&idx) = self.id_to_index.get(id) {
+                                if idx < self.tombstones.len() && !self.tombstones[idx] {
+                                    if let Some(target) = self.documents.get_mut(idx) {
+                                        target.metadata = metadata.clone();
+                                        self.secondary_index.remove_document(idx as u32);
+                                        self.secondary_index.index_document(idx as u32, &metadata);
+                                        self.metadata_index.remove_document(idx as u32);
+                                        self.metadata_index.index_document(idx as u32, &metadata);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 "delete" => {
                     self.delete_internal(&r.ids, false)?;
@@ -206,7 +265,15 @@ impl NativeCollection {
                     "namespace": doc.namespace,
                     "text": doc.text,
                     "metadata": doc.metadata,
-                    "vector": vec
+                    "vector": vec,
+                    "sparse_vector": doc.sparse_vector.as_ref().map(|sv| {
+                        let mut m = serde_json::Map::new();
+                        for (&idx, &val) in sv.indices.iter().zip(sv.values.iter()) {
+                            m.insert(idx.to_string(), serde_json::Value::from(val));
+                        }
+                        serde_json::Value::Object(m)
+                    }),
+                    "colbert_tokens": doc.colbert_tokens
                 });
                 wal_docs.push(doc_json);
             }
@@ -225,11 +292,33 @@ impl NativeCollection {
                         self.pq_vectors[existing_idx] = cb.encode(&vec);
                     }
                 }
+                self.secondary_index.remove_document(existing_idx as u32);
+                self.secondary_index.index_document(existing_idx as u32, &doc.metadata);
+                self.metadata_index.remove_document(existing_idx as u32);
+                self.metadata_index.index_document(existing_idx as u32, &doc.metadata);
+                self.sparse_index.remove_document(existing_idx as u32);
+                if let Some(ref sv) = doc.sparse_vector {
+                    self.sparse_index.add_document(existing_idx as u32, sv);
+                }
+                self.colbert_index.remove_document(existing_idx as u32);
+                if let Some(ref tokens) = doc.colbert_tokens {
+                    self.colbert_index.add_document(existing_idx as u32, tokens.clone());
+                }
+                let old_text = &self.documents[existing_idx].text;
+                self.bm25.update_document(existing_idx as u32, old_text, &doc.text);
                 self.documents[existing_idx] = doc;
                 if existing_idx < self.tombstones.len() {
                     self.tombstones[existing_idx] = false;
                 }
-                self.dirty_index = true;
+                if let Some(ref mut hnsw) = self.hnsw {
+                    hnsw.delete_node(existing_idx as u32, &self.vectors, self.metric, is_cosine);
+                    let _ = hnsw.insert(existing_idx as u32, &vec, &self.vectors, self.metric, is_cosine);
+                    if self.ivf.is_some() {
+                        self.dirty_index = true;
+                    }
+                } else {
+                    self.dirty_index = true;
+                }
                 continue;
             }
 
@@ -250,11 +339,25 @@ impl NativeCollection {
             }
 
             self.secondary_index.index_document(idx as u32, &doc.metadata);
+            self.metadata_index.index_document(idx as u32, &doc.metadata);
+            if let Some(ref sv) = doc.sparse_vector {
+                self.sparse_index.add_document(idx as u32, sv);
+            }
+            if let Some(ref tokens) = doc.colbert_tokens {
+                self.colbert_index.add_document(idx as u32, tokens.clone());
+            }
             self.bm25.add_documents(&[doc.text.clone()]);
-            self.vectors.push(vec);
+            self.vectors.push(vec.clone());
             self.documents.push(doc);
             self.tombstones.push(false);
-            self.dirty_index = true;
+            if let Some(ref mut hnsw) = self.hnsw {
+                let _ = hnsw.insert(idx as u32, &vec, &self.vectors, self.metric, is_cosine);
+                if self.ivf.is_some() {
+                    self.dirty_index = true;
+                }
+            } else {
+                self.dirty_index = true;
+            }
         }
 
         if log_to_wal && !wal_docs.is_empty() {
@@ -296,7 +399,10 @@ impl NativeCollection {
 
         if let Some(target) = self.documents.get_mut(idx) {
             target.metadata = new_metadata.clone();
+            self.secondary_index.remove_document(idx as u32);
             self.secondary_index.index_document(idx as u32, &new_metadata);
+            self.metadata_index.remove_document(idx as u32);
+            self.metadata_index.index_document(idx as u32, &new_metadata);
         }
 
         if let Some(ref mut wal) = self.wal {
@@ -329,6 +435,11 @@ impl NativeCollection {
                     self.tombstones[idx] = true;
                     deleted_count += 1;
                     deleted_ids.push(id.clone());
+
+                    self.secondary_index.remove_document(idx as u32);
+                    self.metadata_index.remove_document(idx as u32);
+                    self.sparse_index.remove_document(idx as u32);
+                    self.colbert_index.remove_document(idx as u32);
 
                     // Dynamic online HNSW node deletion and edge healing
                     if let Some(ref mut hnsw) = self.hnsw {
@@ -476,9 +587,11 @@ impl NativeCollection {
     }
 
     pub fn query(
-        &mut self,
+        &self,
         vector: Option<&[f32]>,
         text: Option<&str>,
+        sparse_vector: Option<&crate::sparse::SparseVector>,
+        colbert_tokens: Option<&[Vec<f32>]>,
         namespace: Option<&str>,
         filter: Option<&Value>,
         top_k: usize,
@@ -487,6 +600,8 @@ impl NativeCollection {
         rrf_constant: usize,
         dense_weight: f32,
         bm25_weight: f32,
+        sparse_weight: f32,
+        colbert_weight: f32,
         use_ann: bool,
     ) -> Result<Vec<NativeSearchResult>, SutraError> {
         let n = self.documents.len();
@@ -495,8 +610,22 @@ impl NativeCollection {
         }
 
         // 1. Build compound mask: metadata filter & tombstones & namespace isolation
-        let metadata_list: Vec<Value> = self.documents.iter().map(|d| d.metadata.clone()).collect();
-        let mut mask = FilterEngine::build_mask(&metadata_list, filter);
+        // Sub-microsecond filter evaluation via SecondaryMetadataIndex
+        let mut mask = vec![true; n];
+        if let Some(bitmap) = self.metadata_index.evaluate_filter(filter) {
+            for i in 0..n {
+                mask[i] = bitmap.contains(i as u32);
+            }
+        }
+
+        // If the filter has complex operators ($geo_within, $geo_box, $regex, etc.), check remaining matching candidates
+        if filter.map(|f| crate::filter::has_complex_operators(f)).unwrap_or(false) {
+            for i in 0..n {
+                if mask[i] {
+                    mask[i] = FilterEngine::evaluate(Some(&self.documents[i].metadata), filter);
+                }
+            }
+        }
 
         for (i, &t) in self.tombstones.iter().enumerate() {
             if t && i < mask.len() {
@@ -521,16 +650,24 @@ impl NativeCollection {
 
         let has_vector = vector.is_some();
         let has_text = text.map(|t| !t.trim().is_empty()).unwrap_or(false);
+        let has_sparse = sparse_vector.map(|sv| !sv.is_empty()).unwrap_or(false);
+        let has_colbert = colbert_tokens.map(|ct| !ct.is_empty()).unwrap_or(false);
 
-        // 2. Score Dense
+        // 2. Cost-Based Query Planning:
+        // If valid_count is small (<= 512 or < 2% of collection),
+        // HNSW graph walking suffers from filter collapse (hitting dead ends).
+        // Bypassing HNSW to direct SIMD scan over the small candidate pool guarantees 100% recall in microseconds!
+        let valid_ratio = valid_count as f32 / n as f32;
+        let should_bypass_hnsw = valid_count <= 512 || valid_ratio < 0.02;
+
         let is_cosine = self.metric == Metric::Cosine;
         let mut dense_scores = vec![0.0f32; n];
 
         if let Some(q_vec) = vector {
             let normalized_q = if is_cosine { normalize_copy(q_vec) } else { q_vec.to_vec() };
 
-            // ANN path: HNSW or IVF if pure vector query without BM25
-            if use_ann && !has_text && !self.dirty_index {
+            // ANN path: HNSW or IVF if pure vector query without BM25 and selectivity is high enough
+            if use_ann && !has_text && !has_sparse && !has_colbert && !self.dirty_index && !should_bypass_hnsw {
                 if let Some(ref hnsw) = self.hnsw {
                     let ann_res = hnsw.search(&normalized_q, &self.vectors, top_k, 32, self.metric, is_cosine, Some(&mask))?;
                     return Ok(ann_res.into_iter().map(|(id, score)| {
@@ -542,6 +679,8 @@ impl NativeCollection {
                             metadata: doc.metadata.clone(),
                             dense_score: Some(score),
                             bm25_score: None,
+                            sparse_score: None,
+                            colbert_score: None,
                             namespace: doc.namespace.clone(),
                         }
                     }).collect());
@@ -556,13 +695,15 @@ impl NativeCollection {
                             metadata: doc.metadata.clone(),
                             dense_score: Some(score),
                             bm25_score: None,
+                            sparse_score: None,
+                            colbert_score: None,
                             namespace: doc.namespace.clone(),
                         }
                     }).collect());
                 }
             }
 
-            // Brute force / exact scoring or two-stage PQ / BQ accelerated search
+            // Low-selectivity bypass or Exact scoring / Quantized scoring
             if self.use_pq && self.pq_codebook.is_some() {
                 let cb = self.pq_codebook.as_ref().unwrap();
                 let lut = cb.compute_lut(&normalized_q, self.metric);
@@ -597,7 +738,7 @@ impl NativeCollection {
                 let q_sum = if self.use_sq8 { normalized_q.iter().sum() } else { 0.0 };
                 for &(idx, _) in candidates.iter().take(rerank_count) {
                     if self.use_sq8 {
-                        dense_scores[idx] = self.sq8_vectors[idx].asymmetric_dot_product(&normalized_q, q_sum);
+                        dense_scores[idx] = self.sq8_vectors[idx].score(&normalized_q, q_sum, self.metric);
                     } else {
                         dense_scores[idx] = compute_vector_score(&normalized_q, &self.vectors[idx], self.metric, is_cosine)?;
                     }
@@ -608,7 +749,7 @@ impl NativeCollection {
                     use rayon::prelude::*;
                     dense_scores = self.sq8_vectors.par_iter().enumerate().map(|(i, sq)| {
                         if mask[i] {
-                            sq.asymmetric_dot_product(&normalized_q, q_sum)
+                            sq.score(&normalized_q, q_sum, self.metric)
                         } else {
                             0.0
                         }
@@ -616,7 +757,7 @@ impl NativeCollection {
                 } else {
                     for (i, sq) in self.sq8_vectors.iter().enumerate() {
                         if mask[i] {
-                            dense_scores[i] = sq.asymmetric_dot_product(&normalized_q, q_sum);
+                            dense_scores[i] = sq.score(&normalized_q, q_sum, self.metric);
                         }
                     }
                 }
@@ -646,9 +787,57 @@ impl NativeCollection {
             bm25_scores = self.bm25.score_query(text.unwrap(), Some(&mask));
         }
 
-        // 4. Fusion or routing
-        if hybrid && has_vector && has_text {
-            let fused = if let Some(a) = alpha {
+        // 4. Score Neural Sparse Vectors
+        let mut sparse_scores = vec![0.0f32; n];
+        if let Some(sv) = sparse_vector {
+            let sparse_hits = self.sparse_index.search(sv, n, Some(&mask));
+            for (id, sc) in sparse_hits {
+                sparse_scores[id as usize] = sc;
+            }
+        }
+
+        // 5. Score ColBERT Multi-Vectors
+        let mut colbert_scores = vec![0.0f32; n];
+        if let Some(ct) = colbert_tokens {
+            let colbert_hits = self.colbert_index.query_maxsim(ct, Some(&mask), n);
+            for (id, sc) in colbert_hits {
+                let idx = id as usize;
+                if idx < n {
+                    colbert_scores[idx] = sc;
+                }
+            }
+        }
+
+        // 6. Fusion or routing
+        let num_modalities = (has_vector as usize) + (has_text as usize) + (has_sparse as usize) + (has_colbert as usize);
+        if hybrid && num_modalities >= 2 {
+            let fused = if has_colbert {
+                crate::fusion::quad_modal_reciprocal_rank_fusion(
+                    &dense_scores,
+                    &bm25_scores,
+                    &sparse_scores,
+                    &colbert_scores,
+                    top_k,
+                    rrf_constant,
+                    dense_weight,
+                    bm25_weight,
+                    sparse_weight,
+                    colbert_weight,
+                    Some(&mask),
+                )
+            } else if has_sparse {
+                crate::fusion::tri_modal_reciprocal_rank_fusion(
+                    &dense_scores,
+                    &bm25_scores,
+                    &sparse_scores,
+                    top_k,
+                    rrf_constant,
+                    dense_weight,
+                    bm25_weight,
+                    sparse_weight,
+                    Some(&mask),
+                )
+            } else if let Some(a) = alpha {
                 linear_score_fusion(&dense_scores, &bm25_scores, a, top_k, Some(&mask))
             } else {
                 reciprocal_rank_fusion(
@@ -671,6 +860,50 @@ impl NativeCollection {
                     metadata: doc.metadata.clone(),
                     dense_score: Some(c.dense_score),
                     bm25_score: Some(c.bm25_score),
+                    sparse_score: Some(c.sparse_score),
+                    colbert_score: Some(c.colbert_score),
+                    namespace: doc.namespace.clone(),
+                }
+            }).collect());
+        }
+
+        if has_colbert && !has_vector && !has_text && !has_sparse {
+            let mut valid: Vec<(usize, f32)> = (0..n).filter(|&i| mask[i] && colbert_scores[i] > 0.0).map(|i| (i, colbert_scores[i])).collect();
+            valid.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            valid.truncate(top_k);
+
+            return Ok(valid.into_iter().map(|(idx, score)| {
+                let doc = &self.documents[idx];
+                NativeSearchResult {
+                    id: doc.id.clone(),
+                    score,
+                    text: doc.text.clone(),
+                    metadata: doc.metadata.clone(),
+                    dense_score: None,
+                    bm25_score: None,
+                    sparse_score: None,
+                    colbert_score: Some(score),
+                    namespace: doc.namespace.clone(),
+                }
+            }).collect());
+        }
+
+        if has_sparse && !has_vector && !has_text {
+            let mut valid: Vec<(usize, f32)> = (0..n).filter(|&i| mask[i] && sparse_scores[i] > 0.0).map(|i| (i, sparse_scores[i])).collect();
+            valid.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            valid.truncate(top_k);
+
+            return Ok(valid.into_iter().map(|(idx, score)| {
+                let doc = &self.documents[idx];
+                NativeSearchResult {
+                    id: doc.id.clone(),
+                    score,
+                    text: doc.text.clone(),
+                    metadata: doc.metadata.clone(),
+                    dense_score: None,
+                    bm25_score: None,
+                    sparse_score: Some(score),
+                    colbert_score: None,
                     namespace: doc.namespace.clone(),
                 }
             }).collect());
@@ -690,6 +923,8 @@ impl NativeCollection {
                     metadata: doc.metadata.clone(),
                     dense_score: Some(score),
                     bm25_score: None,
+                    sparse_score: None,
+                    colbert_score: None,
                     namespace: doc.namespace.clone(),
                 }
             }).collect());
@@ -709,12 +944,71 @@ impl NativeCollection {
                     metadata: doc.metadata.clone(),
                     dense_score: None,
                     bm25_score: Some(score),
+                    sparse_score: None,
+                    colbert_score: None,
                     namespace: doc.namespace.clone(),
                 }
             }).collect());
         }
 
-        Err(SutraError::InvalidQuery("Query must specify a vector, text, or both".into()))
+        Err(SutraError::InvalidQuery("Query must specify a vector, text, sparse vector, or combination".into()))
+    }
+
+    pub fn query_colbert(
+        &self,
+        query_tokens: &[Vec<f32>],
+        namespace: Option<&str>,
+        filter: Option<&Value>,
+        top_k: usize,
+    ) -> Result<Vec<NativeSearchResult>, SutraError> {
+        let n = self.documents.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut mask = vec![true; n];
+        if let Some(bitmap) = self.metadata_index.evaluate_filter(filter) {
+            for i in 0..n {
+                mask[i] = bitmap.contains(i as u32);
+            }
+        }
+        if filter.map(|f| crate::filter::has_complex_operators(f)).unwrap_or(false) {
+            for i in 0..n {
+                if mask[i] {
+                    mask[i] = FilterEngine::evaluate(Some(&self.documents[i].metadata), filter);
+                }
+            }
+        }
+        for (i, &t) in self.tombstones.iter().enumerate() {
+            if t && i < mask.len() {
+                mask[i] = false;
+            }
+        }
+        if let Some(ns) = namespace {
+            for (i, doc) in self.documents.iter().enumerate() {
+                if i < mask.len() && mask[i] {
+                    if doc.namespace.as_deref() != Some(ns) {
+                        mask[i] = false;
+                    }
+                }
+            }
+        }
+
+        let hits = self.colbert_index.query_maxsim(query_tokens, Some(&mask), top_k);
+        Ok(hits.into_iter().map(|(idx, score)| {
+            let doc = &self.documents[idx as usize];
+            NativeSearchResult {
+                id: doc.id.clone(),
+                score,
+                text: doc.text.clone(),
+                metadata: doc.metadata.clone(),
+                dense_score: None,
+                bm25_score: None,
+                sparse_score: None,
+                colbert_score: Some(score),
+                namespace: doc.namespace.clone(),
+            }
+        }).collect())
     }
 
     pub fn save<P: AsRef<Path>>(&mut self, path: Option<P>) -> Result<u64, SutraError> {
@@ -729,31 +1023,53 @@ impl NativeCollection {
         // Compact tombstones before saving
         self.compact()?;
 
-        let mut flattened_vectors = Vec::with_capacity(self.documents.len() * self.dimension);
-        for v in &self.vectors {
-            flattened_vectors.extend_from_slice(v);
-        }
-
         let doc_payloads: Vec<Value> = self.documents.iter().map(|d| {
             serde_json::json!({
                 "id": d.id,
                 "namespace": d.namespace,
                 "text": d.text,
-                "metadata": d.metadata
+                "metadata": d.metadata,
+                "sparse_vector": d.sparse_vector.as_ref().map(|sv| {
+                    let mut m = serde_json::Map::new();
+                    for (&idx, &val) in sv.indices.iter().zip(sv.values.iter()) {
+                        m.insert(idx.to_string(), serde_json::Value::from(val));
+                    }
+                    serde_json::Value::Object(m)
+                }),
+                "colbert_tokens": d.colbert_tokens
             })
         }).collect();
 
         let meta_bytes = serde_json::to_vec(&doc_payloads)
             .map_err(|e| SutraError::Serialization(e.to_string()))?;
 
-        let written = BinaryStorage::write_f32(
-            &p,
-            &flattened_vectors,
-            self.documents.len() as u32,
-            self.dimension as u32,
-            self.metric.as_str(),
-            &meta_bytes,
-        )?;
+        let written = if self.use_sq8 {
+            let mut flattened_sq8 = Vec::with_capacity(self.documents.len() * self.dimension);
+            for sq in &self.sq8_vectors {
+                flattened_sq8.extend_from_slice(&sq.data);
+            }
+            BinaryStorage::write_sq8(
+                &p,
+                &flattened_sq8,
+                self.documents.len() as u32,
+                self.dimension as u32,
+                self.metric.as_str(),
+                &meta_bytes,
+            )?
+        } else {
+            let mut flattened_vectors = Vec::with_capacity(self.documents.len() * self.dimension);
+            for v in &self.vectors {
+                flattened_vectors.extend_from_slice(v);
+            }
+            BinaryStorage::write_f32(
+                &p,
+                &flattened_vectors,
+                self.documents.len() as u32,
+                self.dimension as u32,
+                self.metric.as_str(),
+                &meta_bytes,
+            )?
+        };
 
         if let Some(ref mut wal) = self.wal {
             wal.clear()?;
@@ -774,31 +1090,86 @@ impl NativeCollection {
         let storage = MmapVectorStorage::open(&p)?;
         let header = storage.header();
         self.dimension = header.dimension as usize;
-        self.metric = Metric::from_u8(header.quant_mode).unwrap_or(Metric::Cosine);
+        self.metric = Metric::from_str(&header.metric).unwrap_or(Metric::Cosine);
 
         let doc_count = header.doc_count as usize;
         self.documents.clear();
         self.vectors.clear();
         self.id_to_index.clear();
         self.tombstones.clear();
-        self.bm25 = BM25Index::default();
+        self.bm25 = BM25Index::with_analyzer(self.bm25.k1, self.bm25.b, self.bm25.analyzer.clone());
+        self.secondary_index.clear();
+        self.metadata_index.clear();
+        self.sparse_index = crate::sparse::SparseIndex::new();
+        self.colbert_index = crate::colbert::ColbertIndex::new(self.colbert_index.token_dim);
+        self.sq8_vectors.clear();
+        self.bq_vectors.clear();
+        self.pq_vectors.clear();
+        self.use_sq8 = false;
+        self.use_bq = false;
+        self.use_pq = false;
+        self.hnsw = None;
+        self.ivf = None;
 
         let doc_vals: Vec<Value> = serde_json::from_slice(storage.metadata_bytes())
             .map_err(|e| SutraError::Serialization(e.to_string()))?;
 
         for i in 0..doc_count {
-            let vec_slice = storage.get_vector_f32(i);
+            let vec: Vec<f32> = if header.quant_mode == 1 {
+                let sq8_slice = storage.get_vector_sq8(i);
+                sq8_slice.iter().map(|&b| (b as f32) / 255.0).collect()
+            } else {
+                storage.get_vector_f32(i).to_vec()
+            };
             let d_val = &doc_vals[i];
             let id = d_val.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let namespace = d_val.get("namespace").and_then(|v| v.as_str()).map(|s| s.to_string());
             let text = d_val.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let metadata = d_val.get("metadata").cloned().unwrap_or(Value::Object(serde_json::Map::new()));
 
+            let sparse_vec = d_val.get("sparse_vector").and_then(|v| {
+                if let Some(map) = v.as_object() {
+                    let mut pairs: Vec<(u32, f32)> = map.iter().filter_map(|(k, val)| {
+                        let idx = k.parse::<u32>().ok()?;
+                        let f = val.as_f64()? as f32;
+                        Some((idx, f))
+                    }).collect();
+                    pairs.sort_by_key(|p| p.0);
+                    let idxs = pairs.iter().map(|p| p.0).collect();
+                    let vals = pairs.iter().map(|p| p.1).collect();
+                    Some(crate::sparse::SparseVector::new(idxs, vals))
+                } else {
+                    None
+                }
+            });
+
+            let colbert_tokens: Option<Vec<Vec<f32>>> = d_val.get("colbert_tokens").and_then(|v| {
+                v.as_array().map(|arr| {
+                    arr.iter().filter_map(|tok_arr| {
+                        tok_arr.as_array().map(|vec_arr| {
+                            vec_arr.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect()
+                        })
+                    }).collect()
+                })
+            });
+
+            if let Some(ref sv) = sparse_vec {
+                self.sparse_index.add_document(i as u32, sv);
+            }
+            if let Some(ref tokens) = colbert_tokens {
+                self.colbert_index.add_document(i as u32, tokens.clone());
+            }
+
             self.id_to_index.insert(id.clone(), i);
             self.secondary_index.index_document(i as u32, &metadata);
-            self.vectors.push(vec_slice.to_vec());
-            self.documents.push(NativeDocument { id, namespace, text, metadata });
+            self.metadata_index.index_document(i as u32, &metadata);
+            self.vectors.push(vec);
+            self.documents.push(NativeDocument { id, namespace, text, metadata, sparse_vector: sparse_vec, colbert_tokens });
             self.tombstones.push(false);
+        }
+
+        if header.quant_mode == 1 {
+            self.enable_sq8();
         }
 
         let corpus: Vec<String> = self.documents.iter().map(|d| d.text.clone()).collect();
@@ -817,8 +1188,18 @@ impl NativeCollection {
         let mut new_docs = Vec::new();
         let mut new_vecs = Vec::new();
         let mut new_id_map = HashMap::new();
-        let mut new_bm25 = BM25Index::default();
+        let mut new_bm25 = BM25Index::with_analyzer(self.bm25.k1, self.bm25.b, self.bm25.analyzer.clone());
         let mut new_sec = SecondaryIndex::new();
+        let mut new_meta_idx = crate::filter::SecondaryMetadataIndex::new();
+        let mut new_sparse_idx = crate::sparse::SparseIndex::new();
+        let mut new_colbert_idx = crate::colbert::ColbertIndex::new(self.colbert_index.token_dim);
+        if let Some(ref old_centroids) = self.colbert_index.centroids {
+            new_colbert_idx.centroids = Some(crate::colbert::ColbertCentroids {
+                centroids: old_centroids.centroids.clone(),
+                postings: HashMap::new(),
+            });
+            new_colbert_idx.is_trained = true;
+        }
 
         for (i, doc) in self.documents.drain(..).enumerate() {
             if i < self.tombstones.len() && self.tombstones[i] {
@@ -827,6 +1208,13 @@ impl NativeCollection {
             let idx = new_docs.len();
             new_id_map.insert(doc.id.clone(), idx);
             new_sec.index_document(idx as u32, &doc.metadata);
+            new_meta_idx.index_document(idx as u32, &doc.metadata);
+            if let Some(ref sv) = doc.sparse_vector {
+                new_sparse_idx.add_document(idx as u32, sv);
+            }
+            if let Some(ref tokens) = doc.colbert_tokens {
+                new_colbert_idx.add_document(idx as u32, tokens.clone());
+            }
             new_vecs.push(self.vectors[i].clone());
             new_docs.push(doc);
         }
@@ -840,6 +1228,9 @@ impl NativeCollection {
         self.tombstones = vec![false; self.documents.len()];
         self.bm25 = new_bm25;
         self.secondary_index = new_sec;
+        self.metadata_index = new_meta_idx;
+        self.sparse_index = new_sparse_idx;
+        self.colbert_index = new_colbert_idx;
         if self.use_sq8 {
             self.sq8_vectors = self.vectors.iter().map(|v| SQ8Vector::quantize(v)).collect();
         }

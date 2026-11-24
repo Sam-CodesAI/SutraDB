@@ -15,7 +15,9 @@ import numpy as np
 # Header specification:
 # Magic: 8 bytes ("SUTRA\x02\x00\x00")
 # Format: <8sII16sQI (total 42 bytes + 22 bytes padding = 64-byte aligned header)
-HEADER_MAGIC = b"SUTRA\x02\x00\x00"
+HEADER_MAGIC_V2 = b"SUTRA\x02\x00\x00"
+HEADER_MAGIC_V3 = b"SUTRA\x03\x00\x00"
+HEADER_MAGIC = HEADER_MAGIC_V2
 HEADER_FORMAT = "<8sII16sQI20s"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 assert HEADER_SIZE == 64, f"Header size must be 64 bytes, got {HEADER_SIZE}"
@@ -95,33 +97,54 @@ class BinaryStorage:
             if len(header_bytes) < HEADER_SIZE:
                 raise ValueError("Corrupt file: Header too short")
 
-            magic, doc_count, dimension, metric_raw, meta_len, stored_crc, _ = struct.unpack(
+            magic, doc_count, dimension, metric_raw, meta_len, stored_crc, extra = struct.unpack(
                 HEADER_FORMAT, header_bytes
             )
 
-            if magic != HEADER_MAGIC:
-                raise ValueError(f"Invalid magic bytes: {magic}, expected {HEADER_MAGIC}")
+            if magic not in (HEADER_MAGIC_V2, HEADER_MAGIC_V3):
+                raise ValueError(f"Invalid magic bytes: {magic}, expected {HEADER_MAGIC_V2} or {HEADER_MAGIC_V3}")
 
             metric = metric_raw.rstrip(b"\x00").decode("ascii")
 
-            vector_byte_size = doc_count * dimension * 4
-            vector_bytes = f.read(vector_byte_size)
-            if len(vector_bytes) < vector_byte_size:
-                raise ValueError("Corrupt file: Incomplete vector array data")
+            quant_mode = extra[0] if (magic == HEADER_MAGIC_V3 and len(extra) > 0) else 0
+            if quant_mode == 1:
+                vector_byte_size = doc_count * dimension
+                vector_bytes = f.read(vector_byte_size)
+                if len(vector_bytes) < vector_byte_size:
+                    raise ValueError("Corrupt file: Incomplete vector array data")
 
-            metadata_bytes = f.read(meta_len)
-            if len(metadata_bytes) < meta_len:
-                raise ValueError("Corrupt file: Incomplete metadata payload")
+                metadata_bytes = f.read(meta_len)
+                if len(metadata_bytes) < meta_len:
+                    raise ValueError("Corrupt file: Incomplete metadata payload")
 
-            # Verify CRC32 checksum
-            computed_crc = zlib.crc32(vector_bytes)
-            computed_crc = zlib.crc32(metadata_bytes, computed_crc)
-            if computed_crc != stored_crc:
-                raise ValueError(
-                    f"Integrity check failed: CRC32 mismatch ({computed_crc} != {stored_crc})"
-                )
+                computed_crc = zlib.crc32(vector_bytes)
+                computed_crc = zlib.crc32(metadata_bytes, computed_crc)
+                if computed_crc != stored_crc:
+                    raise ValueError(
+                        f"Integrity check failed: CRC32 mismatch ({computed_crc} != {stored_crc})"
+                    )
 
-            vectors = np.frombuffer(vector_bytes, dtype=np.float32).reshape((doc_count, dimension)).copy()
+                u8_arr = np.frombuffer(vector_bytes, dtype=np.uint8).reshape((doc_count, dimension))
+                vectors = (u8_arr.astype(np.float32) / 255.0).copy()
+            else:
+                vector_byte_size = doc_count * dimension * 4
+                vector_bytes = f.read(vector_byte_size)
+                if len(vector_bytes) < vector_byte_size:
+                    raise ValueError("Corrupt file: Incomplete vector array data")
+
+                metadata_bytes = f.read(meta_len)
+                if len(metadata_bytes) < meta_len:
+                    raise ValueError("Corrupt file: Incomplete metadata payload")
+
+                computed_crc = zlib.crc32(vector_bytes)
+                computed_crc = zlib.crc32(metadata_bytes, computed_crc)
+                if computed_crc != stored_crc:
+                    raise ValueError(
+                        f"Integrity check failed: CRC32 mismatch ({computed_crc} != {stored_crc})"
+                    )
+
+                vectors = np.frombuffer(vector_bytes, dtype=np.float32).reshape((doc_count, dimension)).copy()
+
             documents = json.loads(metadata_bytes.decode("utf-8"))
 
             return vectors, documents, metric
@@ -144,6 +167,30 @@ class WriteAheadLog:
         header = struct.pack("<II", length, crc)
         self._file.write(header + payload)
         self._file.flush()
+        try:
+            if hasattr(os, "fdatasync"):
+                os.fdatasync(self._file.fileno())
+            else:
+                os.fsync(self._file.fileno())
+        except (AttributeError, OSError):
+            try:
+                os.fsync(self._file.fileno())
+            except (AttributeError, OSError):
+                pass
+
+    def flush(self) -> None:
+        """Flushes buffers and forces sync to disk for true durability."""
+        self._file.flush()
+        try:
+            if hasattr(os, "fdatasync"):
+                os.fdatasync(self._file.fileno())
+            else:
+                os.fsync(self._file.fileno())
+        except (AttributeError, OSError):
+            try:
+                os.fsync(self._file.fileno())
+            except (AttributeError, OSError):
+                pass
 
     def replay(self) -> List[Dict[str, Any]]:
         """Reads and validates all WAL entries from disk."""

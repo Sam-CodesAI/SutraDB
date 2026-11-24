@@ -5,7 +5,11 @@ pub mod bm25;
 pub mod filter;
 pub mod fusion;
 pub mod index;
+pub mod sparse;
+pub mod colbert;
 pub mod collection;
+pub mod cluster;
+pub mod grpc;
 pub mod py_api;
 
 use pyo3::prelude::*;

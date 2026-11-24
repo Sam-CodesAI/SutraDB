@@ -89,23 +89,52 @@ class FilterEngine:
                 if field_value == target:
                     return False
             elif op == "$gt":
-                if field_value is None or not (field_value > target):
+                if field_value is None:
+                    return False
+                try:
+                    if not (field_value > target):
+                        return False
+                except TypeError:
                     return False
             elif op == "$gte":
-                if field_value is None or not (field_value >= target):
+                if field_value is None:
+                    return False
+                try:
+                    if not (field_value >= target):
+                        return False
+                except TypeError:
                     return False
             elif op == "$lt":
-                if field_value is None or not (field_value < target):
+                if field_value is None:
+                    return False
+                try:
+                    if not (field_value < target):
+                        return False
+                except TypeError:
                     return False
             elif op == "$lte":
-                if field_value is None or not (field_value <= target):
+                if field_value is None:
+                    return False
+                try:
+                    if not (field_value <= target):
+                        return False
+                except TypeError:
                     return False
             elif op == "$in":
-                if not isinstance(target, (list, tuple, set)) or field_value not in target:
+                if not isinstance(target, (list, tuple, set)):
+                    return False
+                try:
+                    if field_value not in target:
+                        return False
+                except TypeError:
                     return False
             elif op == "$nin":
-                if isinstance(target, (list, tuple, set)) and field_value in target:
-                    return False
+                if isinstance(target, (list, tuple, set)):
+                    try:
+                        if field_value in target:
+                            return False
+                    except TypeError:
+                        pass
             elif op == "$contains":
                 if field_value is None:
                     return False

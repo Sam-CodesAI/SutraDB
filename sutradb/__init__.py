@@ -17,8 +17,20 @@ from sutradb.integrations.langchain import SutraDBVectorStore
 from sutradb.integrations.llamaindex import SutraDBLlamaIndexVectorStore
 from sutradb.quantization import BQVector, SQ8Vector, PQVector, PQCodebook
 from sutradb.nlp import Analyzer, AnalyzerConfig, PorterStemmer
+from sutradb.embeddings import (
+    EmbeddingFunction,
+    DefaultEmbeddingFunction,
+    OpenAIEmbeddingFunction,
+    FastEmbedFunction,
+    HuggingFaceEmbeddingFunction,
+)
+from sutradb.cluster import (
+    ConsistentHashRing,
+    DistributedCollection,
+    DistributedCluster,
+)
 
-__version__ = "3.4.0"
+__version__ = "5.0.0"
 __all__ = [
     "SutraDB",
     "Collection",
@@ -43,4 +55,12 @@ __all__ = [
     "IVFIndex",
     "IVFConfig",
     "auto_n_lists",
+    "EmbeddingFunction",
+    "DefaultEmbeddingFunction",
+    "OpenAIEmbeddingFunction",
+    "FastEmbedFunction",
+    "HuggingFaceEmbeddingFunction",
+    "ConsistentHashRing",
+    "DistributedCollection",
+    "DistributedCluster",
 ]

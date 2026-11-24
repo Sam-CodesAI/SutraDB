@@ -75,11 +75,39 @@ impl PyNativeCollection {
                 Value::Object(serde_json::Map::new())
             };
 
+            let sparse_vec = if let Some(sp_item) = d.get_item("sparse_vector")? {
+                if let Ok(dict) = sp_item.extract::<std::collections::HashMap<u32, f32>>() {
+                    let mut pairs: Vec<(u32, f32)> = dict.into_iter().collect();
+                    pairs.sort_by_key(|p| p.0);
+                    let idxs = pairs.iter().map(|p| p.0).collect();
+                    let vals = pairs.iter().map(|p| p.1).collect();
+                    Some(crate::sparse::SparseVector::new(idxs, vals))
+                } else if let Ok(dict_str) = sp_item.extract::<std::collections::HashMap<String, f32>>() {
+                    let mut pairs: Vec<(u32, f32)> = dict_str.into_iter().filter_map(|(k, v)| k.parse::<u32>().ok().map(|idx| (idx, v))).collect();
+                    pairs.sort_by_key(|p| p.0);
+                    let idxs = pairs.iter().map(|p| p.0).collect();
+                    let vals = pairs.iter().map(|p| p.1).collect();
+                    Some(crate::sparse::SparseVector::new(idxs, vals))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let colbert_tokens: Option<Vec<Vec<f32>>> = if let Some(cb_item) = d.get_item("colbert_tokens")? {
+                cb_item.extract::<Vec<Vec<f32>>>().ok()
+            } else {
+                None
+            };
+
             native_docs.push(NativeDocument {
                 id,
                 namespace,
                 text,
                 metadata: metadata_val,
+                sparse_vector: sparse_vec,
+                colbert_tokens,
             });
         }
 
@@ -175,6 +203,8 @@ impl PyNativeCollection {
     #[pyo3(signature = (
         vector=None,
         text=None,
+        sparse_vector=None,
+        colbert_tokens=None,
         namespace=None,
         filter=None,
         top_k=10,
@@ -183,13 +213,17 @@ impl PyNativeCollection {
         rrf_constant=60,
         dense_weight=1.0,
         bm25_weight=1.0,
+        sparse_weight=1.0,
+        colbert_weight=1.0,
         use_ann=false
     ))]
     fn query(
-        &mut self,
+        &self,
         py: Python,
         vector: Option<Vec<f32>>,
         text: Option<&str>,
+        sparse_vector: Option<Bound<'_, PyDict>>,
+        colbert_tokens: Option<Vec<Vec<f32>>>,
         namespace: Option<&str>,
         filter: Option<Bound<'_, PyDict>>,
         top_k: usize,
@@ -198,6 +232,8 @@ impl PyNativeCollection {
         rrf_constant: usize,
         dense_weight: f32,
         bm25_weight: f32,
+        sparse_weight: f32,
+        colbert_weight: f32,
         use_ann: bool,
     ) -> PyResult<Vec<PyObject>> {
         let filter_val: Option<Value> = if let Some(f_dict) = filter {
@@ -207,10 +243,32 @@ impl PyNativeCollection {
             None
         };
 
+        let sparse_vec = if let Some(sp_dict) = sparse_vector {
+            if let Ok(dict) = sp_dict.extract::<std::collections::HashMap<u32, f32>>() {
+                let mut pairs: Vec<(u32, f32)> = dict.into_iter().collect();
+                pairs.sort_by_key(|p| p.0);
+                let idxs = pairs.iter().map(|p| p.0).collect();
+                let vals = pairs.iter().map(|p| p.1).collect();
+                Some(crate::sparse::SparseVector::new(idxs, vals))
+            } else if let Ok(dict_str) = sp_dict.extract::<std::collections::HashMap<String, f32>>() {
+                let mut pairs: Vec<(u32, f32)> = dict_str.into_iter().filter_map(|(k, v)| k.parse::<u32>().ok().map(|idx| (idx, v))).collect();
+                pairs.sort_by_key(|p| p.0);
+                let idxs = pairs.iter().map(|p| p.0).collect();
+                let vals = pairs.iter().map(|p| p.1).collect();
+                Some(crate::sparse::SparseVector::new(idxs, vals))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let results = py.allow_threads(|| {
             self.inner.query(
                 vector.as_deref(),
                 text,
+                sparse_vec.as_ref(),
+                colbert_tokens.as_deref(),
                 namespace,
                 filter_val.as_ref(),
                 top_k,
@@ -219,6 +277,8 @@ impl PyNativeCollection {
                 rrf_constant,
                 dense_weight,
                 bm25_weight,
+                sparse_weight,
+                colbert_weight,
                 use_ann,
             )
         })?;
@@ -233,6 +293,8 @@ impl PyNativeCollection {
             dict.set_item("text", r.text)?;
             dict.set_item("dense_score", r.dense_score)?;
             dict.set_item("bm25_score", r.bm25_score)?;
+            dict.set_item("sparse_score", r.sparse_score)?;
+            dict.set_item("colbert_score", r.colbert_score)?;
             dict.set_item("namespace", r.namespace)?;
 
             let meta_json = serde_json::to_string(&r.metadata).unwrap_or_default();
@@ -243,6 +305,60 @@ impl PyNativeCollection {
         }
 
         Ok(out)
+    }
+
+    #[pyo3(signature = (query_tokens, namespace=None, filter=None, top_k=10))]
+    fn query_colbert(
+        &self,
+        py: Python,
+        query_tokens: Vec<Vec<f32>>,
+        namespace: Option<&str>,
+        filter: Option<Bound<'_, PyDict>>,
+        top_k: usize,
+    ) -> PyResult<Vec<PyObject>> {
+        let filter_val: Option<Value> = if let Some(f_dict) = filter {
+            let json_str = py.import("json")?.call_method1("dumps", (f_dict,))?.extract::<String>()?;
+            Some(serde_json::from_str(&json_str).unwrap_or(Value::Null))
+        } else {
+            None
+        };
+
+        let results = py.allow_threads(|| {
+            self.inner.query_colbert(
+                &query_tokens,
+                namespace,
+                filter_val.as_ref(),
+                top_k,
+            )
+        })?;
+
+        let json_mod = py.import("json")?;
+        let mut out = Vec::with_capacity(results.len());
+
+        for r in results {
+            let dict = PyDict::new(py);
+            dict.set_item("id", r.id)?;
+            dict.set_item("score", r.score)?;
+            dict.set_item("text", r.text)?;
+            dict.set_item("dense_score", r.dense_score)?;
+            dict.set_item("bm25_score", r.bm25_score)?;
+            dict.set_item("sparse_score", r.sparse_score)?;
+            dict.set_item("colbert_score", r.colbert_score)?;
+            dict.set_item("namespace", r.namespace)?;
+
+            let meta_json = serde_json::to_string(&r.metadata).unwrap_or_default();
+            let meta_py = json_mod.call_method1("loads", (meta_json,))?;
+            dict.set_item("metadata", meta_py)?;
+
+            out.push(dict.into());
+        }
+
+        Ok(out)
+    }
+
+    #[pyo3(signature = (num_centroids=64, max_iters=15))]
+    fn train_colbert_centroids(&mut self, num_centroids: usize, max_iters: usize) -> PyResult<()> {
+        self.inner.colbert_index.train_centroids(num_centroids, max_iters).map_err(Into::into)
     }
 
     #[pyo3(signature = (path=None))]
@@ -300,8 +416,15 @@ fn bq_quantize(v: Vec<f32>) -> (Vec<u64>, usize) {
 }
 
 #[pyfunction]
-fn bq_hamming(a: Vec<u64>, b: Vec<u64>) -> u32 {
-    BQVector::hamming_distance_words(&a, &b)
+fn bq_hamming(a: Vec<u64>, b: Vec<u64>) -> PyResult<u32> {
+    if a.len() != b.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Slice length mismatch in bq_hamming: {} vs {}",
+            a.len(),
+            b.len()
+        )));
+    }
+    Ok(BQVector::hamming_distance_words(&a, &b))
 }
 
 #[pyfunction]
@@ -345,8 +468,49 @@ fn batch_vector_distances(
     Ok(crate::distance::simd::batch_distances(&query, &vectors, m, is_normalized))
 }
 
+#[pyclass(name = "NativeConsistentHashRing")]
+pub struct PyConsistentHashRing {
+    inner: crate::cluster::ConsistentHashRing,
+}
+
+#[pymethods]
+impl PyConsistentHashRing {
+    #[new]
+    #[pyo3(signature = (vnodes_per_node=64))]
+    fn new(vnodes_per_node: usize) -> Self {
+        Self {
+            inner: crate::cluster::ConsistentHashRing::new(vnodes_per_node),
+        }
+    }
+
+    fn add_node(&mut self, node_id: &str) {
+        self.inner.add_node(node_id);
+    }
+
+    fn remove_node(&mut self, node_id: &str) -> bool {
+        self.inner.remove_node(node_id)
+    }
+
+    fn get_node(&self, key: &str) -> Option<String> {
+        self.inner.get_node(key).map(|s| s.to_string())
+    }
+
+    fn get_preference_list(&self, key: &str, count: usize) -> Vec<String> {
+        self.inner.get_preference_list(key, count).into_iter().map(|s| s.to_string()).collect()
+    }
+
+    fn node_count(&self) -> usize {
+        self.inner.node_count()
+    }
+
+    fn get_nodes(&self) -> Vec<String> {
+        self.inner.get_nodes()
+    }
+}
+
 pub fn register_module(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyNativeCollection>()?;
+    m.add_class::<PyConsistentHashRing>()?;
     m.add_function(wrap_pyfunction!(simd_dot, m)?)?;
     m.add_function(wrap_pyfunction!(simd_cosine, m)?)?;
     m.add_function(wrap_pyfunction!(simd_euclidean, m)?)?;

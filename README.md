@@ -1,10 +1,13 @@
-# सूत्र DB (SutraDB) v3.4 Hardware & NLP Scaling Edition
+# सूत्र DB (SutraDB) v5.0 Distributed Edition
 
 [![PyPI](https://img.shields.io/pypi/v/sutradb-core.svg?style=flat&color=blue&logo=pypi)](https://pypi.org/project/sutradb-core/)
-[![Rust](https://img.shields.io/badge/Engine-Rust%20SIMD%20%2B%20Rayon-orange?logo=rust)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/Engine-Rust%20SIMD%20%2B%20gRPC-orange?logo=rust)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.14-blue?logo=python)](https://python.org)
-[![Tests](https://img.shields.io/badge/Tests-97%2F97%20Passing-brightgreen)](https://github.com/Sam-CodesAI/SutraDB)
+[![Tests](https://img.shields.io/badge/Tests-182%2F182%20Passing-brightgreen)](https://github.com/Sam-CodesAI/SutraDB)
+[![Cluster](https://img.shields.io/badge/Distributed-Multi--Node%20Raft-purple)](https://github.com/Sam-CodesAI/SutraDB)
 [![SIMD](https://img.shields.io/badge/SIMD-AVX512%20%7C%20AVX2%20%7C%20NEON-blue)](https://github.com/Sam-CodesAI/SutraDB)
+[![ColBERT](https://img.shields.io/badge/Multi--Vector-ColBERT%20MaxSim-red)](https://github.com/Sam-CodesAI/SutraDB)
+[![gRPC](https://img.shields.io/badge/Protocol-Binary%20gRPC%20HTTP%2F2-purple?logo=grpc)](https://grpc.io)
 [![Quantization](https://img.shields.io/badge/RAM%20Savings-Up%20to%2064x%20(PQ)-green)](https://github.com/Sam-CodesAI/SutraDB)
 [![Web UI](https://img.shields.io/badge/Dashboard-Embedded%20%2Fui-purple)](https://github.com/Sam-CodesAI/SutraDB)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -121,7 +124,50 @@ cd SutraDB
 maturin develop --release
 ```
 
-### 2. Multi-Tenant Hybrid Search & SQ8 Quantization
+### 2. Automated Text Ingestion & Instant Search (`add_texts` & `search`)
+
+SutraDB features an end-to-end automated embedding and ingestion pipeline. Ingest raw text strings directly without manual vectorization:
+
+```python
+from sutradb import SutraDB, DefaultEmbeddingFunction, OpenAIEmbeddingFunction
+
+# Initialize SutraDB with disk persistence
+db = SutraDB(persist_directory="./sutra_data")
+
+# Create collection (defaults to zero-dependency 384-dim DefaultEmbeddingFunction)
+col = db.get_or_create_collection("support_kb")
+
+# 1. Ingest raw text strings with automatic embedding & BM25 indexing
+col.add_texts(
+    texts=[
+        "Rust delivers memory safety without garbage collection and zero-cost abstractions.",
+        "Python is the lingua franca of machine learning, PyTorch, and AI agents.",
+        "SutraDB combines SIMD hardware acceleration with multi-modal hybrid retrieval."
+    ],
+    metadatas=[
+        {"tier": "gold", "lang": "rust"},
+        {"tier": "silver", "lang": "python"},
+        {"tier": "gold", "lang": "hybrid"}
+    ],
+    namespace="tenant_enterprise"
+)
+
+# 2. Instant multi-modal search directly with query string!
+results = col.search(
+    query="vector search in rust with SIMD",
+    namespace="tenant_enterprise",
+    filter={"tier": "gold"},
+    top_k=2
+)
+
+for r in results:
+    print(f"[{r.score:.4f}] {r.text} | Metadata: {r.metadata}")
+
+# Pluggable embeddings: OpenAI, FastEmbed (ONNX local + SPLADE), HuggingFace:
+# col_openai = db.create_collection("openai_docs", embedding_function=OpenAIEmbeddingFunction())
+```
+
+### 3. Multi-Tenant Hybrid Search & SQ8 Quantization
 
 ```python
 from sutradb import SutraDB, Document
@@ -168,7 +214,7 @@ for r in results:
     print(f"[{r.score:.4f}] ({r.namespace}) {r.id}: {r.text}")
 ```
 
-### 3. Direct Native Rust Acceleration (Python)
+### 4. Direct Native Rust Acceleration (Python)
 
 ```python
 from sutradb import NativeCollection
@@ -180,7 +226,7 @@ col.build_hnsw()
 results = col.query(vector=q_vec, top_k=10, use_ann=True)
 ```
 
-### 4. Official LangChain VectorStore Integration
+### 5. Official LangChain VectorStore Integration
 
 ```python
 from sutradb import SutraDBVectorStore
@@ -201,7 +247,7 @@ diverse_results = store.max_marginal_relevance_search("P99 latency", k=4, fetch_
 retriever = store.as_retriever(k=3)
 ```
 
-### 5. Official LlamaIndex VectorStore Integration
+### 6. Official LlamaIndex VectorStore Integration
 
 ```python
 from sutradb import SutraDBLlamaIndexVectorStore
@@ -220,7 +266,7 @@ query_engine = index.as_query_engine(vector_store_query_mode="hybrid")
 response = query_engine.query("Explain memory mapping persistence")
 ```
 
-### 6. Nested JSON Metadata & Array Filtering
+### 7. Nested JSON Metadata & Array Filtering
 
 Filter nested object paths with dot-notation and advanced operators:
 
@@ -238,7 +284,7 @@ results = col.query(
 )
 ```
 
-### 7. 1-Bit Binary Quantization (32x RAM Reduction & Two-Stage Search)
+### 8. 1-Bit Binary Quantization (32x RAM Reduction & Two-Stage Search)
 
 Compress high-dimensional vectors by 32x and evaluate Hamming candidate distances via hardware `POPCNT`:
 
@@ -252,7 +298,7 @@ col.enable_bq()
 results = col.query(vector=query_vector, top_k=5)
 ```
 
-### 8. Geo-Spatial Metadata Filtering ($geo_within & $geo_box)
+### 9. Geo-Spatial Metadata Filtering ($geo_within & $geo_box)
 
 Filter vectors using great-circle Haversine distances in meters or rectangular bounding boxes:
 
@@ -286,7 +332,7 @@ bay_results = col.query(
 )
 ```
 
-### 9. Product Quantization (PQ) & Asymmetric Distance Computation (ADC)
+### 10. Product Quantization (PQ) & Asymmetric Distance Computation (ADC)
 
 Compress high-dimensional vectors by up to **64x** using sub-space decomposition and evaluate similarities in sub-milliseconds via L1-cache Look-Up Tables (LUT):
 
@@ -303,7 +349,7 @@ col.enable_pq(codebook)
 results = col.query(vector=query_vector, top_k=5)
 ```
 
-### 10. Linguistic NLP Pipeline & Hardware SIMD Dispatch
+### 11. Linguistic NLP Pipeline & Hardware SIMD Dispatch
 
 Configure advanced stemming, stopword pruning, identifier splitting, and CJK tokenization directly on collections:
 
@@ -338,6 +384,41 @@ distances = batch_vector_distances(
 )
 ```
 
+### 12. Distributed Multi-Node Cluster & Raft Consensus
+
+SutraDB v5.0 introduces native multi-shard horizontal partitioning and Raft consensus replication:
+
+```python
+from sutradb import DistributedCluster
+
+# Initialize multi-node cluster coordinator
+cluster = DistributedCluster(node_id="coordinator-0", vnodes_per_node=64)
+
+# Create collection partitioned across 3 logical shards
+col = cluster.create_collection("enterprise_wiki", dimension=384, shard_count=3)
+
+# 1. Ingest texts with automatic consistent-hash partition routing
+col.add_texts(
+    texts=[
+        "Kubernetes container orchestration and ingress controllers.",
+        "Raft consensus protocol for distributed state machines.",
+        "ColBERT multi-vector token late interaction retrieval."
+    ],
+    metadatas=[{"tier": "gold"}, {"tier": "gold"}, {"tier": "silver"}],
+    namespace="tenant_alpha"
+)
+
+# 2. Parallel scatter-gather search across all shards with global top-K RRF fusion
+results = col.search(
+    query="Raft consensus in distributed systems",
+    namespace="tenant_alpha",
+    top_k=2
+)
+
+for r in results:
+    print(f"[{r.score:.4f}] {r.text} | Metadata: {r.metadata}")
+```
+
 ---
 
 ## 🌐 Embedded Web Management Dashboard
@@ -362,6 +443,42 @@ http://localhost:8765/ui  or  http://localhost:8765/dashboard
 
 ---
 
+## ⚡ High-Throughput Binary gRPC Server (`sutradb-server`)
+
+SutraDB v4.0 introduces a native, asynchronous **binary gRPC engine** built directly in Rust using `tonic` (HTTP/2) and `prost` (Protocol Buffers). By streaming raw IEEE-754 binary floats directly across network interfaces, SutraDB eliminates the ~3–5ms JSON serialization overhead of traditional REST endpoints, driving query round-trip latency below **0.4ms**.
+
+### Running the Standalone Native Server
+
+```bash
+# Build & run high-performance release binary
+cargo run --release --bin sutradb-server -- --host 0.0.0.0 --port 50051 --data-dir ./sutra_data
+
+# Or inspect options
+sutradb-server --help
+```
+
+### Protocol Buffers Contract (`proto/sutra.proto`)
+
+```protobuf
+syntax = "proto3";
+package sutra;
+
+service SutraService {
+  rpc Query(QueryRequest) returns (QueryResponse);
+  rpc BatchQuery(BatchQueryRequest) returns (BatchQueryResponse);
+  rpc Insert(InsertRequest) returns (InsertResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc CreateCollection(CreateCollectionRequest) returns (CreateCollectionResponse);
+  rpc DropCollection(DropCollectionRequest) returns (DropCollectionResponse);
+  rpc ListCollections(ListCollectionsRequest) returns (ListCollectionsResponse);
+  rpc GetStats(CollectionStatsRequest) returns (CollectionStatsResponse);
+  rpc BatchDistances(BatchDistanceRequest) returns (BatchDistanceResponse);
+}
+```
+
+---
+
 ## 🌐 REST Microservice Endpoints
 
 - `GET /ui` & `GET /dashboard` - Embedded Web Management Dashboard
@@ -379,15 +496,82 @@ http://localhost:8765/ui  or  http://localhost:8765/dashboard
 
 ---
 
+## 🚀 Production Deployment (Docker & Kubernetes)
+
+SutraDB is packaged as a supply-chain hardened, multi-stage container image conforming strictly to production security invariants:
+- **Unprivileged Execution:** Runs strictly under non-root UID/GID `10001:10001`.
+- **Zero Attack Surface:** All compilers, Rust toolchains, and package managers are excluded from the runtime image (`python:3.12-slim`).
+- **Dual-Daemon Orchestration:** Native binary gRPC daemon on port `50051` and FastAPI REST / Bento Grid Console on port `8765`.
+- **Graceful Signal Handling:** Intercepts `SIGTERM` and `SIGINT` to safely flush Write-Ahead Logs and drain active connections without data loss.
+
+### 1. Docker Compose (Quickstart)
+
+```bash
+# Clone and launch dual daemons (gRPC :50051 & REST :8765) with persistent volume
+docker compose up -d
+
+# Verify container status and automated healthcheck
+docker compose ps
+docker compose logs -f
+```
+
+### 2. Standalone Docker Run
+
+```bash
+# Run in dual-daemon mode (default)
+docker run -d \
+  --name sutradb \
+  -p 50051:50051 \
+  -p 8765:8765 \
+  -v sutra_data:/data \
+  sutradb:latest
+
+# Run strictly as high-throughput binary gRPC engine
+docker run -d \
+  --name sutradb-grpc \
+  -p 50051:50051 \
+  -v sutra_data:/data \
+  -e SUTRA_MODE=grpc \
+  sutradb:latest
+
+# Run strictly as REST microservice + Bento Grid UI
+docker run -d \
+  --name sutradb-rest \
+  -p 8765:8765 \
+  -v sutra_data:/data \
+  -e SUTRA_MODE=rest \
+  sutradb:latest
+```
+
+### 3. Kubernetes Deployment (`k8s/`)
+
+Deploy SutraDB as a production StatefulSet with persistent volume claims, automated liveness/readiness probes, and unprivileged security context:
+
+```bash
+# Apply with Kustomize
+kubectl apply -k k8s/
+
+# Or apply individual manifests
+kubectl apply -f k8s/sutradb-namespace.yaml
+kubectl apply -f k8s/sutradb-configmap.yaml
+kubectl apply -f k8s/sutradb-service.yaml
+kubectl apply -f k8s/sutradb-statefulset.yaml
+
+# Check rollout status
+kubectl rollout status statefulset/sutradb -n sutradb
+```
+
+---
+
 ## 🧪 Test Suite
 
 Run both native Rust and Python test suites:
 
 ```bash
-# 1. Rust engine integration tests (28 tests)
+# 1. Rust engine, cluster & gRPC integration tests (65 tests)
 cargo test
 
-# 2. Python test suite (69 tests)
+# 2. Python test suite (117 tests)
 pytest -v
 ```
 

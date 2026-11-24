@@ -50,12 +50,15 @@ class BQVector:
 
     def hamming_distance(self, other: "BQVector") -> int:
         """Computes bitwise Hamming distance between two binary quantized vectors."""
+        if self.dimension != other.dimension or len(self.bits) != len(other.bits):
+            raise ValueError(
+                f"Dimension mismatch in BQVector hamming_distance: {self.dimension} vs {other.dimension}"
+            )
         if _native_bq_hamming is not None:
             return _native_bq_hamming(self.bits, other.bits)
 
         dist = 0
-        n = min(len(self.bits), len(other.bits))
-        for i in range(n):
+        for i in range(len(self.bits)):
             dist += bin(self.bits[i] ^ other.bits[i]).count("1")
         return dist
 
@@ -73,8 +76,11 @@ class SQ8Vector:
     Compresses 32-bit floats into 8-bit integers (4x RAM reduction).
     """
 
-    def __init__(self, data: np.ndarray, min_val: float, scale: float):
-        self.data = np.asarray(data, dtype=np.uint8)
+    def __init__(self, data: Union[np.ndarray, bytes], min_val: float, scale: float):
+        if isinstance(data, (bytes, bytearray)):
+            self.data = np.frombuffer(data, dtype=np.uint8)
+        else:
+            self.data = np.asarray(data, dtype=np.uint8)
         self.min_val = min_val
         self.scale = scale
 
@@ -83,7 +89,11 @@ class SQ8Vector:
         vec = np.asarray(vector, dtype=np.float32)
         if _native_sq8_quantize is not None:
             data, min_val, scale = _native_sq8_quantize(vec.tolist())
-            return cls(np.array(data, dtype=np.uint8), min_val, scale)
+            if isinstance(data, (bytes, bytearray)):
+                arr = np.frombuffer(data, dtype=np.uint8)
+            else:
+                arr = np.array(data, dtype=np.uint8)
+            return cls(arr, min_val, scale)
 
         min_val = float(np.min(vec))
         max_val = float(np.max(vec))
@@ -94,6 +104,28 @@ class SQ8Vector:
 
     def dequantize(self) -> np.ndarray:
         return self.data.astype(np.float32) * self.scale + self.min_val
+
+    def asymmetric_dot_product(self, query: np.ndarray, query_sum: Optional[float] = None) -> float:
+        """Computes asymmetric dot product against query float32 vector."""
+        if query_sum is None:
+            query_sum = float(np.sum(query))
+        return float(self.scale * np.dot(query, self.data.astype(np.float32)) + self.min_val * query_sum)
+
+    def asymmetric_euclidean_squared(self, query: np.ndarray) -> float:
+        """Computes squared Euclidean distance against query float32 vector."""
+        dequant = self.dequantize()
+        return float(np.sum((query - dequant) ** 2))
+
+    def score(self, query: np.ndarray, query_sum: Optional[float] = None, metric: str = "cosine") -> float:
+        """Computes asymmetric similarity score according to the metric."""
+        m = metric.lower() if isinstance(metric, str) else str(metric).lower()
+        if m in ("cosine", "dot_product", "dot"):
+            return self.asymmetric_dot_product(query, query_sum)
+        elif m == "euclidean":
+            dist_sq = self.asymmetric_euclidean_squared(query)
+            return 1.0 / (1.0 + np.sqrt(dist_sq))
+        else:
+            return self.asymmetric_dot_product(query, query_sum)
 
 
 class PQVector:

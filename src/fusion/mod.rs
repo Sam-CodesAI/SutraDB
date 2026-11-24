@@ -7,6 +7,8 @@ pub struct FusedCandidate {
     pub score: f32,
     pub dense_score: f32,
     pub bm25_score: f32,
+    pub sparse_score: f32,
+    pub colbert_score: f32,
 }
 
 /// Candidate-pruned Reciprocal Rank Fusion (RRF).
@@ -108,6 +110,8 @@ pub fn reciprocal_rank_fusion(
             score,
             dense_score: dense_scores[doc_idx],
             bm25_score: bm25_scores[doc_idx],
+            sparse_score: 0.0,
+            colbert_score: 0.0,
         });
     }
 
@@ -174,6 +178,8 @@ pub fn linear_score_fusion(
                 score,
                 dense_score: dense_scores[i],
                 bm25_score: bm25_scores[i],
+                sparse_score: 0.0,
+                colbert_score: 0.0,
             }
         })
         .collect();
@@ -181,4 +187,292 @@ pub fn linear_score_fusion(
     scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
     scored.truncate(top_k);
     scored
+}
+
+/// Tri-modal Reciprocal Rank Fusion (RRF) across Dense + BM25 + Neural Sparse vectors.
+pub fn tri_modal_reciprocal_rank_fusion(
+    dense_scores: &[f32],
+    bm25_scores: &[f32],
+    sparse_scores: &[f32],
+    top_k: usize,
+    k_constant: usize,
+    dense_weight: f32,
+    bm25_weight: f32,
+    sparse_weight: f32,
+    mask: Option<&[bool]>,
+) -> Vec<FusedCandidate> {
+    let n = dense_scores.len();
+    if top_k == 0 || n == 0 {
+        return Vec::new();
+    }
+
+    let valid_indices: Vec<usize> = match mask {
+        Some(m) => (0..n).filter(|&i| i < m.len() && m[i]).collect(),
+        None => (0..n).collect(),
+    };
+
+    if valid_indices.is_empty() {
+        return Vec::new();
+    }
+
+    let m_bound = (top_k * 4).min(200);
+
+    // 1. Dense ranks
+    let mut dense_pairs: Vec<(usize, f32)> = valid_indices.iter().map(|&i| (i, dense_scores[i])).collect();
+    dense_pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+    let k_dense = m_bound.min(dense_pairs.len());
+    let top_dense = &dense_pairs[..k_dense];
+
+    let mut dense_ranks: HashMap<usize, usize> = HashMap::new();
+    for (rank, &(idx, score)) in top_dense.iter().enumerate() {
+        if score > 0.0 {
+            dense_ranks.insert(idx, rank + 1);
+        }
+    }
+    if dense_ranks.is_empty() && !top_dense.is_empty() {
+        for (rank, &(idx, _)) in top_dense.iter().enumerate() {
+            dense_ranks.insert(idx, rank + 1);
+        }
+    }
+
+    // 2. BM25 ranks
+    let mut bm25_pairs: Vec<(usize, f32)> = valid_indices
+        .iter()
+        .filter(|&&i| bm25_scores[i] > 0.0)
+        .map(|&i| (i, bm25_scores[i]))
+        .collect();
+    bm25_pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+    let k_bm25 = m_bound.min(bm25_pairs.len());
+    let top_bm25 = &bm25_pairs[..k_bm25];
+
+    let mut bm25_ranks: HashMap<usize, usize> = HashMap::new();
+    for (rank, &(idx, _)) in top_bm25.iter().enumerate() {
+        bm25_ranks.insert(idx, rank + 1);
+    }
+
+    // 3. Sparse ranks
+    let mut sparse_pairs: Vec<(usize, f32)> = valid_indices
+        .iter()
+        .filter(|&&i| sparse_scores[i] > 0.0)
+        .map(|&i| (i, sparse_scores[i]))
+        .collect();
+    sparse_pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+    let k_sparse = m_bound.min(sparse_pairs.len());
+    let top_sparse = &sparse_pairs[..k_sparse];
+
+    let mut sparse_ranks: HashMap<usize, usize> = HashMap::new();
+    for (rank, &(idx, _)) in top_sparse.iter().enumerate() {
+        sparse_ranks.insert(idx, rank + 1);
+    }
+
+    // 4. Candidate union
+    let mut union_set = Vec::new();
+    for &(idx, _) in top_dense {
+        if !union_set.contains(&idx) {
+            union_set.push(idx);
+        }
+    }
+    for &(idx, _) in top_bm25 {
+        if !union_set.contains(&idx) {
+            union_set.push(idx);
+        }
+    }
+    for &(idx, _) in top_sparse {
+        if !union_set.contains(&idx) {
+            union_set.push(idx);
+        }
+    }
+
+    // 5. Compute Tri-Modal RRF
+    let mut candidates = Vec::with_capacity(union_set.len());
+    let k_const = k_constant as f32;
+
+    for &doc_idx in &union_set {
+        let mut score = 0.0f32;
+        if let Some(&r) = dense_ranks.get(&doc_idx) {
+            score += dense_weight / (k_const + r as f32);
+        }
+        if let Some(&r) = bm25_ranks.get(&doc_idx) {
+            score += bm25_weight / (k_const + r as f32);
+        }
+        if let Some(&r) = sparse_ranks.get(&doc_idx) {
+            score += sparse_weight / (k_const + r as f32);
+        }
+
+        candidates.push(FusedCandidate {
+            doc_idx,
+            score,
+            dense_score: dense_scores[doc_idx],
+            bm25_score: bm25_scores[doc_idx],
+            sparse_score: sparse_scores[doc_idx],
+            colbert_score: 0.0,
+        });
+    }
+
+    candidates.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| b.dense_score.partial_cmp(&a.dense_score).unwrap_or(Ordering::Equal))
+    });
+
+    candidates.truncate(top_k);
+    candidates
+}
+
+/// Quad-modal Reciprocal Rank Fusion (RRF) across Dense + BM25 + Neural Sparse + ColBERT MaxSim.
+pub fn quad_modal_reciprocal_rank_fusion(
+    dense_scores: &[f32],
+    bm25_scores: &[f32],
+    sparse_scores: &[f32],
+    colbert_scores: &[f32],
+    top_k: usize,
+    k_constant: usize,
+    dense_weight: f32,
+    bm25_weight: f32,
+    sparse_weight: f32,
+    colbert_weight: f32,
+    mask: Option<&[bool]>,
+) -> Vec<FusedCandidate> {
+    let n = dense_scores.len();
+    if top_k == 0 || n == 0 {
+        return Vec::new();
+    }
+
+    let valid_indices: Vec<usize> = match mask {
+        Some(m) => (0..n).filter(|&i| i < m.len() && m[i]).collect(),
+        None => (0..n).collect(),
+    };
+
+    if valid_indices.is_empty() {
+        return Vec::new();
+    }
+
+    let m_bound = (top_k * 4).min(200);
+
+    // 1. Dense ranks
+    let mut dense_pairs: Vec<(usize, f32)> = valid_indices.iter().map(|&i| (i, dense_scores[i])).collect();
+    dense_pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+    let k_dense = m_bound.min(dense_pairs.len());
+    let top_dense = &dense_pairs[..k_dense];
+
+    let mut dense_ranks: HashMap<usize, usize> = HashMap::new();
+    for (rank, &(idx, score)) in top_dense.iter().enumerate() {
+        if score > 0.0 {
+            dense_ranks.insert(idx, rank + 1);
+        }
+    }
+    if dense_ranks.is_empty() && !top_dense.is_empty() {
+        for (rank, &(idx, _)) in top_dense.iter().enumerate() {
+            dense_ranks.insert(idx, rank + 1);
+        }
+    }
+
+    // 2. BM25 ranks
+    let mut bm25_pairs: Vec<(usize, f32)> = valid_indices
+        .iter()
+        .filter(|&&i| bm25_scores[i] > 0.0)
+        .map(|&i| (i, bm25_scores[i]))
+        .collect();
+    bm25_pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+    let k_bm25 = m_bound.min(bm25_pairs.len());
+    let top_bm25 = &bm25_pairs[..k_bm25];
+
+    let mut bm25_ranks: HashMap<usize, usize> = HashMap::new();
+    for (rank, &(idx, _)) in top_bm25.iter().enumerate() {
+        bm25_ranks.insert(idx, rank + 1);
+    }
+
+    // 3. Sparse ranks
+    let mut sparse_pairs: Vec<(usize, f32)> = valid_indices
+        .iter()
+        .filter(|&&i| sparse_scores[i] > 0.0)
+        .map(|&i| (i, sparse_scores[i]))
+        .collect();
+    sparse_pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+    let k_sparse = m_bound.min(sparse_pairs.len());
+    let top_sparse = &sparse_pairs[..k_sparse];
+
+    let mut sparse_ranks: HashMap<usize, usize> = HashMap::new();
+    for (rank, &(idx, _)) in top_sparse.iter().enumerate() {
+        sparse_ranks.insert(idx, rank + 1);
+    }
+
+    // 4. ColBERT MaxSim ranks
+    let mut colbert_pairs: Vec<(usize, f32)> = valid_indices
+        .iter()
+        .filter(|&&i| colbert_scores[i] > 0.0)
+        .map(|&i| (i, colbert_scores[i]))
+        .collect();
+    colbert_pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+    let k_colbert = m_bound.min(colbert_pairs.len());
+    let top_colbert = &colbert_pairs[..k_colbert];
+
+    let mut colbert_ranks: HashMap<usize, usize> = HashMap::new();
+    for (rank, &(idx, _)) in top_colbert.iter().enumerate() {
+        colbert_ranks.insert(idx, rank + 1);
+    }
+
+    // 5. Candidate union
+    let mut union_set = Vec::new();
+    for &(idx, _) in top_dense {
+        if !union_set.contains(&idx) {
+            union_set.push(idx);
+        }
+    }
+    for &(idx, _) in top_bm25 {
+        if !union_set.contains(&idx) {
+            union_set.push(idx);
+        }
+    }
+    for &(idx, _) in top_sparse {
+        if !union_set.contains(&idx) {
+            union_set.push(idx);
+        }
+    }
+    for &(idx, _) in top_colbert {
+        if !union_set.contains(&idx) {
+            union_set.push(idx);
+        }
+    }
+
+    // 6. Compute Quad-Modal RRF
+    let mut candidates = Vec::with_capacity(union_set.len());
+    let k_const = k_constant as f32;
+
+    for &doc_idx in &union_set {
+        let mut score = 0.0f32;
+        if let Some(&r) = dense_ranks.get(&doc_idx) {
+            score += dense_weight / (k_const + r as f32);
+        }
+        if let Some(&r) = bm25_ranks.get(&doc_idx) {
+            score += bm25_weight / (k_const + r as f32);
+        }
+        if let Some(&r) = sparse_ranks.get(&doc_idx) {
+            score += sparse_weight / (k_const + r as f32);
+        }
+        if let Some(&r) = colbert_ranks.get(&doc_idx) {
+            score += colbert_weight / (k_const + r as f32);
+        }
+
+        candidates.push(FusedCandidate {
+            doc_idx,
+            score,
+            dense_score: dense_scores[doc_idx],
+            bm25_score: bm25_scores[doc_idx],
+            sparse_score: sparse_scores[doc_idx],
+            colbert_score: colbert_scores[doc_idx],
+        });
+    }
+
+    candidates.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| b.colbert_score.partial_cmp(&a.colbert_score).unwrap_or(Ordering::Equal))
+            .then_with(|| b.dense_score.partial_cmp(&a.dense_score).unwrap_or(Ordering::Equal))
+    });
+
+    candidates.truncate(top_k);
+    candidates
 }
