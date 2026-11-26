@@ -3,6 +3,7 @@ pub mod proto {
     include!("sutra_gen.rs");
 }
 
+pub mod http_bridge;
 pub mod service;
 
 pub use proto::sutra_service_server::{SutraService, SutraServiceServer};

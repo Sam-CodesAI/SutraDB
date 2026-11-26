@@ -1,6 +1,6 @@
-/// High-performance linguistic stemmer implementing the Porter algorithm for English,
-/// with supplementary phonetic/inflection rules for Spanish, French, and German.
-/// Zero external C/Python dependencies, zero allocations for unstemmed tokens.
+//! High-performance linguistic stemmer implementing the Porter algorithm for English,
+//! with supplementary phonetic/inflection rules for Spanish, French, and German.
+//! Zero external C/Python dependencies, zero allocations for unstemmed tokens.
 
 /// Stems a single lowercase token based on the specified language.
 pub fn stem(word: &str, lang: &str) -> String {

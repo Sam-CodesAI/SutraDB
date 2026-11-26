@@ -23,7 +23,7 @@ if [ "$#" -gt 0 ]; then
 fi
 
 echo "=========================================================="
-echo "  SutraDB v5.0 Production Daemon Manager"
+echo "  SutraDB v5.1.0 Production Daemon Manager"
 echo "  Mode       : ${SUTRA_MODE}"
 echo "  Storage    : ${SUTRA_DATA_DIR}"
 echo "  UID / GID  : $(id -u):$(id -g)"
@@ -40,13 +40,16 @@ if [ "$SUTRA_MODE" = "rest" ]; then
 fi
 
 if [ "$SUTRA_MODE" = "all" ]; then
-    echo "[SutraDB] Launching Dual Daemons: gRPC (${SUTRA_GRPC_PORT}) & REST (${SUTRA_REST_PORT})..."
+    echo "[SutraDB] Launching Unified Mode: gRPC (${SUTRA_GRPC_PORT}) + HTTP Bridge (${SUTRA_REST_PORT})..."
+    echo "[SutraDB] Single-owner /data: gRPC server owns storage; REST proxies via HTTP bridge."
     
-    sutradb-server --host "$SUTRA_HOST" --port "$SUTRA_GRPC_PORT" --data-dir "$SUTRA_DATA_DIR" &
+    # Launch gRPC as sole owner of /data, with an HTTP bridge on the REST port
+    sutradb-server --host "$SUTRA_HOST" --port "$SUTRA_GRPC_PORT" --data-dir "$SUTRA_DATA_DIR" \
+        --http-bridge-addr "${SUTRA_HOST}:${SUTRA_REST_PORT}" &
     GRPC_PID=$!
     
-    python3 -m sutradb.server "$SUTRA_REST_PORT" "$SUTRA_DATA_DIR" &
-    REST_PID=$!
+    # No separate Python REST process — the Rust HTTP bridge serves REST+JSON
+    REST_PID=$GRPC_PID
     
     cleanup() {
         echo ""

@@ -217,9 +217,16 @@ impl RaftNode {
         }
 
         // 2. Update term and recognize leader
-        if args.term > self.current_term || self.role == RaftRole::Candidate {
+        if args.term > self.current_term {
+            // Higher term: step down and reset vote
             self.become_follower(args.term, Some(args.leader_id.clone()));
+        } else if self.role == RaftRole::Candidate {
+            // Same-term AppendEntries from a leader means someone else won;
+            // step down but preserve voted_for (Raft spec §5.2)
+            self.role = RaftRole::Follower;
+            self.leader_id = Some(args.leader_id.clone());
         } else {
+            // Same term, already follower: just update leader_id
             self.leader_id = Some(args.leader_id.clone());
         }
 
@@ -311,6 +318,12 @@ impl RaftNode {
             }));
         }
 
+        // Single-node cluster: no peers to replicate to, so auto-commit immediately
+        if self.peers.is_empty() {
+            self.commit_index = new_index;
+            self.apply_committed();
+        }
+
         Ok((new_index, peer_msgs))
     }
 
@@ -380,12 +393,16 @@ impl RaftNode {
             }
             ClusterCommand::Insert { collection, documents, vectors } => {
                 if let Some(col) = self.collections.get_mut(collection) {
-                    let _ = col.insert(documents.clone(), vectors.clone());
+                    if let Err(e) = col.insert(documents.clone(), vectors.clone()) {
+                        eprintln!("[Raft] Error applying insert to '{}': {}", collection, e);
+                    }
                 }
             }
             ClusterCommand::Delete { collection, ids } => {
                 if let Some(col) = self.collections.get_mut(collection) {
-                    let _ = col.delete(ids);
+                    if let Err(e) = col.delete(ids) {
+                        eprintln!("[Raft] Error applying delete to '{}': {}", collection, e);
+                    }
                 }
             }
             ClusterCommand::Noop => {}

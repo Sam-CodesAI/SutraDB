@@ -1,8 +1,60 @@
 use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock};
+use regex::{Regex, RegexBuilder};
 use serde_json::Value;
+
+static REGEX_CACHE: OnceLock<RwLock<HashMap<String, Option<Regex>>>> = OnceLock::new();
+
+fn get_cached_regex(pattern: &str) -> Option<Regex> {
+    let lock = REGEX_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Ok(cache) = lock.read() {
+        if let Some(entry) = cache.get(pattern) {
+            return entry.clone();
+        }
+    }
+    let compiled = RegexBuilder::new(pattern)
+        .size_limit(1 << 20)
+        .dfa_size_limit(1 << 20)
+        .build()
+        .ok();
+    if let Ok(mut cache) = lock.write() {
+        if cache.len() >= 1024 {
+            cache.clear();
+        }
+        cache.insert(pattern.to_string(), compiled.clone());
+    }
+    compiled
+}
 
 pub mod index;
 pub use index::SecondaryMetadataIndex;
+
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Null, Value::Null) => true,
+        (Value::Bool(ba), Value::Bool(bb)) => ba == bb,
+        (Value::String(sa), Value::String(sb)) => sa == sb,
+        (Value::Number(na), Value::Number(nb)) => {
+            if na == nb {
+                return true;
+            }
+            match (na.as_f64(), nb.as_f64()) {
+                (Some(fa), Some(fb)) => fa == fb,
+                _ => false,
+            }
+        }
+        (Value::Array(aa), Value::Array(ab)) => {
+            aa.len() == ab.len() && aa.iter().zip(ab.iter()).all(|(x, y)| values_equal(x, y))
+        }
+        (Value::Object(oa), Value::Object(ob)) => {
+            oa.len() == ob.len()
+                && oa
+                    .iter()
+                    .all(|(k, va)| ob.get(k).is_some_and(|vb| values_equal(va, vb)))
+        }
+        _ => false,
+    }
+}
 
 /// Evaluates JSON condition AST against metadata values.
 pub struct FilterEngine;
@@ -14,10 +66,7 @@ impl FilterEngine {
                 // If map has no $-prefixed operator keys, treat as direct literal object comparison
                 let has_op = map.keys().any(|k| k.starts_with('$'));
                 if !has_op {
-                    return match field_value {
-                        Some(v) => v == condition,
-                        None => false,
-                    };
+                    return field_value.is_some_and(|v| values_equal(v, condition));
                 }
 
                 for (op, target) in map {
@@ -29,7 +78,15 @@ impl FilterEngine {
                                         return false;
                                     }
                                 }
-                            } else if field_value != Some(target) {
+                            } else if let Some(Value::Array(arr)) = field_value {
+                                if target.is_array() {
+                                    if !values_equal(field_value.unwrap(), target) {
+                                        return false;
+                                    }
+                                } else if !arr.iter().any(|item| values_equal(item, target)) {
+                                    return false;
+                                }
+                            } else if !field_value.is_some_and(|v| values_equal(v, target)) {
                                 return false;
                             }
                         }
@@ -40,34 +97,51 @@ impl FilterEngine {
                                     Some(v) if v.is_null() => return false,
                                     _ => {}
                                 }
-                            } else if field_value == Some(target) {
+                            } else if let Some(Value::Array(arr)) = field_value {
+                                if target.is_array() {
+                                    if values_equal(field_value.unwrap(), target) {
+                                        return false;
+                                    }
+                                } else if arr.iter().any(|item| values_equal(item, target)) {
+                                    return false;
+                                }
+                            } else if field_value.is_some_and(|v| values_equal(v, target)) {
                                 return false;
                             }
                         }
                         "$gt" => {
-                            if !compare_values(field_value, target, |a, b| a > b) {
+                            if !compare_values(field_value, target, &|a, b| a > b) {
                                 return false;
                             }
                         }
                         "$gte" => {
-                            if !compare_values(field_value, target, |a, b| a >= b) {
+                            if !compare_values(field_value, target, &|a, b| a >= b) {
                                 return false;
                             }
                         }
                         "$lt" => {
-                            if !compare_values(field_value, target, |a, b| a < b) {
+                            if !compare_values(field_value, target, &|a, b| a < b) {
                                 return false;
                             }
                         }
                         "$lte" => {
-                            if !compare_values(field_value, target, |a, b| a <= b) {
+                            if !compare_values(field_value, target, &|a, b| a <= b) {
                                 return false;
                             }
                         }
                         "$in" => {
                             if let Value::Array(arr) = target {
                                 if let Some(val) = field_value {
-                                    if !arr.contains(val) {
+                                    let matched = match val {
+                                        Value::Array(field_arr) => {
+                                            arr.iter().any(|t| values_equal(val, t))
+                                                || field_arr
+                                                    .iter()
+                                                    .any(|item| arr.iter().any(|t| values_equal(item, t)))
+                                        }
+                                        _ => arr.iter().any(|t| values_equal(val, t)),
+                                    };
+                                    if !matched {
                                         return false;
                                     }
                                 } else {
@@ -80,7 +154,16 @@ impl FilterEngine {
                         "$nin" => {
                             if let Value::Array(arr) = target {
                                 if let Some(val) = field_value {
-                                    if arr.contains(val) {
+                                    let matched = match val {
+                                        Value::Array(field_arr) => {
+                                            arr.iter().any(|t| values_equal(val, t))
+                                                || field_arr
+                                                    .iter()
+                                                    .any(|item| arr.iter().any(|t| values_equal(item, t)))
+                                        }
+                                        _ => arr.iter().any(|t| values_equal(val, t)),
+                                    };
+                                    if matched {
                                         return false;
                                     }
                                 }
@@ -88,7 +171,7 @@ impl FilterEngine {
                         }
                         "$contains" => match field_value {
                             Some(Value::Array(arr)) => {
-                                if !arr.contains(target) {
+                                if !arr.iter().any(|item| values_equal(item, target)) {
                                     return false;
                                 }
                             }
@@ -105,7 +188,10 @@ impl FilterEngine {
                         },
                         "$all" => match (field_value, target) {
                             (Some(Value::Array(field_arr)), Value::Array(target_arr)) => {
-                                if !target_arr.iter().all(|t| field_arr.contains(t)) {
+                                if !target_arr
+                                    .iter()
+                                    .all(|t| field_arr.iter().any(|f| values_equal(f, t)))
+                                {
                                     return false;
                                 }
                             }
@@ -133,9 +219,29 @@ impl FilterEngine {
                             _ => return false,
                         },
                         "$exists" => {
-                            let exists = field_value.is_some() && !field_value.unwrap().is_null();
+                            let exists = field_value.is_some_and(|v| !v.is_null());
                             let expected = target.as_bool().unwrap_or(false);
                             if exists != expected {
+                                return false;
+                            }
+                        }
+                        "$regex" => {
+                            let pattern = match target.as_str() {
+                                Some(p) => p,
+                                None => return false,
+                            };
+                            let re = match get_cached_regex(pattern) {
+                                Some(r) => r,
+                                None => return false,
+                            };
+                            let matched = match field_value {
+                                Some(Value::String(s)) => re.is_match(s),
+                                Some(Value::Array(arr)) => arr
+                                    .iter()
+                                    .any(|item| matches!(item, Value::String(s) if re.is_match(s))),
+                                _ => false,
+                            };
+                            if !matched {
                                 return false;
                             }
                         }
@@ -225,7 +331,12 @@ impl FilterEngine {
                 None => true,
                 Some(v) => v.is_null(),
             },
-            _ => field_value == Some(condition),
+            Value::Array(_) => field_value.is_some_and(|v| values_equal(v, condition)),
+            _ => match field_value {
+                Some(Value::Array(arr)) => arr.iter().any(|item| values_equal(item, condition)),
+                Some(v) => values_equal(v, condition),
+                None => false,
+            },
         }
     }
 
@@ -337,7 +448,7 @@ pub fn has_complex_operators(filter: &Value) -> bool {
     }
 }
 
-fn compare_values<F>(a: Option<&Value>, b: &Value, op: F) -> bool
+fn compare_values<F>(a: Option<&Value>, b: &Value, op: &F) -> bool
 where
     F: Fn(f64, f64) -> bool,
 {
@@ -349,6 +460,9 @@ where
                 false
             }
         }
+        (Some(Value::Array(arr)), Value::Number(_)) => {
+            arr.iter().any(|item| compare_values(Some(item), b, op))
+        }
         _ => false,
     }
 }
@@ -358,6 +472,8 @@ where
 pub struct SecondaryIndex {
     // (field_name, string_value) -> doc_indices
     pub index: HashMap<String, HashMap<String, Vec<u32>>>,
+    // Reverse map doc_id -> indexed (field_name, string_value) pairs for O(k) removal
+    doc_keys: HashMap<u32, Vec<(String, String)>>,
 }
 
 impl SecondaryIndex {
@@ -367,6 +483,7 @@ impl SecondaryIndex {
 
     pub fn index_document(&mut self, doc_id: u32, metadata: &Value) {
         if let Some(map) = metadata.as_object() {
+            let keys_entry = self.doc_keys.entry(doc_id).or_default();
             for (key, val) in map {
                 let str_repr = match val {
                     Value::String(s) => s.clone(),
@@ -377,9 +494,10 @@ impl SecondaryIndex {
                 self.index
                     .entry(key.clone())
                     .or_default()
-                    .entry(str_repr)
+                    .entry(str_repr.clone())
                     .or_default()
                     .push(doc_id);
+                keys_entry.push((key.clone(), str_repr));
             }
         }
     }
@@ -389,15 +507,30 @@ impl SecondaryIndex {
     }
 
     pub fn remove_document(&mut self, doc_id: u32) {
-        for map in self.index.values_mut() {
-            for doc_list in map.values_mut() {
-                doc_list.retain(|&x| x != doc_id);
+        if let Some(keys) = self.doc_keys.remove(&doc_id) {
+            for (field, val) in keys {
+                let mut remove_field = false;
+                if let Some(map) = self.index.get_mut(&field) {
+                    let mut remove_val = false;
+                    if let Some(doc_list) = map.get_mut(&val) {
+                        doc_list.retain(|&x| x != doc_id);
+                        remove_val = doc_list.is_empty();
+                    }
+                    if remove_val {
+                        map.remove(&val);
+                    }
+                    remove_field = map.is_empty();
+                }
+                if remove_field {
+                    self.index.remove(&field);
+                }
             }
         }
     }
 
     pub fn clear(&mut self) {
         self.index.clear();
+        self.doc_keys.clear();
     }
 }
 

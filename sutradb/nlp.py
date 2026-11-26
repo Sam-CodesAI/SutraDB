@@ -217,6 +217,66 @@ class PorterStemmer:
 
         return word
 
+
+def stem_spanish(word: str) -> str:
+    """Suffix-stripping stemmer for Spanish matching Rust src/bm25/stemmer.rs."""
+    suffixes = (
+        "amientos", "imientos", "amiento", "imiento", "izaciones", "ización", "izacion",
+        "aciones", "ación", "acion", "amente", "mente", "adoras", "adores", "adora", "ador",
+        "idades", "idad", "ancias", "ancia", "encias", "encia",
+        "iendo", "ando", "ieron", "aron", "aste", "iste", "emos", "imos",
+        "ada", "ado", "ida", "ido", "ar", "er", "ir", "as", "es", "os",
+    )
+    for suffix in suffixes:
+        if word.endswith(suffix) and len(word) > len(suffix) + 3:
+            return word[:-len(suffix)]
+    return word
+
+
+def stem_french(word: str) -> str:
+    """Suffix-stripping stemmer for French matching Rust src/bm25/stemmer.rs."""
+    suffixes = (
+        "issements", "issement", "isations", "isation", "atrices", "ateurs", "atrice", "ateur",
+        "ations", "ation", "ements", "ement", "ismes", "isme", "istes", "iste",
+        "antes", "ante", "ants", "ant", "euses", "euse", "able", "ible",
+        "îtes", "âtes", "rent", "ions", "erie", "era", "ez", "ent", "ais", "ait",
+        "er", "ir", "ée", "és", "ées", "é",
+    )
+    for suffix in suffixes:
+        if word.endswith(suffix) and len(word) > len(suffix) + 3:
+            return word[:-len(suffix)]
+    return word
+
+
+def stem_german(word: str) -> str:
+    """Suffix-stripping stemmer for German matching Rust src/bm25/stemmer.rs."""
+    suffixes = (
+        "schaften", "schaft", "heiten", "heit", "keiten", "keit",
+        "ungen", "ung", "ieren", "ierend", "ierte", "iert",
+        "innen", "isch", "lich", "ende", "end", "ern", "est", "en", "er", "es", "em",
+    )
+    for suffix in suffixes:
+        if word.endswith(suffix) and len(word) > len(suffix) + 3:
+            return word[:-len(suffix)]
+    return word
+
+
+def stem_word(word: str, language: str = "english") -> str:
+    """Dispatches stemming by language matching Rust src/bm25/stemmer.rs."""
+    w = word.lower()
+    if len(w) <= 2:
+        return w
+    lang = language.lower()
+    if lang in ("english", "en", "porter"):
+        return PorterStemmer.stem(w)
+    if lang in ("spanish", "es"):
+        return stem_spanish(w)
+    if lang in ("french", "fr"):
+        return stem_french(w)
+    if lang in ("german", "de"):
+        return stem_german(w)
+    return PorterStemmer.stem(w)
+
 # ---------------------------------------------------------------------------
 # Identifier Splitting & CJK Helpers
 # ---------------------------------------------------------------------------
@@ -308,7 +368,7 @@ class Analyzer:
                 if self.config.split_identifiers and ("_" in token or "-" in token or any(c.isupper() for c in token)):
                     raw_tokens.extend(split_identifier(token))
                 else:
-                    raw_tokens.push(token) if hasattr(raw_tokens, 'push') else raw_tokens.append(token)
+                    raw_tokens.append(token)
                 continue
 
             i += 1
@@ -323,8 +383,8 @@ class Analyzer:
             if self.config.stopwords and tok in self._stopwords:
                 continue
 
-            if self.config.stemmer and self.config.language.lower() in ("english", "en", "porter"):
-                tok = PorterStemmer.stem(tok)
+            if self.config.stemmer:
+                tok = stem_word(tok, self.config.language)
 
             output.append(tok)
 

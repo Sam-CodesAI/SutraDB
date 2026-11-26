@@ -229,12 +229,63 @@ def test_rust_sq8_snapshot_save_reload_and_python_read(tmp_path):
     assert stats["metric"] == "cosine", "Metric must be cosine, not corrupted by SQ8 quant_mode"
     assert stats["quantized_sq8"] is True, "SQ8 mode must remain enabled after reload"
 
-    # Verify read in Python BinaryStorage
+    # Verify read in Python BinaryStorage (Rust normalizes Cosine vectors before SQ8 quantization)
     py_vecs, py_docs, py_metric = BinaryStorage.read(snapshot_path)
     assert py_metric == "cosine"
     assert len(py_docs) == 2
     assert py_docs[0]["id"] == "sq8_1"
-    assert np.allclose(py_vecs[0], np.array(vectors[0], dtype=np.float32), atol=0.05)
+    expected_v0 = np.array(vectors[0], dtype=np.float32)
+    expected_v0 = expected_v0 / np.linalg.norm(expected_v0)
+    assert np.allclose(py_vecs[0], expected_v0, atol=0.05)
+
+
+def test_sq8_negative_coordinate_roundtrip_cross_engine(tmp_path):
+    """
+    Verifies that negative-coordinate vectors survive SQ8 V4 save/load roundtrips
+    across both Rust NativeCollection and Python Collection / BinaryStorage.
+    """
+    neg_vec = [-0.70710677, 0.0, 0.70710677, 0.0]
+
+    # 1. Rust -> Disk (V4 SQ8) -> Rust & Python
+    rust_path = str(tmp_path / "rust_neg_sq8.sutra")
+    rust_col = NativeCollection("neg_rust", 4, "cosine", rust_path, False)
+    rust_col.insert([{"id": "neg_1", "text": "negative coords"}], [neg_vec])
+    rust_col.enable_sq8()
+    rust_col.save()
+
+    reloaded_rust = NativeCollection("neg_rust", 4, "cosine", rust_path, False)
+    reloaded_rust.load(rust_path)
+    rust_res = reloaded_rust.query(vector=neg_vec, top_k=1)
+    assert len(rust_res) == 1
+    assert rust_res[0]["score"] > 0.99
+
+    py_vecs, _, _ = BinaryStorage.read(rust_path)
+    assert np.allclose(py_vecs[0], np.array(neg_vec, dtype=np.float32), atol=0.02)
+
+    py_from_rust = Collection(name="neg_rust_py", dimension=4, metric="cosine")
+    py_from_rust.load(rust_path)
+    assert py_from_rust.stats()["quantized_sq8"] is True
+    py_res = py_from_rust.query(vector=neg_vec, top_k=1)
+    assert len(py_res) == 1
+    assert py_res[0].score > 0.99
+
+    # 2. Python -> Disk (V4 SQ8) -> Python & Rust
+    py_path = str(tmp_path / "py_neg_sq8.sutra")
+    py_col = Collection(name="neg_py", dimension=4, metric="cosine", storage_path=py_path)
+    py_col.insert([Document(id="neg_1", vector=neg_vec, text="negative coords")])
+    py_col.enable_sq8()
+    py_col.save()
+
+    py_reloaded = Collection(name="neg_py", dimension=4, metric="cosine", storage_path=py_path)
+    py_reloaded.load()
+    assert py_reloaded.stats()["quantized_sq8"] is True
+    assert np.allclose(py_reloaded.vectors[0], np.array(neg_vec, dtype=np.float32), atol=0.02)
+    assert py_reloaded.query(vector=neg_vec, top_k=1)[0].score > 0.99
+
+    rust_from_py = NativeCollection("neg_py_rust", 4, "cosine", py_path, False)
+    rust_from_py.load(py_path)
+    assert rust_from_py.stats()["quantized_sq8"] is True
+    assert rust_from_py.query(vector=neg_vec, top_k=1)[0]["score"] > 0.99
 
 
 def test_python_filter_engine_type_safety():

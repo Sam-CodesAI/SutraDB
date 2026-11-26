@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use crate::error::SutraError;
 
 /// Sparse vector with non-zero dimension indices and corresponding continuous float values.
 /// Used for neural sparse representations like SPLADE, BGE-M3, and BM42.
@@ -11,10 +12,15 @@ pub struct SparseVector {
 }
 
 impl SparseVector {
-    pub fn new(indices: Vec<u32>, values: Vec<f32>) -> Self {
-        assert_eq!(indices.len(), values.len(), "Indices and values must have equal length");
+    pub fn try_new(indices: Vec<u32>, values: Vec<f32>) -> Result<Self, SutraError> {
+        if indices.len() != values.len() {
+            return Err(SutraError::DimensionMismatch {
+                expected: indices.len(),
+                got: values.len(),
+            });
+        }
         // Ensure indices are sorted for fast two-pointer dot products
-        let mut pairs: Vec<(u32, f32)> = indices.into_iter().zip(values.into_iter()).collect();
+        let mut pairs: Vec<(u32, f32)> = indices.into_iter().zip(values).collect();
         pairs.sort_by_key(|p| p.0);
 
         let mut sorted_indices = Vec::with_capacity(pairs.len());
@@ -24,10 +30,14 @@ impl SparseVector {
             sorted_values.push(val);
         }
 
-        Self {
+        Ok(Self {
             indices: sorted_indices,
             values: sorted_values,
-        }
+        })
+    }
+
+    pub fn new(indices: Vec<u32>, values: Vec<f32>) -> Self {
+        Self::try_new(indices, values).expect("Indices and values must have equal length")
     }
 
     pub fn from_pairs(pairs: &[(u32, f32)]) -> Self {
@@ -91,6 +101,8 @@ impl PostingList {
 pub struct SparseIndex {
     /// Dimension index -> Posting list
     pub postings: HashMap<u32, PostingList>,
+    /// Reverse map doc_id -> active sparse dimensions for O(k) removal
+    pub doc_dims: HashMap<u32, Vec<u32>>,
     pub total_docs: usize,
 }
 
@@ -105,22 +117,36 @@ impl SparseIndex {
             self.total_docs = (doc_id as usize) + 1;
         }
 
+        let dims_entry = self.doc_dims.entry(doc_id).or_default();
         for (&dim, &val) in vec.indices.iter().zip(vec.values.iter()) {
             if val.abs() > 1e-6 {
                 let list = self.postings.entry(dim).or_default();
                 list.add(doc_id, val);
+                dims_entry.push(dim);
             }
         }
     }
 
-    /// Removes a document ID from postings (tombstone removal / compaction).
+    /// Removes a document ID from postings in O(k) time (tombstone removal / compaction).
     pub fn remove_document(&mut self, doc_id: u32) {
-        for list in self.postings.values_mut() {
-            if let Some(pos) = list.doc_ids.iter().position(|&id| id == doc_id) {
-                list.doc_ids.swap_remove(pos);
-                list.weights.swap_remove(pos);
-                // Recalculate max_weight if needed
-                list.max_weight = list.weights.iter().cloned().fold(0.0f32, f32::max);
+        if let Some(dims) = self.doc_dims.remove(&doc_id) {
+            for dim in dims {
+                let mut remove_list = false;
+                if let Some(list) = self.postings.get_mut(&dim) {
+                    while let Some(pos) = list.doc_ids.iter().position(|&id| id == doc_id) {
+                        list.doc_ids.swap_remove(pos);
+                        let removed_w = list.weights.swap_remove(pos);
+                        if list.weights.is_empty() {
+                            list.max_weight = 0.0;
+                            remove_list = true;
+                        } else if removed_w >= list.max_weight - f32::EPSILON {
+                            list.max_weight = list.weights.iter().copied().fold(0.0f32, f32::max);
+                        }
+                    }
+                }
+                if remove_list {
+                    self.postings.remove(&dim);
+                }
             }
         }
     }

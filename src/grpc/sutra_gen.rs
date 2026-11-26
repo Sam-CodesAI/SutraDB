@@ -204,6 +204,36 @@ pub struct CollectionStatsResponse {
     pub wal_records: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SaveRequest {
+    #[prost(string, tag = "1")]
+    pub collection_name: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SaveResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub path: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "4")]
+    pub bytes_written: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CompactRequest {
+    #[prost(string, tag = "1")]
+    pub collection_name: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CompactResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(uint64, tag = "2")]
+    pub count: u64,
+    #[prost(string, tag = "3")]
+    pub message: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BatchDistanceRequest {
     #[prost(float, repeated, tag = "1")]
     pub query_vector: ::prost::alloc::vec::Vec<f32>,
@@ -534,6 +564,48 @@ pub mod sutra_service_client {
                 .insert(GrpcMethod::new("sutra.SutraService", "BatchDistances"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn save(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SaveRequest>,
+        ) -> std::result::Result<tonic::Response<super::SaveResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/sutra.SutraService/Save");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("sutra.SutraService", "Save"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn compact(
+            &mut self,
+            request: impl tonic::IntoRequest<super::CompactRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::CompactResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sutra.SutraService/Compact",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("sutra.SutraService", "Compact"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -607,6 +679,14 @@ pub mod sutra_service_server {
             tonic::Response<super::BatchDistanceResponse>,
             tonic::Status,
         >;
+        async fn save(
+            &self,
+            request: tonic::Request<super::SaveRequest>,
+        ) -> std::result::Result<tonic::Response<super::SaveResponse>, tonic::Status>;
+        async fn compact(
+            &self,
+            request: tonic::Request<super::CompactRequest>,
+        ) -> std::result::Result<tonic::Response<super::CompactResponse>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct SutraServiceServer<T> {
@@ -1119,6 +1199,94 @@ pub mod sutra_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = BatchDistancesSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sutra.SutraService/Save" => {
+                    #[allow(non_camel_case_types)]
+                    struct SaveSvc<T: SutraService>(pub Arc<T>);
+                    impl<T: SutraService> tonic::server::UnaryService<super::SaveRequest>
+                    for SaveSvc<T> {
+                        type Response = super::SaveResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::SaveRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SutraService>::save(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SaveSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sutra.SutraService/Compact" => {
+                    #[allow(non_camel_case_types)]
+                    struct CompactSvc<T: SutraService>(pub Arc<T>);
+                    impl<
+                        T: SutraService,
+                    > tonic::server::UnaryService<super::CompactRequest>
+                    for CompactSvc<T> {
+                        type Response = super::CompactResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::CompactRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SutraService>::compact(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CompactSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

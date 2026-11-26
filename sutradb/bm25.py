@@ -33,43 +33,115 @@ class BM25Index:
         self.analyzer = analyzer or Analyzer()
         self.doc_count: int = 0
         self.doc_lengths: List[int] = []
+        self.doc_active: List[bool] = []
+        self.total_length: int = 0
         self.avg_doc_length: float = 0.0
         
         # Inverted index: term -> list of (doc_index, term_frequency)
         self.inverted_index: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
-        # Document frequencies: term -> number of docs containing term
+        # Document frequencies: term -> number of active docs containing term
         self.doc_frequencies: Dict[str, int] = defaultdict(int)
+        # Per-slot indexed term set for O(terms) deletion
+        self._doc_terms: Dict[int, Set[str]] = {}
         # Cached IDF values
         self.idf_cache: Dict[str, float] = {}
 
     def add_documents(self, corpus: List[str]) -> None:
         """Indexes a batch of raw text strings using the linguistic analyzer."""
-        start_idx = self.doc_count
-        total_len = sum(self.doc_lengths)
+        start_idx = len(self.doc_lengths)
 
         for i, text in enumerate(corpus):
             doc_idx = start_idx + i
             tokens = self.analyzer.analyze(text)
             doc_len = len(tokens)
             self.doc_lengths.append(doc_len)
-            total_len += doc_len
+            self.doc_active.append(True)
+            self.total_length += doc_len
 
             counts = Counter(tokens)
+            self._doc_terms[doc_idx] = set(counts.keys())
             for term, freq in counts.items():
                 self.inverted_index[term].append((doc_idx, freq))
                 self.doc_frequencies[term] += 1
 
         self.doc_count += len(corpus)
-        if self.doc_count > 0:
-            self.avg_doc_length = total_len / self.doc_count
+        self.avg_doc_length = (self.total_length / self.doc_count) if self.doc_count > 0 else 0.0
 
         # Invalidate IDF cache
+        self.idf_cache.clear()
+
+    def remove_document(self, doc_idx: int, old_text: Optional[str] = None) -> None:
+        """Removes a soft-deleted document from BM25 statistics and postings."""
+        if doc_idx < 0 or doc_idx >= len(self.doc_active) or not self.doc_active[doc_idx]:
+            return
+
+        terms = self._doc_terms.pop(doc_idx, None)
+        if terms is None:
+            if old_text is not None:
+                terms = set(self.analyzer.analyze(old_text))
+            else:
+                terms = {
+                    t for t, postings in self.inverted_index.items()
+                    if any(idx == doc_idx for idx, _ in postings)
+                }
+
+        for term in terms:
+            postings = self.inverted_index.get(term)
+            if postings:
+                new_postings = [p for p in postings if p[0] != doc_idx]
+                removed = len(postings) - len(new_postings)
+                if new_postings:
+                    self.inverted_index[term] = new_postings
+                else:
+                    self.inverted_index.pop(term, None)
+                if removed > 0:
+                    new_df = self.doc_frequencies.get(term, 0) - 1
+                    if new_df > 0:
+                        self.doc_frequencies[term] = new_df
+                    else:
+                        self.doc_frequencies.pop(term, None)
+
+        self.total_length = max(0, self.total_length - self.doc_lengths[doc_idx])
+        self.doc_lengths[doc_idx] = 0
+        self.doc_active[doc_idx] = False
+        self.doc_count = max(0, self.doc_count - 1)
+        self.avg_doc_length = (self.total_length / self.doc_count) if self.doc_count > 0 else 0.0
+        self.idf_cache.clear()
+
+    def update_document(self, doc_idx: int, new_text: str) -> None:
+        """Updates (or re-activates) a single slot in-place without disturbing other tombstones."""
+        if doc_idx < 0:
+            raise ValueError(f"Invalid doc_idx: {doc_idx}")
+        if doc_idx < len(self.doc_active) and self.doc_active[doc_idx]:
+            self.remove_document(doc_idx)
+
+        while len(self.doc_lengths) <= doc_idx:
+            self.doc_lengths.append(0)
+            self.doc_active.append(False)
+
+        tokens = self.analyzer.analyze(new_text)
+        doc_len = len(tokens)
+        self.doc_lengths[doc_idx] = doc_len
+        self.doc_active[doc_idx] = True
+        self.total_length += doc_len
+        self.doc_count += 1
+
+        counts = Counter(tokens)
+        self._doc_terms[doc_idx] = set(counts.keys())
+        for term, freq in counts.items():
+            self.inverted_index[term].append((doc_idx, freq))
+            self.doc_frequencies[term] += 1
+
+        self.avg_doc_length = (self.total_length / self.doc_count) if self.doc_count > 0 else 0.0
         self.idf_cache.clear()
 
     def _get_idf(self, term: str) -> float:
         """Calculates Robertson-Spärck Jones IDF with non-negative smoothing."""
         if term in self.idf_cache:
             return self.idf_cache[term]
+
+        if self.doc_count == 0:
+            return 0.0
 
         n_q = self.doc_frequencies.get(term, 0)
         if n_q == 0:
@@ -87,13 +159,17 @@ class BM25Index:
         mask: Optional[np.ndarray] = None
     ) -> np.ndarray:
         """
-        Calculates BM25 scores for all documents given a query string.
-        Optionally zeroes out any document indices masked as False.
+        Calculates BM25 scores for all document slots given a query string.
+        Optionally zeroes out any document indices masked as False or tombstoned.
         """
-        if self.doc_count == 0:
+        slot_count = len(self.doc_lengths)
+        if slot_count == 0:
             return np.empty(0, dtype=np.float32)
 
-        scores = np.zeros(self.doc_count, dtype=np.float32)
+        scores = np.zeros(slot_count, dtype=np.float32)
+        if self.doc_count == 0:
+            return scores
+
         query_terms = self.analyzer.analyze(query)
         if not query_terms:
             return scores
@@ -111,6 +187,8 @@ class BM25Index:
                 continue
 
             for doc_idx, tf in postings:
+                if doc_idx >= slot_count or not self.doc_active[doc_idx]:
+                    continue
                 if mask is not None and not mask[doc_idx]:
                     continue
 

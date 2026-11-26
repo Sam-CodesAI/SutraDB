@@ -1,7 +1,7 @@
 """
 Production Python client SDK for SutraDB.
-Provides synchronous (SutraClient) and asynchronous (AsyncSutraClient) HTTP interfaces
-with connection pooling, exponential backoff retries, and strict type safety.
+Provides synchronous SutraClient HTTP interface with connection pooling,
+exponential backoff retries, and strict type safety.
 """
 
 from typing import Any, Dict, List, Optional, Union

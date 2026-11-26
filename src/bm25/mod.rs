@@ -18,6 +18,7 @@ pub struct BM25Index {
     pub b: f32,
     pub doc_count: u32,
     pub doc_lengths: Vec<u32>,
+    pub doc_active: Vec<bool>,
     pub total_length: u64,
     pub analyzer: Analyzer,
     // term -> list of (doc_index, term_frequency)
@@ -39,6 +40,7 @@ impl Clone for BM25Index {
             b: self.b,
             doc_count: self.doc_count,
             doc_lengths: self.doc_lengths.clone(),
+            doc_active: self.doc_active.clone(),
             total_length: self.total_length,
             analyzer: self.analyzer.clone(),
             inverted_index: self.inverted_index.clone(),
@@ -65,6 +67,7 @@ impl BM25Index {
             b,
             doc_count: 0,
             doc_lengths: Vec::new(),
+            doc_active: Vec::new(),
             total_length: 0,
             analyzer,
             inverted_index: HashMap::new(),
@@ -82,12 +85,13 @@ impl BM25Index {
     }
 
     pub fn add_documents(&mut self, corpus: &[String]) {
-        let start_idx = self.doc_count;
+        let start_idx = self.doc_lengths.len() as u32;
         for (i, text) in corpus.iter().enumerate() {
             let doc_idx = start_idx + i as u32;
             let tokens = self.analyzer.analyze(text);
             let len = tokens.len() as u32;
             self.doc_lengths.push(len);
+            self.doc_active.push(true);
             self.total_length += len as u64;
 
             let mut counts: HashMap<String, u32> = HashMap::new();
@@ -112,57 +116,101 @@ impl BM25Index {
         cache.clear();
     }
 
-    /// In-place update of an existing document's lexical terms.
-    /// Removes stale postings and doc frequencies, updates doc length and total length,
-    /// inserts new postings, and invalidates the IDF cache.
-    pub fn update_document(&mut self, doc_idx: u32, old_text: &str, new_text: &str) {
-        if old_text == new_text {
+    /// Removes a tombstoned document's lexical terms, decrements active `doc_count` and
+    /// `total_length`, and invalidates the IDF cache without shifting slot indices.
+    pub fn remove_document(&mut self, doc_idx: u32, old_text: &str) {
+        let idx = doc_idx as usize;
+        if idx >= self.doc_active.len() || !self.doc_active[idx] {
             return;
         }
 
-        let idx = doc_idx as usize;
-
-        // 1. Remove old terms
         let old_tokens = self.analyzer.analyze(old_text);
-        let mut old_counts: HashMap<String, u32> = HashMap::new();
+        let mut seen_terms = std::collections::HashSet::new();
         for t in old_tokens {
-            *old_counts.entry(t).or_insert(0) += 1;
-        }
-
-        for term in old_counts.keys() {
-            if let Some(postings) = self.inverted_index.get_mut(term) {
+            if !seen_terms.insert(t.clone()) {
+                continue;
+            }
+            if let Some(postings) = self.inverted_index.get_mut(&t) {
                 postings.retain(|&(d, _)| d != doc_idx);
                 if postings.is_empty() {
-                    self.inverted_index.remove(term);
+                    self.inverted_index.remove(&t);
                 }
             }
-            if let Some(df) = self.doc_frequencies.get_mut(term) {
+            if let Some(df) = self.doc_frequencies.get_mut(&t) {
                 if *df > 0 {
                     *df -= 1;
                 }
                 if *df == 0 {
-                    self.doc_frequencies.remove(term);
+                    self.doc_frequencies.remove(&t);
                 }
             }
         }
 
         if idx < self.doc_lengths.len() {
             self.total_length = self.total_length.saturating_sub(self.doc_lengths[idx] as u64);
+            self.doc_lengths[idx] = 0;
+        }
+        self.doc_active[idx] = false;
+        self.doc_count = self.doc_count.saturating_sub(1);
+
+        let mut cache = self
+            .idf_cache
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        cache.clear();
+    }
+
+    /// In-place update of an existing document's lexical terms.
+    /// Removes stale postings and doc frequencies, updates doc length and total length,
+    /// inserts new postings, and invalidates the IDF cache.
+    pub fn update_document(&mut self, doc_idx: u32, old_text: &str, new_text: &str) {
+        let idx = doc_idx as usize;
+        let was_active = idx < self.doc_active.len() && self.doc_active[idx];
+        if was_active && old_text == new_text {
+            return;
+        }
+
+        // 1. Remove old terms if previously active
+        if was_active {
+            let old_tokens = self.analyzer.analyze(old_text);
+            let mut old_counts: HashMap<String, u32> = HashMap::new();
+            for t in old_tokens {
+                *old_counts.entry(t).or_insert(0) += 1;
+            }
+
+            for term in old_counts.keys() {
+                if let Some(postings) = self.inverted_index.get_mut(term) {
+                    postings.retain(|&(d, _)| d != doc_idx);
+                    if postings.is_empty() {
+                        self.inverted_index.remove(term);
+                    }
+                }
+                if let Some(df) = self.doc_frequencies.get_mut(term) {
+                    if *df > 0 {
+                        *df -= 1;
+                    }
+                    if *df == 0 {
+                        self.doc_frequencies.remove(term);
+                    }
+                }
+            }
+
+            if idx < self.doc_lengths.len() {
+                self.total_length = self.total_length.saturating_sub(self.doc_lengths[idx] as u64);
+            }
         }
 
         // 2. Add new terms
         let new_tokens = self.analyzer.analyze(new_text);
         let new_len = new_tokens.len() as u32;
-        if idx < self.doc_lengths.len() {
-            self.doc_lengths[idx] = new_len;
-        } else {
-            while self.doc_lengths.len() <= idx {
-                self.doc_lengths.push(0);
-            }
-            self.doc_lengths[idx] = new_len;
-            if self.doc_count <= doc_idx {
-                self.doc_count = doc_idx + 1;
-            }
+        while self.doc_lengths.len() <= idx {
+            self.doc_lengths.push(0);
+            self.doc_active.push(false);
+        }
+        self.doc_lengths[idx] = new_len;
+        if !self.doc_active[idx] {
+            self.doc_active[idx] = true;
+            self.doc_count += 1;
         }
         self.total_length += new_len as u64;
 
@@ -198,12 +246,12 @@ impl BM25Index {
         }
 
         let n_q = *self.doc_frequencies.get(term).unwrap_or(&0) as f32;
-        let idf = if n_q == 0.0 {
+        let idf = if n_q == 0.0 || self.doc_count == 0 {
             0.0
         } else {
             let n = self.doc_count as f32;
             // Robertson-Spärck Jones non-negative formulation: ln(1 + (N - n_q + 0.5) / (n_q + 0.5))
-            ((1.0 + (n - n_q + 0.5) / (n_q + 0.5))).ln().max(0.0)
+            (1.0 + (n - n_q + 0.5) / (n_q + 0.5)).ln().max(0.0)
         };
 
         {
@@ -217,11 +265,12 @@ impl BM25Index {
     }
 
     pub fn score_query(&self, query: &str, mask: Option<&[bool]>) -> Vec<f32> {
-        if self.doc_count == 0 {
-            return Vec::new();
+        let slot_count = self.doc_lengths.len();
+        if self.doc_count == 0 || slot_count == 0 {
+            return vec![0.0f32; slot_count];
         }
 
-        let mut scores = vec![0.0f32; self.doc_count as usize];
+        let mut scores = vec![0.0f32; slot_count];
         let query_terms = self.analyzer.analyze(query);
         if query_terms.is_empty() {
             return scores;
@@ -242,6 +291,9 @@ impl BM25Index {
             if let Some(postings) = self.inverted_index.get(&term) {
                 for &(doc_idx, tf) in postings {
                     let idx = doc_idx as usize;
+                    if idx >= slot_count || !self.doc_active[idx] {
+                        continue;
+                    }
                     if let Some(m) = mask {
                         if idx >= m.len() || !m[idx] {
                             continue;

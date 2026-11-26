@@ -11,9 +11,10 @@ import sys
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi import FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
+import httpx
 from pydantic import BaseModel, Field
 import uvicorn
 
@@ -51,7 +52,7 @@ class QueryRequest(BaseModel):
     text: Optional[str] = Field(None, description="Lexical search query string")
     filter: Optional[Dict[str, Any]] = Field(None, description="Compound metadata filter dictionary")
     namespace: Optional[str] = Field(None, description="Multi-tenant namespace filter")
-    top_k: int = Field(10, gt=0, description="Max results to return")
+    top_k: int = Field(10, gt=0, le=10000, description="Max results to return (capped at 10000)")
     hybrid: bool = Field(True, description="Enable hybrid dense + BM25 search")
     alpha: Optional[float] = Field(None, description="Convex linear weight if not using RRF")
     rrf_constant: int = Field(60, ge=1, description="Reciprocal Rank Fusion smoothing constant")
@@ -78,23 +79,86 @@ def create_app(data_dir: Optional[str] = None, db: Optional[SutraDB] = None) -> 
     """Creates and configures the production FastAPI ASGI application."""
     import os
     effective_data_dir = data_dir if data_dir is not None else os.getenv("SUTRA_DATA_DIR", "./sutra_data")
+    backend_url = os.getenv("SUTRA_BACKEND_URL", "").strip().rstrip("/")
     app = FastAPI(
         title="SutraDB API",
         version=__version__,
         description="High-Performance Hybrid Vector & BM25 Search Engine in pure Python."
     )
 
-    # Injected or initialized database instance
-    app.state.db = db if db is not None else SutraDB(persist_directory=effective_data_dir)
+    # Single-owner invariant: when SUTRA_BACKEND_URL is set, proxy all API operations to sutradb-server
+    app.state.db = db if db is not None else (None if backend_url else SutraDB(persist_directory=effective_data_dir))
+    app.state.backend_url = backend_url or None
 
-    # CORS Middleware
+    # CORS Middleware — restrict origins in production via SUTRA_CORS_ORIGINS env
+    import os as _os
+    cors_origins_raw = _os.getenv("SUTRA_CORS_ORIGINS", "*")
+    cors_origins = [o.strip() for o in cors_origins_raw.split(",") if o.strip()]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
+        allow_origins=cors_origins,
+        allow_credentials="*" not in cors_origins,
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    if backend_url:
+        @app.middleware("http")
+        async def proxy_to_backend(request: Request, call_next):
+            path = request.url.path.rstrip("/") or "/"
+            if path in ("/ui", "/dashboard"):
+                return await call_next(request)
+
+            forward_headers = {}
+            for hdr in ("content-type", "accept"):
+                val = request.headers.get(hdr)
+                if val:
+                    forward_headers[hdr] = val
+
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    if path == "/ui/stats":
+                        upstream = await client.get(f"{backend_url}/collections", headers=forward_headers)
+                        if upstream.status_code != 200:
+                            return Response(
+                                content=upstream.content,
+                                status_code=upstream.status_code,
+                                media_type=upstream.headers.get("content-type", "application/json"),
+                            )
+                        data = upstream.json()
+                        cols = data.get("collections", [])
+                        total_docs = sum(int(c.get("count", 0)) for c in cols if isinstance(c, dict))
+                        return JSONResponse(
+                            status_code=200,
+                            content={
+                                "version": __version__,
+                                "total_collections": len(cols),
+                                "total_documents": total_docs,
+                                "collections": cols,
+                            },
+                        )
+
+                    body_bytes = await request.body()
+                    target_url = f"{backend_url}{request.url.path}"
+                    if request.url.query:
+                        target_url = f"{target_url}?{request.url.query}"
+
+                    upstream = await client.request(
+                        method=request.method,
+                        url=target_url,
+                        content=body_bytes,
+                        headers=forward_headers,
+                    )
+                    return Response(
+                        content=upstream.content,
+                        status_code=upstream.status_code,
+                        media_type=upstream.headers.get("content-type", "application/json"),
+                    )
+            except httpx.RequestError as exc:
+                return JSONResponse(
+                    status_code=503,
+                    content={"detail": f"Backend service unavailable: {exc}"},
+                )
 
     # Bounded payload middleware (max 10MB)
     @app.middleware("http")
@@ -175,7 +239,7 @@ def create_app(data_dir: Optional[str] = None, db: Optional[SutraDB] = None) -> 
         }
 
     @app.get("/collections/{name}/sample_vectors", tags=["Collections"])
-    def get_sample_vectors(name: str, limit: int = 100):
+    def get_sample_vectors(name: str, limit: int = Query(100, ge=1, le=10000)):
         """Returns sample vectors for in-browser PCA 2D projection."""
         active_db: SutraDB = app.state.db
         try:
@@ -209,8 +273,10 @@ def create_app(data_dir: Optional[str] = None, db: Optional[SutraDB] = None) -> 
             try:
                 col = active_db.get_collection(name)
                 st = col.stats()
-                lines.append(f'sutradb_documents_count{{collection="{name}"}} {st.get("count", 0)}')
-                lines.append(f'sutradb_vector_memory_bytes{{collection="{name}"}} {st.get("vector_memory_bytes", 0)}')
+                # Escape collection name for Prometheus label safety
+                safe_name = name.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '')
+                lines.append(f'sutradb_documents_count{{collection="{safe_name}"}} {st.get("count", 0)}')
+                lines.append(f'sutradb_vector_memory_bytes{{collection="{safe_name}"}} {st.get("vector_memory_bytes", 0)}')
             except Exception:
                 continue
         return Response(content="\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
@@ -289,8 +355,25 @@ def create_app(data_dir: Optional[str] = None, db: Optional[SutraDB] = None) -> 
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+    @app.post("/collections/{name}/compact", tags=["Persistence"])
+    def compact_collection(name: str):
+        active_db: SutraDB = app.state.db
+        try:
+            col = active_db.get_collection(name)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
+        try:
+            col.compact()
+            return {"message": "Collection compacted", "count": col.count()}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
     @app.get("/collections/{name}/documents", tags=["Documents"])
-    def list_documents(name: str, limit: int = 50, offset: int = 0):
+    def list_documents(
+        name: str,
+        limit: int = Query(50, ge=1, le=1000),
+        offset: int = Query(0, ge=0),
+    ):
         active_db: SutraDB = app.state.db
         try:
             col = active_db.get_collection(name)

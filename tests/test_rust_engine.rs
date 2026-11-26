@@ -533,8 +533,10 @@ fn test_nlp_multilingual_and_cjk_support() {
     use _sutradb::bm25::analyzer::{Analyzer, AnalyzerConfig};
 
     // Spanish
-    let mut es_config = AnalyzerConfig::default();
-    es_config.language = "spanish".to_string();
+    let es_config = AnalyzerConfig {
+        language: "spanish".to_string(),
+        ..Default::default()
+    };
     let es_analyzer = Analyzer::new(es_config);
     let es_tokens = es_analyzer.analyze("Optimización y despliegue de servidores");
     // "y" and "de" are stopwords
@@ -828,8 +830,8 @@ fn test_colbert_multivector_maxsim_and_quadmodal_rrf() {
     ];
 
     let vecs = vec![
-        vec![0.7071, 0.7071, 0.0, 0.0],
-        vec![0.0, 0.0, 0.7071, 0.7071],
+        vec![std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2, 0.0, 0.0],
+        vec![0.0, 0.0, std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2],
     ];
 
     col.insert(docs, vecs).unwrap();
@@ -848,7 +850,7 @@ fn test_colbert_multivector_maxsim_and_quadmodal_rrf() {
     assert_eq!(colbert_results[0].colbert_score, Some(2.0));
 
     // 2. Quad-Modal Hybrid Query (Dense + BM25 + Sparse + ColBERT)
-    let q_dense = vec![0.7071, 0.7071, 0.0, 0.0];
+    let q_dense = vec![std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2, 0.0, 0.0];
     let quad_res = col.query(
         Some(&q_dense),
         Some("interaction multi-vector"),
@@ -1004,7 +1006,7 @@ fn test_wal_replay_preserves_vectors_on_update_metadata() {
         assert_eq!(doc.metadata["author"], "sam");
 
         let vec = &col_recovered.vectors[0];
-        assert_eq!(vec, &original_vec, "Document vector must not be wiped with zeros on WAL replay");
+        assert_eq!(vec, original_vec.as_slice(), "Document vector must not be wiped with zeros on WAL replay");
 
         // Verify secondary index reflects updated metadata and removed stale keys
         let old_hits = col_recovered.metadata_index.evaluate_filter(Some(&json!({"status": "draft"}))).unwrap();
@@ -1045,9 +1047,9 @@ fn test_hnsw_level_disconnect_healing() {
     assert_eq!(ep_level, max_lvl);
 
     // Verify all layers up to max_lvl have entry point in their layers map
-    for l in 0..=max_lvl {
+    for (l, layer) in hnsw.layers.iter().enumerate().take(max_lvl + 1) {
         assert!(
-            hnsw.layers[l].contains_key(&ep),
+            layer.contains_key(&ep),
             "Layer {} must contain entry point {}",
             l,
             ep
@@ -1517,8 +1519,8 @@ fn test_bm25_analyzer_preservation_on_compaction_and_load() {
 
     // Verify analyzer config was preserved across compact()
     assert_eq!(col.bm25.analyzer.config.language, "german");
-    assert_eq!(col.bm25.analyzer.config.split_identifiers, true);
-    assert_eq!(col.bm25.analyzer.config.cjk_bigrams, true);
+    assert!(col.bm25.analyzer.config.split_identifiers);
+    assert!(col.bm25.analyzer.config.cjk_bigrams);
 
     // Save and load
     col.save::<PathBuf>(None).unwrap();
@@ -1526,6 +1528,994 @@ fn test_bm25_analyzer_preservation_on_compaction_and_load() {
 
     // Verify analyzer config was preserved across load()
     assert_eq!(col.bm25.analyzer.config.language, "german");
-    assert_eq!(col.bm25.analyzer.config.split_identifiers, true);
-    assert_eq!(col.bm25.analyzer.config.cjk_bigrams, true);
+    assert!(col.bm25.analyzer.config.split_identifiers);
+    assert!(col.bm25.analyzer.config.cjk_bigrams);
+}
+
+// ============================================================================
+// M1 Audit Remediation Regression Tests
+// ============================================================================
+
+#[test]
+fn test_sq8_v4_negative_and_scaled_roundtrip_and_v3_backward_read() {
+    use _sutradb::storage::{BinaryStorage, MmapVectorStorage, HEADER_MAGIC_V3, HEADER_MAGIC_V4};
+
+    let tmp = tempdir().unwrap();
+    let v4_path = tmp.path().join("sq8_v4_cos.sutra");
+
+    // Negative and scaled vectors under Cosine
+    let mut col = NativeCollection::new(
+        "sq8_v4_test".to_string(),
+        4,
+        Metric::Cosine,
+        Some(v4_path.clone()),
+        false,
+    )
+    .unwrap();
+
+    let v0 = vec![-std::f32::consts::FRAC_1_SQRT_2, 0.0, std::f32::consts::FRAC_1_SQRT_2, 0.0];
+    let v1 = vec![0.0, -std::f32::consts::FRAC_1_SQRT_2, 0.0, std::f32::consts::FRAC_1_SQRT_2];
+    col.insert(
+        vec![
+            NativeDocument {
+                id: "neg0".into(),
+                namespace: None,
+                text: "negative vec".into(),
+                metadata: json!({}),
+                sparse_vector: None,
+                colbert_tokens: None,
+            },
+            NativeDocument {
+                id: "neg1".into(),
+                namespace: None,
+                text: "other vec".into(),
+                metadata: json!({}),
+                sparse_vector: None,
+                colbert_tokens: None,
+            },
+        ],
+        vec![v0.clone(), v1.clone()],
+    )
+    .unwrap();
+    col.enable_sq8();
+    let (orig_min_val, orig_scale) = col.sq8_vectors.params[0];
+    col.save::<PathBuf>(None).unwrap();
+
+    // Verify file header is V4
+    let mmap = MmapVectorStorage::open(&v4_path).unwrap();
+    assert_eq!(mmap.header().magic, *HEADER_MAGIC_V4);
+    assert_eq!(mmap.header().quant_mode, 1);
+    let (min_val, scale) = mmap.get_sq8_params(0).unwrap();
+    assert!((min_val - orig_min_val).abs() < 1e-6);
+    assert!((scale - orig_scale).abs() < 1e-6);
+
+    // Reload into fresh collection and check exact SQ8 params & cosine score ~ 1.0
+    let mut reloaded = NativeCollection::new(
+        "sq8_v4_test".to_string(),
+        4,
+        Metric::Cosine,
+        Some(v4_path),
+        false,
+    )
+    .unwrap();
+    reloaded.load::<PathBuf>(None).unwrap();
+    assert!(reloaded.use_sq8);
+    assert_eq!(reloaded.sq8_vectors.params[0].0, orig_min_val);
+    assert_eq!(reloaded.sq8_vectors.params[0].1, orig_scale);
+    for (a, b) in reloaded.vectors[0].iter().zip(v0.iter()) {
+        assert!((a - b).abs() < 0.02, "Dequantized mismatch: {} vs {}", a, b);
+    }
+    let hits = reloaded
+        .query(Some(&v0), None, None, None, None, None, 2, false, None, 60, 1.0, 1.0, 1.0, 1.0, false)
+        .unwrap();
+    assert_eq!(hits[0].id, "neg0");
+    assert!((hits[0].score - 1.0).abs() < 0.03, "Expected cosine ~ 1.0, got {}", hits[0].score);
+
+    // Scaled Euclidean SQ8 V4 roundtrip
+    let euc_path = tmp.path().join("sq8_v4_euc.sutra");
+    let mut col_euc = NativeCollection::new(
+        "sq8_v4_euc".to_string(),
+        4,
+        Metric::Euclidean,
+        Some(euc_path.clone()),
+        false,
+    )
+    .unwrap();
+    let scaled = vec![10.0, -20.0, 30.0, -40.0];
+    col_euc
+        .insert(
+            vec![NativeDocument {
+                id: "s0".into(),
+                namespace: None,
+                text: "scaled".into(),
+                metadata: json!({}),
+                sparse_vector: None,
+                colbert_tokens: None,
+            }],
+            vec![scaled.clone()],
+        )
+        .unwrap();
+    col_euc.enable_sq8();
+    col_euc.save::<PathBuf>(None).unwrap();
+
+    let mut reloaded_euc = NativeCollection::new(
+        "sq8_v4_euc".to_string(),
+        4,
+        Metric::Euclidean,
+        Some(euc_path),
+        false,
+    )
+    .unwrap();
+    reloaded_euc.load::<PathBuf>(None).unwrap();
+    for (a, b) in reloaded_euc.vectors[0].iter().zip(scaled.iter()) {
+        assert!((a - b).abs() < 0.5, "Scaled dequantized mismatch: {} vs {}", a, b);
+    }
+
+    // Legacy V3 SQ8 backward compatibility read
+    let v3_path = tmp.path().join("legacy_v3_sq8.sutra");
+    let raw_sq8 = vec![0u8, 128, 255, 64];
+    let meta = br#"[{"id":"v3doc","text":"legacy","metadata":{}}]"#;
+    BinaryStorage::write_sq8(&v3_path, &raw_sq8, 1, 4, "cosine", meta).unwrap();
+    let mmap_v3 = MmapVectorStorage::open(&v3_path).unwrap();
+    assert_eq!(mmap_v3.header().magic, *HEADER_MAGIC_V3);
+    assert!(mmap_v3.get_sq8_params(0).is_err());
+
+    let mut col_v3 = NativeCollection::new(
+        "legacy_v3".to_string(),
+        4,
+        Metric::Cosine,
+        Some(v3_path),
+        false,
+    )
+    .unwrap();
+    col_v3.load::<PathBuf>(None).unwrap();
+    assert_eq!(col_v3.count(), 1);
+    assert!(col_v3.use_sq8);
+    assert!((col_v3.vectors[0][2] - 1.0).abs() < 1e-5);
+}
+
+#[test]
+fn test_wal_clear_append_replay_and_name_validation() {
+    use _sutradb::validate_collection_name;
+
+    let tmp = tempdir().unwrap();
+    let wal_path = tmp.path().join("clear_test.wal");
+    let mut wal = WriteAheadLog::open(&wal_path).unwrap();
+
+    wal.append(&WalRecord {
+        op: "insert".into(),
+        docs: vec![json!({"id": "old", "text": "before clear"})],
+        ids: Vec::new(),
+    })
+    .unwrap();
+    wal.clear().unwrap();
+    assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 0);
+
+    // Subsequent append after clear must append cleanly at offset 0 (no NUL hole)
+    wal.append(&WalRecord {
+        op: "insert".into(),
+        docs: vec![json!({"id": "new", "text": "after clear"})],
+        ids: Vec::new(),
+    })
+    .unwrap();
+    let replayed = wal.replay().unwrap();
+    assert_eq!(replayed.len(), 1);
+    assert_eq!(replayed[0].docs[0]["id"], "new");
+
+    // Collection name validation
+    assert!(validate_collection_name("valid-col_123").is_ok());
+    for bad in ["", "../evil", "a/b", "a\\b", "bad name", "a\0b"] {
+        assert!(validate_collection_name(bad).is_err(), "Should reject {:?}", bad);
+        assert!(
+            NativeCollection::new(bad.to_string(), 4, Metric::Cosine, None, false).is_err(),
+            "NativeCollection::new should reject {:?}",
+            bad
+        );
+    }
+    let too_long = "a".repeat(129);
+    assert!(validate_collection_name(&too_long).is_err());
+}
+
+#[test]
+fn test_save_and_compact_preserve_hnsw_and_ivf() {
+    let tmp = tempdir().unwrap();
+    let hnsw_path = tmp.path().join("hnsw_compact.sutra");
+    let mut col = NativeCollection::new(
+        "hnsw_compact".to_string(),
+        4,
+        Metric::Cosine,
+        Some(hnsw_path),
+        false,
+    )
+    .unwrap();
+
+    let mut docs = Vec::new();
+    let mut vecs = Vec::new();
+    for i in 0..20 {
+        docs.push(NativeDocument {
+            id: format!("d{}", i),
+            namespace: None,
+            text: format!("doc {}", i),
+            metadata: json!({}),
+            sparse_vector: None,
+            colbert_tokens: None,
+        });
+        vecs.push(vec![(i as f32) + 1.0, 0.5, 0.2, 0.1]);
+    }
+    col.insert(docs, vecs).unwrap();
+    col.build_hnsw(Some(HNSWConfig {
+        m: 8,
+        m0: 16,
+        ef_construction: 32,
+        ef_search: 24,
+        ml: 1.0 / (8.0f64).ln(),
+        seed: 42,
+    }))
+    .unwrap();
+
+    col.delete(&["d0".to_string()]).unwrap();
+    col.save::<PathBuf>(None).unwrap();
+
+    assert!(col.hnsw.is_some());
+    assert!(!col.dirty_index);
+    assert_eq!(col.stats()["has_hnsw"], true);
+    let hits = col
+        .query(Some(&[20.0, 0.5, 0.2, 0.1]), None, None, None, None, None, 5, false, None, 60, 1.0, 1.0, 1.0, 1.0, true)
+        .unwrap();
+    assert!(!hits.is_empty());
+    assert!(!hits.iter().any(|h| h.id == "d0"));
+
+    // Repeat for IVF
+    let mut col_ivf = NativeCollection::new("ivf_compact".to_string(), 4, Metric::Cosine, None, false).unwrap();
+    let mut docs2 = Vec::new();
+    let mut vecs2 = Vec::new();
+    for i in 0..20 {
+        docs2.push(NativeDocument {
+            id: format!("d{}", i),
+            namespace: None,
+            text: format!("doc {}", i),
+            metadata: json!({}),
+            sparse_vector: None,
+            colbert_tokens: None,
+        });
+        vecs2.push(vec![(i as f32) + 1.0, 0.5, 0.2, 0.1]);
+    }
+    col_ivf.insert(docs2, vecs2).unwrap();
+    col_ivf
+        .build_ivf(Some(_sutradb::index::ivf::IVFConfig {
+            n_lists: 4,
+            nprobe: 2,
+            kmeans_iters: 10,
+            seed: 42,
+        }))
+        .unwrap();
+    col_ivf.delete(&["d0".to_string()]).unwrap();
+    col_ivf.compact().unwrap();
+
+    assert!(col_ivf.ivf.is_some());
+    assert!(!col_ivf.dirty_index);
+    assert_eq!(col_ivf.stats()["has_ivf"], true);
+}
+
+#[test]
+fn test_bq_pq_negative_dense_scores_and_linear_fusion_finite() {
+    // 40 docs all pointing into negative hemisphere relative to query [1, 0, 0, 0, ...]
+    let dim = 8;
+    let mut docs = Vec::new();
+    let mut vecs = Vec::new();
+    for i in 0..40 {
+        let x = if i == 0 { -0.1 } else { -0.9 };
+        let y = (1.0f32 - x * x).sqrt();
+        let mut v = vec![0.0f32; dim];
+        v[0] = x;
+        v[1] = y;
+        docs.push(NativeDocument {
+            id: format!("d{}", i),
+            namespace: None,
+            text: if i == 0 { "match keyword".into() } else { "other text".into() },
+            metadata: json!({}),
+            sparse_vector: None,
+            colbert_tokens: None,
+        });
+        vecs.push(v);
+    }
+
+    let mut q = vec![0.0f32; dim];
+    q[0] = 1.0;
+
+    // 1. BQ negative dense scores & linear fusion
+    let mut col_bq = NativeCollection::new("bq_neg".to_string(), dim, Metric::Cosine, None, false).unwrap();
+    col_bq.insert(docs.clone(), vecs.clone()).unwrap();
+    col_bq.enable_bq();
+    let res_bq = col_bq
+        .query(Some(&q), None, None, None, None, None, 5, false, None, 60, 1.0, 1.0, 1.0, 1.0, false)
+        .unwrap();
+    assert_eq!(res_bq.len(), 5);
+    assert_eq!(res_bq[0].id, "d0", "Un-reranked docs must not beat -0.1 score");
+    assert!(res_bq.iter().all(|r| r.score.is_finite() && r.score < 0.0));
+
+    let res_bq_lin = col_bq
+        .query(Some(&q), Some("match keyword"), None, None, None, None, 5, true, Some(0.5), 60, 1.0, 1.0, 1.0, 1.0, false)
+        .unwrap();
+    assert!(res_bq_lin.iter().all(|r| r.score.is_finite()), "Linear fusion must not emit NaN");
+
+    // 2. PQ negative dense scores & linear fusion
+    let mut col_pq = NativeCollection::new("pq_neg".to_string(), dim, Metric::Cosine, None, false).unwrap();
+    col_pq.insert(docs, vecs).unwrap();
+    col_pq.train_pq(Some(4), None).unwrap();
+    let res_pq = col_pq
+        .query(Some(&q), None, None, None, None, None, 5, false, None, 60, 1.0, 1.0, 1.0, 1.0, false)
+        .unwrap();
+    assert_eq!(res_pq.len(), 5);
+    assert_eq!(res_pq[0].id, "d0", "Un-reranked PQ docs must not beat -0.1 score");
+    assert!(res_pq.iter().all(|r| r.score.is_finite() && r.score < 0.0));
+
+    let res_pq_lin = col_pq
+        .query(Some(&q), Some("match keyword"), None, None, None, None, 5, true, Some(0.5), 60, 1.0, 1.0, 1.0, 1.0, false)
+        .unwrap();
+    assert!(res_pq_lin.iter().all(|r| r.score.is_finite()), "PQ linear fusion must not emit NaN");
+}
+
+#[test]
+fn test_rayon_64_plus_query_and_batch_dimension_mismatch() {
+    use _sutradb::distance::simd::try_batch_distances;
+    use _sutradb::error::SutraError;
+
+    let mut col = NativeCollection::new("rayon_dim".to_string(), 4, Metric::Cosine, None, false).unwrap();
+    let mut docs = Vec::new();
+    let mut vecs = Vec::new();
+    for i in 0..70 {
+        docs.push(NativeDocument {
+            id: format!("d{}", i),
+            namespace: None,
+            text: "doc".into(),
+            metadata: json!({}),
+            sparse_vector: None,
+            colbert_tokens: None,
+        });
+        vecs.push(vec![1.0, 0.0, 0.0, 0.0]);
+    }
+    col.insert(docs, vecs.clone()).unwrap();
+
+    let bad_q = vec![1.0, 0.0, 0.0];
+    let err = col.query(Some(&bad_q), None, None, None, None, None, 5, false, None, 60, 1.0, 1.0, 1.0, 1.0, false).unwrap_err();
+    assert!(matches!(err, SutraError::DimensionMismatch { expected: 4, got: 3 }));
+
+    col.enable_sq8();
+    assert!(matches!(
+        col.query(Some(&bad_q), None, None, None, None, None, 5, false, None, 60, 1.0, 1.0, 1.0, 1.0, false),
+        Err(SutraError::DimensionMismatch { expected: 4, got: 3 })
+    ));
+
+    col.enable_bq();
+    assert!(matches!(
+        col.query(Some(&bad_q), None, None, None, None, None, 5, false, None, 60, 1.0, 1.0, 1.0, 1.0, false),
+        Err(SutraError::DimensionMismatch { expected: 4, got: 3 })
+    ));
+
+    assert!(matches!(
+        try_batch_distances(&bad_q, &vecs, Metric::Cosine, false),
+        Err(SutraError::DimensionMismatch { expected: 3, got: 4 })
+    ));
+}
+
+#[test]
+fn test_h2_no_panics_on_malformed_inputs_and_atomic_batch() {
+    use _sutradb::distance::pq::{PQCodebook, PQConfig};
+    use _sutradb::error::SutraError;
+    use _sutradb::sparse::SparseVector;
+    use _sutradb::storage::{MmapVectorStorage, SutraHeader, HEADER_MAGIC_V4};
+
+    // 1. PQCodebook::train validation
+    let vecs = vec![vec![1.0, 2.0, 3.0, 4.0]];
+    assert!(PQCodebook::train(&vecs, 4, PQConfig { m: 0, ..Default::default() }).is_err());
+    assert!(PQCodebook::train(&vecs, 4, PQConfig { m: 8, ..Default::default() }).is_err());
+    assert!(PQCodebook::train(&vecs, 4, PQConfig { m: 3, ..Default::default() }).is_err());
+    assert!(PQCodebook::train(&[vec![1.0, 2.0]], 4, PQConfig { m: 2, ..Default::default() }).is_err());
+
+    // 2. SparseVector::try_new
+    assert!(matches!(
+        SparseVector::try_new(vec![1, 2], vec![1.0]),
+        Err(SutraError::DimensionMismatch { expected: 2, got: 1 })
+    ));
+
+    // 3. Atomic batch insert_internal on bad vector or bad colbert token dim
+    let mut col = NativeCollection::new("atomic_batch".to_string(), 4, Metric::Cosine, None, false).unwrap();
+    let err_vec = col.insert(
+        vec![
+            NativeDocument { id: "ok".into(), namespace: None, text: "ok".into(), metadata: json!({}), sparse_vector: None, colbert_tokens: None },
+            NativeDocument { id: "bad".into(), namespace: None, text: "bad".into(), metadata: json!({}), sparse_vector: None, colbert_tokens: None },
+        ],
+        vec![vec![1.0, 0.0, 0.0, 0.0], vec![1.0, 0.0]],
+    );
+    assert!(matches!(err_vec, Err(SutraError::DimensionMismatch { expected: 4, got: 2 })));
+    assert_eq!(col.count(), 0);
+    assert!(col.documents.is_empty());
+
+    let err_cb = col.insert(
+        vec![
+            NativeDocument { id: "ok".into(), namespace: None, text: "ok".into(), metadata: json!({}), sparse_vector: None, colbert_tokens: None },
+            NativeDocument { id: "bad_cb".into(), namespace: None, text: "bad".into(), metadata: json!({}), sparse_vector: None, colbert_tokens: Some(vec![vec![1.0, 2.0]]) },
+        ],
+        vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]],
+    );
+    assert!(matches!(err_cb, Err(SutraError::DimensionMismatch { expected: 4, got: 2 })));
+    assert_eq!(col.count(), 0);
+
+    // 4. ColBERT query dimension checks
+    assert!(matches!(
+        col.query_colbert(&[vec![1.0, 2.0]], None, None, 5),
+        Err(SutraError::DimensionMismatch { expected: 4, got: 2 })
+    ));
+    assert!(matches!(
+        col.query(None, None, None, Some(&[vec![1.0, 2.0]]), None, None, 5, false, None, 60, 1.0, 1.0, 1.0, 1.0, false),
+        Err(SutraError::DimensionMismatch { expected: 4, got: 2 })
+    ));
+
+    // 5. MmapVectorStorage overflow / invalid quant_mode / metadata mismatch
+    let tmp = tempdir().unwrap();
+    let bad_qm_path = tmp.path().join("bad_qm.sutra");
+    let mut hdr_bytes = SutraHeader {
+        magic: *HEADER_MAGIC_V4,
+        doc_count: 1,
+        dimension: 4,
+        metric: "cosine".into(),
+        metadata_length: 2,
+        crc32: 0,
+        quant_mode: 9,
+    }
+    .to_bytes();
+    let mut file_bytes = hdr_bytes.to_vec();
+    file_bytes.extend_from_slice(&[0u8; 32]);
+    std::fs::write(&bad_qm_path, &file_bytes).unwrap();
+    assert!(matches!(MmapVectorStorage::open(&bad_qm_path), Err(SutraError::InvalidHeader(_))));
+
+    // Overflow u32::MAX * u32::MAX
+    let overflow_path = tmp.path().join("overflow.sutra");
+    hdr_bytes = SutraHeader::new(u32::MAX, u32::MAX, "cosine", 0, 0, 0).to_bytes();
+    std::fs::write(&overflow_path, hdr_bytes).unwrap();
+    assert!(matches!(MmapVectorStorage::open(&overflow_path), Err(SutraError::InvalidHeader(_))));
+
+    // Metadata count mismatch with valid CRC32
+    let meta_mismatch_path = tmp.path().join("meta_mismatch.sutra");
+    let vecs_raw = vec![0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
+    let bad_meta = br#"[{"id":"only_one","text":"a","metadata":{}}]"#;
+    _sutradb::storage::BinaryStorage::write_f32(&meta_mismatch_path, &vecs_raw, 2, 4, "cosine", bad_meta).unwrap();
+    let mut col_load = NativeCollection::new("meta_mismatch".to_string(), 4, Metric::Cosine, Some(meta_mismatch_path), false).unwrap();
+    assert!(matches!(col_load.load::<PathBuf>(None), Err(SutraError::InvalidHeader(_))));
+}
+
+#[test]
+fn test_hnsw_filtered_recall_above_acorn_threshold() {
+    let mut col = NativeCollection::new("hnsw_filtered".to_string(), 4, Metric::Cosine, None, false).unwrap();
+    let mut docs = Vec::new();
+    let mut vecs = Vec::new();
+    for i in 0..1000 {
+        let is_rare = i >= 400; // 60% selectivity (> 2% ACORN threshold)
+        docs.push(NativeDocument {
+            id: format!("doc_{}", i),
+            namespace: None,
+            text: format!("doc {}", i),
+            metadata: json!({"tag": if is_rare { "rare_cluster" } else { "blocked" }}),
+            sparse_vector: None,
+            colbert_tokens: None,
+        });
+        if is_rare {
+            vecs.push(vec![0.01 * ((i % 10) as f32), 1.0, 0.0, 0.0]);
+        } else {
+            vecs.push(vec![1.0, 0.01 * ((i % 10) as f32), 0.0, 0.0]);
+        }
+    }
+    col.insert(docs, vecs).unwrap();
+    col.build_hnsw(Some(HNSWConfig {
+        m: 16,
+        m0: 32,
+        ef_construction: 64,
+        ef_search: 32,
+        ml: 1.0 / (16.0f64).ln(),
+        seed: 42,
+    }))
+    .unwrap();
+
+    // Query near blocked cluster [1, 0, 0, 0] with filter tag=rare_cluster
+    let filter = json!({"tag": "rare_cluster"});
+    let hits = col
+        .query(Some(&[1.0, 0.0, 0.0, 0.0]), None, None, None, None, Some(&filter), 10, false, None, 60, 1.0, 1.0, 1.0, 1.0, true)
+        .unwrap();
+    assert_eq!(hits.len(), 10, "Filtered HNSW must traverse through masked-out nodes to return top_k=10 results");
+    assert!(hits.iter().all(|h| h.metadata["tag"] == "rare_cluster"));
+}
+
+#[test]
+fn test_hnsw_delete_cleans_asymmetric_incoming_edges() {
+    let mut hnsw = HNSWIndex::new(HNSWConfig {
+        m: 2,
+        m0: 2,
+        ef_construction: 16,
+        ef_search: 16,
+        ml: 1.0 / (2.0f64).ln(),
+        seed: 7,
+    });
+    let mut vectors = Vec::new();
+    for i in 0..35 {
+        vectors.push(normalize_copy(&[((i % 7) + 1) as f32, ((i / 7) + 1) as f32, 0.3, 0.1]));
+    }
+    for (i, v) in vectors.iter().enumerate() {
+        hnsw.insert(i as u32, v, &vectors, Metric::Cosine, true).unwrap();
+    }
+
+    let deleted_ids = [0u32, 5, 10, 15, 20];
+    for &del_id in &deleted_ids {
+        assert!(hnsw.delete_node(del_id, &vectors, Metric::Cosine, true));
+        for layer in &hnsw.layers {
+            assert!(!layer.contains_key(&del_id));
+            for nbrs in layer.values() {
+                assert!(!nbrs.contains(&del_id), "Dangling edge to {} remained", del_id);
+            }
+        }
+    }
+
+    let hits = hnsw.search(&vectors[1], &vectors, 10, 16, Metric::Cosine, true, None).unwrap();
+    assert!(!hits.is_empty());
+    for (id, _) in hits {
+        assert!(!deleted_ids.contains(&id), "Deleted node {} returned by search", id);
+    }
+}
+
+#[test]
+fn test_filter_regex_not_complex_exists_and_type_parity() {
+    let mut col = NativeCollection::new("filter_parity".to_string(), 4, Metric::Cosine, None, false).unwrap();
+    let docs = vec![
+        NativeDocument {
+            id: "d0".into(),
+            namespace: None,
+            text: "alpha".into(),
+            metadata: json!({
+                "name": "foo-123",
+                "tags": ["rust", "db"],
+                "scores": [10, 100],
+                "count": 1.0,
+                "user": {"name": "alice"},
+                "empty_arr": []
+            }),
+            sparse_vector: None,
+            colbert_tokens: None,
+        },
+        NativeDocument {
+            id: "d1".into(),
+            namespace: None,
+            text: "beta".into(),
+            metadata: json!({
+                "name": "bar-456",
+                "tags": ["python"],
+                "scores": [10, 20],
+                "count": 2,
+                "user": null,
+                "empty_arr": [1]
+            }),
+            sparse_vector: None,
+            colbert_tokens: None,
+        },
+    ];
+    col.insert(docs, vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]]).unwrap();
+
+    // $regex match and invalid regex
+    let q = vec![1.0, 0.0, 0.0, 0.0];
+    let rx = col.query(Some(&q), None, None, None, None, Some(&json!({"name": {"$regex": "^foo-\\d+$"}})), 10, false, None, 60, 1.0, 1.0, 1.0, 1.0, false).unwrap();
+    assert_eq!(rx.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), vec!["d0"]);
+
+    let rx_bad = col.query(Some(&q), None, None, None, None, Some(&json!({"name": {"$regex": "[unclosed"}})), 10, false, None, 60, 1.0, 1.0, 1.0, 1.0, false).unwrap();
+    assert!(rx_bad.is_empty());
+
+    // $not over complex operators ($contains and $regex)
+    let not_contains = col.query(Some(&q), None, None, None, None, Some(&json!({"$not": {"tags": {"$contains": "rust"}}})), 10, false, None, 60, 1.0, 1.0, 1.0, 1.0, false).unwrap();
+    assert_eq!(not_contains.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), vec!["d1"]);
+
+    let not_regex = col.query(Some(&q), None, None, None, None, Some(&json!({"$not": {"name": {"$regex": "^foo"}}})), 10, false, None, 60, 1.0, 1.0, 1.0, 1.0, false).unwrap();
+    assert_eq!(not_regex.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), vec!["d1"]);
+
+    // $exists on nested object & empty array
+    let exists_user = col.query(Some(&q), None, None, None, None, Some(&json!({"user": {"$exists": true}})), 10, false, None, 60, 1.0, 1.0, 1.0, 1.0, false).unwrap();
+    assert_eq!(exists_user.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), vec!["d0"]);
+
+    let exists_empty = col.query(Some(&q), None, None, None, None, Some(&json!({"empty_arr": {"$exists": true}})), 10, false, None, 60, 1.0, 1.0, 1.0, 1.0, false).unwrap();
+    assert_eq!(exists_empty.len(), 2);
+
+    // Numeric 1 == 1.0 and array-element comparison parity with/without complex ops
+    let eq_int = col.query(Some(&q), None, None, None, None, Some(&json!({"count": 1})), 10, false, None, 60, 1.0, 1.0, 1.0, 1.0, false).unwrap();
+    assert_eq!(eq_int.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), vec!["d0"]);
+
+    let eq_int_complex = col.query(Some(&q), None, None, None, None, Some(&json!({"count": 1, "name": {"$regex": "foo"}})), 10, false, None, 60, 1.0, 1.0, 1.0, 1.0, false).unwrap();
+    assert_eq!(eq_int_complex.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), vec!["d0"]);
+
+    let arr_gt = col.query(Some(&q), None, None, None, None, Some(&json!({"scores": {"$gt": 50}, "name": {"$regex": ".*"}})), 10, false, None, 60, 1.0, 1.0, 1.0, 1.0, false).unwrap();
+    assert_eq!(arr_gt.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), vec!["d0"]);
+
+    // Dotted array index path ("scores.1" == 100)
+    let dotted_arr = col.query(Some(&q), None, None, None, None, Some(&json!({"scores.1": 100})), 10, false, None, 60, 1.0, 1.0, 1.0, 1.0, false).unwrap();
+    assert_eq!(dotted_arr.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), vec!["d0"]);
+}
+
+#[test]
+fn test_bm25_delete_updates_idf_and_avdl_without_oob() {
+    let mut col = NativeCollection::new("bm25_del".to_string(), 2, Metric::Cosine, None, false).unwrap();
+    col.insert(
+        vec![
+            NativeDocument { id: "d0".into(), namespace: None, text: "rareterm alpha".into(), metadata: json!({}), sparse_vector: None, colbert_tokens: None },
+            NativeDocument { id: "d1".into(), namespace: None, text: "common beta".into(), metadata: json!({}), sparse_vector: None, colbert_tokens: None },
+            NativeDocument { id: "d2".into(), namespace: None, text: "common gamma".into(), metadata: json!({}), sparse_vector: None, colbert_tokens: None },
+        ],
+        vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![0.5, 0.5]],
+    )
+    .unwrap();
+    assert_eq!(col.bm25.doc_count, 3);
+
+    col.delete(&["d0".to_string()]).unwrap();
+    assert_eq!(col.bm25.doc_count, 2);
+    // Deleted term must not match
+    let res_deleted = col.query(None, Some("rareterm"), None, None, None, None, 5, false, None, 60, 1.0, 1.0, 1.0, 1.0, false).unwrap();
+    assert!(res_deleted.is_empty());
+
+    // Surviving doc 2 must still score without OOB panic
+    let res_surv = col.query(None, Some("gamma"), None, None, None, None, 5, false, None, 60, 1.0, 1.0, 1.0, 1.0, false).unwrap();
+    assert_eq!(res_surv.len(), 1);
+    assert_eq!(res_surv[0].id, "d2");
+
+    // Inserting a new doc after deletion must assign unique slot index without collision
+    col.insert(
+        vec![NativeDocument { id: "d3".into(), namespace: None, text: "delta unique".into(), metadata: json!({}), sparse_vector: None, colbert_tokens: None }],
+        vec![vec![1.0, 0.0]],
+    )
+    .unwrap();
+    assert_eq!(col.bm25.doc_count, 3);
+    let res_new = col.query(None, Some("delta"), None, None, None, None, 5, false, None, 60, 1.0, 1.0, 1.0, 1.0, false).unwrap();
+    assert_eq!(res_new.len(), 1);
+    assert_eq!(res_new[0].id, "d3");
+}
+
+#[test]
+fn test_ivf_cosine_normalized_centroids_and_bq_euclidean_guard() {
+    let mut col = NativeCollection::new("ivf_cos".to_string(), 4, Metric::Cosine, None, false).unwrap();
+    let mut docs = Vec::new();
+    let mut vecs = Vec::new();
+    for i in 0..32 {
+        docs.push(NativeDocument {
+            id: format!("d{}", i),
+            namespace: None,
+            text: format!("doc {}", i),
+            metadata: json!({}),
+            sparse_vector: None,
+            colbert_tokens: None,
+        });
+        let angle = (i as f32) * 0.1;
+        vecs.push(vec![angle.cos(), angle.sin(), 0.1, 0.0]);
+    }
+    col.insert(docs, vecs).unwrap();
+    col.build_ivf(Some(_sutradb::index::ivf::IVFConfig {
+        n_lists: 4,
+        nprobe: 2,
+        kmeans_iters: 15,
+        seed: 42,
+    }))
+    .unwrap();
+
+    let ivf = col.ivf.as_ref().unwrap();
+    assert_eq!(ivf.metric, Metric::Cosine);
+    for c in &ivf.centroids {
+        let norm: f32 = c.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-4, "Cosine IVF centroid must be unit-normalized, got {}", norm);
+    }
+
+    let q = vec![1.0, 0.0, 0.1, 0.0];
+    let hits = col.query(Some(&q), None, None, None, None, None, 5, false, None, 60, 1.0, 1.0, 1.0, 1.0, true).unwrap();
+    assert_eq!(hits[0].id, "d0");
+    assert!(ivf.search(&[1.0, 0.0], &col.vectors, 5, Metric::Cosine, true, None).is_err());
+
+    // BQ + Euclidean guard: distinct magnitudes in same positive orthant must rank by exact Euclidean distance
+    let mut col_euc = NativeCollection::new("bq_euc_guard".to_string(), 4, Metric::Euclidean, None, false).unwrap();
+    col_euc
+        .insert(
+            vec![
+                NativeDocument { id: "far".into(), namespace: None, text: "far".into(), metadata: json!({}), sparse_vector: None, colbert_tokens: None },
+                NativeDocument { id: "near".into(), namespace: None, text: "near".into(), metadata: json!({}), sparse_vector: None, colbert_tokens: None },
+            ],
+            vec![vec![100.0, 100.0, 100.0, 100.0], vec![1.0, 1.0, 1.0, 1.0]],
+        )
+        .unwrap();
+    col_euc.enable_bq();
+    let euc_hits = col_euc
+        .query(Some(&[1.0, 1.0, 1.0, 1.0]), None, None, None, None, None, 2, false, None, 60, 1.0, 1.0, 1.0, 1.0, false)
+        .unwrap();
+    assert_eq!(euc_hits[0].id, "near");
+}
+
+#[test]
+fn test_secondary_index_type_separation_and_query_parity() {
+    let mut idx = _sutradb::filter::SecondaryMetadataIndex::new();
+    let metas = [
+        json!({"text": "a", "flag": "true", "code": "1", "arr": ["true", "1"]}),
+        json!({"text": "b", "flag": true, "code": 1, "arr": [true, 1.0]}),
+        json!({"text": "c", "flag": false, "code": 1.0, "arr": [false, -0.0]}),
+        json!({"text": "d", "flag": "false", "code": 0, "arr": ["false", 0]}),
+        json!({"text": "e", "status": "null"}),
+    ];
+    for (i, m) in metas.iter().enumerate() {
+        idx.index_document(i as u32, m);
+    }
+
+    // 1. Direct SecondaryMetadataIndex exactness and type separation
+    let cases = [
+        (json!({"flag": true}), vec![1]),
+        (json!({"flag": "true"}), vec![0]),
+        (json!({"flag": false}), vec![2]),
+        (json!({"flag": "false"}), vec![3]),
+        (json!({"code": "1"}), vec![0]),
+        (json!({"code": 1}), vec![1, 2]),
+        (json!({"code": 1.0}), vec![1, 2]),
+        (json!({"code": -0.0}), vec![3]),
+        (json!({"flag": {"$eq": true}}), vec![1]),
+        (json!({"flag": {"$ne": "true"}}), vec![1, 2, 3, 4]),
+        (json!({"flag": {"$in": [true]}}), vec![1]),
+        (json!({"flag": {"$nin": ["true"]}}), vec![1, 2, 3, 4]),
+        (json!({"code": {"$in": [1.0]}}), vec![1, 2]),
+        (json!({"code": {"$nin": ["1"]}}), vec![1, 2, 3, 4]),
+        (json!({"arr": true}), vec![1]),
+        (json!({"arr": "true"}), vec![0]),
+        (json!({"arr": 1}), vec![1]),
+        (json!({"arr": "1"}), vec![0]),
+        (json!({"arr": 0.0}), vec![2, 3]),
+    ];
+
+    for (filter, expected) in &cases {
+        let (bm, is_exact) = idx.evaluate_filter_checked(Some(filter)).unwrap();
+        assert!(is_exact, "Expected exact index eval for {}", filter);
+        let got: Vec<u32> = bm.iter().collect();
+        assert_eq!(&got, expected, "SecondaryMetadataIndex mismatch for {}", filter);
+    }
+
+    // Non-object elements in $and / $or must mark exact = false (Superset)
+    let (_, and_non_obj_exact) = idx.evaluate_filter_checked(Some(&json!({"$and": [123]}))).unwrap();
+    assert!(!and_non_obj_exact, "$and with non-object element must return Superset");
+    let (_, or_non_obj_exact) = idx
+        .evaluate_filter_checked(Some(&json!({"$or": [{"flag": true}, 123]})))
+        .unwrap();
+    assert!(!or_non_obj_exact, "$or with non-object element must return Superset");
+    let (_, not_and_non_obj_exact) = idx
+        .evaluate_filter_checked(Some(&json!({"$not": {"$and": [123]}})))
+        .unwrap();
+    assert!(!not_and_non_obj_exact, "$not over $and with non-object must return Superset");
+
+    // Removal must only remove the deleted document's typed key without touching other types
+    idx.remove_document(0);
+    let (bm_after_del, _) = idx.evaluate_filter_checked(Some(&json!({"flag": true}))).unwrap();
+    assert_eq!(bm_after_del.iter().collect::<Vec<_>>(), vec![1]);
+    let (bm_str_after_del, _) = idx.evaluate_filter_checked(Some(&json!({"flag": "true"}))).unwrap();
+    assert!(bm_str_after_del.is_empty());
+
+    // 2. NativeCollection::query vs FilterEngine bypass parity across all cases
+    let mut col = NativeCollection::new("type_parity".to_string(), 2, Metric::Cosine, None, false).unwrap();
+    let docs: Vec<NativeDocument> = metas
+        .iter()
+        .enumerate()
+        .map(|(i, m)| NativeDocument {
+            id: format!("d{}", i),
+            namespace: None,
+            text: format!("doc {}", i),
+            metadata: m.clone(),
+            sparse_vector: None,
+            colbert_tokens: None,
+        })
+        .collect();
+    let vecs = vec![vec![1.0, 0.0]; docs.len()];
+    col.insert(docs, vecs).unwrap();
+
+    let q = vec![1.0, 0.0];
+    for (filter, expected_indices) in &cases {
+        let mut direct_ids: Vec<String> = col
+            .query(Some(&q), None, None, None, None, Some(filter), 10, false, None, 60, 1.0, 1.0, 1.0, 1.0, false)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        direct_ids.sort();
+
+        let bypass_filter = json!({"$and": [filter, {"text": {"$regex": ".*"}}]});
+        let mut bypass_ids: Vec<String> = col
+            .query(Some(&q), None, None, None, None, Some(&bypass_filter), 10, false, None, 60, 1.0, 1.0, 1.0, 1.0, false)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        bypass_ids.sort();
+
+        let expected_ids: Vec<String> = expected_indices.iter().map(|i| format!("d{}", i)).collect();
+        assert_eq!(direct_ids, expected_ids, "Collection direct query mismatch for {}", filter);
+        assert_eq!(direct_ids, bypass_ids, "Collection direct vs bypass mismatch for {}", filter);
+    }
+}
+
+#[test]
+fn test_native_stats_includes_enable_wal_flag() {
+    let tmp = tempdir().unwrap();
+    let wal_col = NativeCollection::new(
+        "wal_on".to_string(),
+        4,
+        Metric::Cosine,
+        Some(tmp.path().join("wal_on.sutra")),
+        true,
+    )
+    .unwrap();
+    assert_eq!(wal_col.stats()["enable_wal"], true);
+
+    let mem_col = NativeCollection::new(
+        "wal_off".to_string(),
+        4,
+        Metric::Cosine,
+        None,
+        false,
+    )
+    .unwrap();
+    assert_eq!(mem_col.stats()["enable_wal"], false);
+}
+
+#[test]
+fn test_native_load_rejects_invalid_metric_header() {
+    use _sutradb::storage::BinaryStorage;
+
+    let tmp = tempdir().unwrap();
+    let bad_path = tmp.path().join("bad_metric.sutra");
+    let meta = serde_json::to_vec(&vec![json!({"id": "d1", "text": "x", "metadata": {}})]).unwrap();
+    BinaryStorage::write_f32(&bad_path, &[1.0, 0.0], 1, 2, "bogus_metric", &meta).unwrap();
+
+    let mut col = NativeCollection::new("bad_metric".to_string(), 2, Metric::Cosine, None, false).unwrap();
+    let err = col.load(Some(&bad_path)).unwrap_err();
+    assert!(
+        err.to_string().contains("Unsupported metric"),
+        "Expected Unsupported metric error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_wal_replay_ignores_corrupt_oversized_length_without_oom() {
+    use std::io::Write;
+    use _sutradb::storage::wal::{WalRecord, WriteAheadLog};
+
+    let tmp = tempdir().unwrap();
+    let wal_path = tmp.path().join("corrupt_len.wal");
+    let mut wal = WriteAheadLog::open(&wal_path).unwrap();
+    wal.append(&WalRecord {
+        op: "delete".to_string(),
+        docs: Vec::new(),
+        ids: vec!["d1".to_string()],
+    })
+    .unwrap();
+    drop(wal);
+
+    // Append a corrupt header claiming 500MB payload, with only 10 bytes present
+    let mut f = std::fs::OpenOptions::new().append(true).open(&wal_path).unwrap();
+    f.write_all(&500_000_000u32.to_le_bytes()).unwrap();
+    f.write_all(&0u32.to_le_bytes()).unwrap();
+    f.write_all(b"0123456789").unwrap();
+    drop(f);
+
+    let mut wal2 = WriteAheadLog::open(&wal_path).unwrap();
+    let recs = wal2.replay().unwrap();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].ids, vec!["d1"]);
+}
+
+#[test]
+fn test_simd_unaligned_and_sq8_parity() {
+    use _sutradb::distance::simd::{dot_product, euclidean_distance_squared};
+    use _sutradb::distance::sq8::{sq8_asymmetric_dot_slice, SQ8Vector};
+
+    for &dim in &[0usize, 1, 7, 8, 15, 16, 31, 32, 33, 63, 64, 65, 128, 131] {
+        let a: Vec<f32> = (0..dim).map(|i| ((i * 17 + 3) % 41) as f32 * 0.1 - 2.0).collect();
+        let b: Vec<f32> = (0..dim).map(|i| ((i * 29 + 5) % 37) as f32 * 0.1 - 1.5).collect();
+
+        let ref_dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        let ref_l2: f32 = a.iter().zip(b.iter()).map(|(x, y)| (x - y) * (x - y)).sum();
+
+        assert!(
+            (dot_product(&a, &b) - ref_dot).abs() < 1e-3,
+            "dot parity mismatch at dim={}",
+            dim
+        );
+        assert!(
+            (euclidean_distance_squared(&a, &b) - ref_l2).abs() < 1e-3,
+            "l2 parity mismatch at dim={}",
+            dim
+        );
+
+        let sq = SQ8Vector::quantize(&b);
+        let q_sum: f32 = a.iter().sum();
+        let ref_sq8: f32 = sq.min_val * q_sum
+            + sq.scale
+                * a.iter()
+                    .zip(sq.data.iter())
+                    .map(|(q, &byte)| q * (byte as f32))
+                    .sum::<f32>();
+        let simd_sq8 = sq8_asymmetric_dot_slice(&sq.data, sq.min_val, sq.scale, &a, q_sum).unwrap();
+        assert!(
+            (simd_sq8 - ref_sq8).abs() < 1e-3,
+            "sq8 parity mismatch at dim={}",
+            dim
+        );
+    }
+}
+
+#[test]
+fn test_mmap_fp32_ram_eviction_on_quantization() {
+    let tmp = tempdir().unwrap();
+    let sutra_path = tmp.path().join("evict_test.sutra");
+    let dim = 16;
+    let n = 64;
+
+    let mut docs = Vec::with_capacity(n);
+    let mut vecs = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut v = vec![0.0f32; dim];
+        v[i % dim] = 1.0;
+        v[(i + 3) % dim] = 0.25 * ((i / dim + 1) as f32);
+        docs.push(NativeDocument {
+            id: format!("ev_{}", i),
+            namespace: None,
+            text: format!("doc {}", i),
+            metadata: json!({"i": i}),
+            sparse_vector: None,
+            colbert_tokens: None,
+        });
+        vecs.push(normalize_copy(&v));
+    }
+
+    let mut col = NativeCollection::new(
+        "evict_col".to_string(),
+        dim,
+        Metric::Cosine,
+        Some(sutra_path.clone()),
+        false,
+    )
+    .unwrap();
+    col.insert(docs, vecs.clone()).unwrap();
+    col.save::<PathBuf>(None).unwrap();
+
+    let mut reloaded = NativeCollection::new(
+        "evict_col".to_string(),
+        dim,
+        Metric::Cosine,
+        Some(sutra_path),
+        false,
+    )
+    .unwrap();
+    reloaded.load::<PathBuf>(None).unwrap();
+    assert!(reloaded.mmap_storage.is_some());
+    assert!(!reloaded.vectors_evicted);
+    assert_eq!(reloaded.vectors.len(), n);
+
+    reloaded.enable_bq();
+    assert!(reloaded.vectors_evicted, "FP32 arena must be evicted when BQ enabled over mmap");
+    assert!(reloaded.vectors.is_empty(), "Evicted FP32 arena must hold 0 bytes");
+    assert_eq!(reloaded.stats()["vector_memory_bytes"].as_u64().unwrap(), (n * 8) as u64);
+
+    let hits = reloaded
+        .query(
+            Some(&vecs[0]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            3,
+            false,
+            None,
+            60,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            false,
+        )
+        .unwrap();
+    assert_eq!(hits[0].id, "ev_0");
 }

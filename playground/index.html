@@ -383,78 +383,151 @@
             } catch (err) {
                 if (err.name === 'AbortError') return;
                 console.error('Search error:', err);
-                resultsArea.innerHTML = `
-                    <div class="empty-state">
-                        <div class="empty-icon">⚠️</div>
-                        <h3>Error performing search</h3>
-                        <p>${err.message}</p>
-                    </div>`;
+                resultsArea.replaceChildren();
+                const emptyState = document.createElement('div');
+                emptyState.className = 'empty-state';
+                const icon = document.createElement('div');
+                icon.className = 'empty-icon';
+                icon.textContent = '⚠️';
+                const title = document.createElement('h3');
+                title.textContent = 'Error performing search';
+                const msg = document.createElement('p');
+                msg.textContent = String(err.message || err);
+                emptyState.append(icon, title, msg);
+                resultsArea.appendChild(emptyState);
                 timingDisplay.textContent = 'Error';
             }
         }
 
         function renderResults(results) {
+            resultsArea.replaceChildren();
             if (results.length === 0) {
-                resultsArea.innerHTML = `
-                    <div class="empty-state">
-                        <div class="empty-icon">👻</div>
-                        <h3>No results found</h3>
-                        <p>Try adjusting your search terms or filters</p>
-                    </div>`;
+                const emptyState = document.createElement('div');
+                emptyState.className = 'empty-state';
+                const icon = document.createElement('div');
+                icon.className = 'empty-icon';
+                icon.textContent = '👻';
+                const title = document.createElement('h3');
+                title.textContent = 'No results found';
+                const msg = document.createElement('p');
+                msg.textContent = 'Try adjusting your search terms or filters';
+                emptyState.append(icon, title, msg);
+                resultsArea.appendChild(emptyState);
                 return;
             }
 
-            resultsArea.innerHTML = results.map((r, i) => {
+            results.forEach((r, i) => {
                 const meta = r.metadata || {};
-                const tags = meta.tags || [];
-                const ds = r.dense_score || 0;
-                const bs = r.bm25_score || 0;
+                const tags = Array.isArray(meta.tags) ? meta.tags : [];
+                const ds = Number(r.dense_score) || 0;
+                const bs = Number(r.bm25_score) || 0;
                 const totalScore = ds + bs;
-                
-                // Calculate percentages for the bar, handle 0 total
+
                 const dsPct = totalScore > 0 ? (ds / totalScore) * 100 : 0;
                 const bsPct = totalScore > 0 ? (bs / totalScore) * 100 : 0;
 
-                return `
-                    <div class="card" style="animation-delay: ${i * 0.05}s">
-                        <div class="card-header">
-                            <div class="badges">
-                                ${meta.category ? `<span class="badge category">${meta.category}</span>` : ''}
-                                ${meta.difficulty ? `<span class="badge difficulty">${meta.difficulty}</span>` : ''}
-                            </div>
-                            <div class="score-overall">${(r.score || 0).toFixed(4)}</div>
-                        </div>
-                        <div class="card-text">${highlight(r.text, searchInput.value)}</div>
-                        <div class="badges">
-                            ${tags.map(t => `<span class="badge tag">#${t}</span>`).join('')}
-                        </div>
-                        <div class="score-bar-container">
-                            <div class="score-bar-labels">
-                                <span>Dense: ${ds.toFixed(3)}</span>
-                                <span>BM25: ${bs.toFixed(3)}</span>
-                            </div>
-                            <div class="score-bar">
-                                <div class="score-dense" style="width: ${dsPct}%"></div>
-                                <div class="score-bm25" style="width: ${bsPct}%"></div>
-                            </div>
-                        </div>
-                    </div>
-                `;
-            }).join('');
+                const card = document.createElement('div');
+                card.className = 'card';
+                card.style.animationDelay = `${i * 0.05}s`;
+
+                const cardHeader = document.createElement('div');
+                cardHeader.className = 'card-header';
+
+                const headerBadges = document.createElement('div');
+                headerBadges.className = 'badges';
+                if (meta.category) {
+                    const cat = document.createElement('span');
+                    cat.className = 'badge category';
+                    cat.textContent = String(meta.category);
+                    headerBadges.appendChild(cat);
+                }
+                if (meta.difficulty) {
+                    const diff = document.createElement('span');
+                    diff.className = 'badge difficulty';
+                    diff.textContent = String(meta.difficulty);
+                    headerBadges.appendChild(diff);
+                }
+
+                const overall = document.createElement('div');
+                overall.className = 'score-overall';
+                overall.textContent = (Number(r.score) || 0).toFixed(4);
+                cardHeader.append(headerBadges, overall);
+
+                const cardText = document.createElement('div');
+                cardText.className = 'card-text';
+                cardText.appendChild(highlight(String(r.text || ''), searchInput.value));
+
+                const tagBadges = document.createElement('div');
+                tagBadges.className = 'badges';
+                tags.forEach(t => {
+                    const tagEl = document.createElement('span');
+                    tagEl.className = 'badge tag';
+                    tagEl.textContent = `#${String(t)}`;
+                    tagBadges.appendChild(tagEl);
+                });
+
+                const scoreContainer = document.createElement('div');
+                scoreContainer.className = 'score-bar-container';
+
+                const labels = document.createElement('div');
+                labels.className = 'score-bar-labels';
+                const dsLabel = document.createElement('span');
+                dsLabel.textContent = `Dense: ${ds.toFixed(3)}`;
+                const bsLabel = document.createElement('span');
+                bsLabel.textContent = `BM25: ${bs.toFixed(3)}`;
+                labels.append(dsLabel, bsLabel);
+
+                const bar = document.createElement('div');
+                bar.className = 'score-bar';
+                const barDense = document.createElement('div');
+                barDense.className = 'score-dense';
+                barDense.style.width = `${dsPct}%`;
+                const barBm25 = document.createElement('div');
+                barBm25.className = 'score-bm25';
+                barBm25.style.width = `${bsPct}%`;
+                bar.append(barDense, barBm25);
+
+                scoreContainer.append(labels, bar);
+                card.append(cardHeader, cardText, tagBadges, scoreContainer);
+                resultsArea.appendChild(card);
+            });
         }
 
-        // Simple highlighter
+        function escapeRegExp(str) {
+            return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        }
+
+        // Safe DOM-based highlighter (zero innerHTML interpolation, regex-escaped terms)
         function highlight(text, query) {
-            if (!text || !query) return text;
-            const terms = query.trim().split(/\s+/).filter(t => t.length > 2);
-            if (terms.length === 0) return text;
-            
-            let highlighted = text;
-            terms.forEach(term => {
-                const regex = new RegExp(`(${term})`, 'gi');
-                highlighted = highlighted.replace(regex, '<span style="color: var(--accent-blue); font-weight: bold; background: rgba(59, 130, 246, 0.1); border-radius: 2px; padding: 0 2px;">$1</span>');
-            });
-            return highlighted;
+            const frag = document.createDocumentFragment();
+            if (!text || !query) {
+                frag.appendChild(document.createTextNode(text || ''));
+                return frag;
+            }
+            const terms = query.trim().split(/\s+/).filter(t => t.length > 2).map(escapeRegExp);
+            if (terms.length === 0) {
+                frag.appendChild(document.createTextNode(text));
+                return frag;
+            }
+
+            const combined = new RegExp(`(${terms.join('|')})`, 'gi');
+            let lastIndex = 0;
+            let match;
+            while ((match = combined.exec(text)) !== null) {
+                if (match.index > lastIndex) {
+                    frag.appendChild(document.createTextNode(text.slice(lastIndex, match.index)));
+                }
+                const span = document.createElement('span');
+                span.style.cssText = 'color: var(--accent-blue); font-weight: bold; background: rgba(59, 130, 246, 0.1); border-radius: 2px; padding: 0 2px;';
+                span.textContent = match[0];
+                frag.appendChild(span);
+                lastIndex = combined.lastIndex;
+                if (match[0].length === 0) combined.lastIndex++;
+            }
+            if (lastIndex < text.length) {
+                frag.appendChild(document.createTextNode(text.slice(lastIndex)));
+            }
+            return frag;
         }
 
         // Event Listeners

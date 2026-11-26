@@ -22,8 +22,10 @@ pub struct ClusterCoordinator {
 
 impl ClusterCoordinator {
     pub fn new(node_id: &str, vnodes_per_node: usize) -> Self {
-        let mut ring = ConsistentHashRing::new(vnodes_per_node);
-        ring.add_node(node_id);
+        // Do NOT add the coordinator's own node_id to the hash ring.
+        // Only actual shard nodes should be ring members so that routing
+        // never lands on the coordinator itself (which holds no data).
+        let ring = ConsistentHashRing::new(vnodes_per_node);
 
         Self {
             node_id: node_id.to_string(),
@@ -67,7 +69,7 @@ impl ClusterCoordinator {
 
         {
             let ring = self.hash_ring.read().unwrap();
-            for (doc, vec) in documents.into_iter().zip(vectors.into_iter()) {
+            for (doc, vec) in documents.into_iter().zip(vectors) {
                 // Route by namespace if present (tenant-affinity), otherwise doc id
                 let routing_key = doc.namespace.as_deref().unwrap_or(&doc.id);
                 let target_shard = ring.get_node(routing_key).unwrap_or(&self.node_id).to_string();

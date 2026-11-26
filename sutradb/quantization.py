@@ -162,19 +162,23 @@ class PQCodebook:
     @classmethod
     def train(cls, vectors: Union[List[List[float]], np.ndarray], m: Optional[int] = None, k: int = 256, iters: int = 20, seed: int = 42) -> "PQCodebook":
         vecs = np.asarray(vectors, dtype=np.float32)
+        if vecs.ndim != 2 or vecs.shape[0] == 0 or vecs.shape[1] == 0:
+            raise ValueError("Training vectors must be a non-empty 2D array")
         n, dim = vecs.shape
-        effective_m = m or cls.suggest_m(dim)
+        effective_m = cls.suggest_m(dim) if m is None else int(m)
+        if effective_m <= 0 or effective_m > dim:
+            raise ValueError(f"M={effective_m} must be between 1 and vector dimension {dim}")
         if dim % effective_m != 0:
             raise ValueError(f"Vector dimension {dim} must be divisible by M={effective_m}")
 
         sub_dim = dim // effective_m
         k = min(k, n)
-        np.random.seed(seed)
+        rng = np.random.default_rng(seed)
 
         all_centroids = np.empty((effective_m, k, sub_dim), dtype=np.float32)
         for m_idx in range(effective_m):
             sub_vecs = vecs[:, m_idx * sub_dim : (m_idx + 1) * sub_dim]
-            init_indices = np.random.choice(n, size=k, replace=False)
+            init_indices = rng.choice(n, size=k, replace=False)
             centroids = sub_vecs[init_indices].copy()
 
             for _ in range(iters):

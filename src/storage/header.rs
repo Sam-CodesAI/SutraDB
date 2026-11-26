@@ -1,7 +1,9 @@
+use crc32fast::Hasher;
 use crate::error::SutraError;
 
 pub const HEADER_MAGIC_V2: &[u8; 8] = b"SUTRA\x02\x00\x00";
 pub const HEADER_MAGIC_V3: &[u8; 8] = b"SUTRA\x03\x00\x00";
+pub const HEADER_MAGIC_V4: &[u8; 8] = b"SUTRA\x04\x00\x00";
 pub const HEADER_SIZE: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +30,18 @@ impl SutraHeader {
         }
     }
 
+    pub fn new_v4(doc_count: u32, dimension: u32, metric: &str, metadata_length: u64, crc32: u32, quant_mode: u8) -> Self {
+        Self {
+            magic: *HEADER_MAGIC_V4,
+            doc_count,
+            dimension,
+            metric: metric.to_string(),
+            metadata_length,
+            crc32,
+            quant_mode,
+        }
+    }
+
     pub fn to_bytes(&self) -> [u8; HEADER_SIZE] {
         let mut buf = [0u8; HEADER_SIZE];
         buf[0..8].copy_from_slice(&self.magic);
@@ -43,7 +57,12 @@ impl SutraHeader {
         buf[32..40].copy_from_slice(&self.metadata_length.to_le_bytes());
         buf[40..44].copy_from_slice(&self.crc32.to_le_bytes());
         buf[44] = self.quant_mode;
-        // Remaining bytes 45..64 are 0 padding
+        // Store header CRC32 in bytes 45..49 for O(1) header integrity verification on lazy mmap open
+        let mut h_hasher = Hasher::new();
+        h_hasher.update(&buf[0..45]);
+        let header_crc = h_hasher.finalize();
+        buf[45..49].copy_from_slice(&header_crc.to_le_bytes());
+        // Remaining bytes 49..64 are 0 padding
         buf
     }
 
@@ -54,11 +73,24 @@ impl SutraHeader {
 
         let mut magic = [0u8; 8];
         magic.copy_from_slice(&buf[0..8]);
-        if magic != *HEADER_MAGIC_V2 && magic != *HEADER_MAGIC_V3 {
+        if magic != *HEADER_MAGIC_V2 && magic != *HEADER_MAGIC_V3 && magic != *HEADER_MAGIC_V4 {
             return Err(SutraError::InvalidHeader(format!(
                 "Invalid magic bytes: {:?}",
                 magic
             )));
+        }
+
+        let stored_header_crc = u32::from_le_bytes(buf[45..49].try_into().unwrap());
+        if stored_header_crc != 0 {
+            let mut h_hasher = Hasher::new();
+            h_hasher.update(&buf[0..45]);
+            let computed_header_crc = h_hasher.finalize();
+            if computed_header_crc != stored_header_crc {
+                return Err(SutraError::InvalidHeader(format!(
+                    "Header CRC32 checksum mismatch: expected {}, got {}",
+                    stored_header_crc, computed_header_crc
+                )));
+            }
         }
 
         let doc_count = u32::from_le_bytes(buf[8..12].try_into().unwrap());
@@ -71,6 +103,12 @@ impl SutraHeader {
         let metadata_length = u64::from_le_bytes(buf[32..40].try_into().unwrap());
         let crc32 = u32::from_le_bytes(buf[40..44].try_into().unwrap());
         let quant_mode = if magic == *HEADER_MAGIC_V2 { 0 } else { buf[44] };
+        if quant_mode != 0 && quant_mode != 1 {
+            return Err(SutraError::InvalidHeader(format!(
+                "Unsupported quant_mode: {}",
+                quant_mode
+            )));
+        }
 
         Ok(Self {
             magic,

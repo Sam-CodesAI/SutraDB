@@ -288,12 +288,12 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
     <!-- Navigation Tabs -->
     <div class="tabs">
-      <button class="tab-btn active" onclick="switchTab('playground')">⚡ Hybrid Query Lab</button>
-      <button class="tab-btn" onclick="switchTab('ingest')">📥 Ingestion & Batch Upsert</button>
-      <button class="tab-btn" onclick="switchTab('explorer')">🗂️ Document Explorer</button>
-      <button class="tab-btn" onclick="switchTab('visualizer')">📊 2D Vector Projection (PCA)</button>
-      <button class="tab-btn" onclick="switchTab('admin')">🛠️ Collection Administration</button>
-      <button class="tab-btn" onclick="switchTab('snippets')">💻 Client Code Snippets</button>
+      <button class="tab-btn active" onclick="switchTab('playground', event)">⚡ Hybrid Query Lab</button>
+      <button class="tab-btn" onclick="switchTab('ingest', event)">📥 Ingestion & Batch Upsert</button>
+      <button class="tab-btn" onclick="switchTab('explorer', event)">🗂️ Document Explorer</button>
+      <button class="tab-btn" onclick="switchTab('visualizer', event)">📊 2D Vector Projection (PCA)</button>
+      <button class="tab-btn" onclick="switchTab('admin', event)">🛠️ Collection Administration</button>
+      <button class="tab-btn" onclick="switchTab('snippets', event)">💻 Client Code Snippets</button>
     </div>
 
     <!-- Tab 1: Playground -->
@@ -320,9 +320,9 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
           <div class="form-group">
             <label>Hybrid Search Ratio (RRF / Linear)</label>
             <div class="slider-container">
-              <span style="font-size: 11px; color: var(--primary);">Dense (0.0)</span>
+              <span style="font-size: 11px; color: var(--accent);">Lexical (0.0)</span>
               <input type="range" id="hybridAlpha" min="0" max="1" step="0.1" value="0.5" oninput="updateAlphaLabel(this.value)">
-              <span style="font-size: 11px; color: var(--accent);">Lexical (1.0)</span>
+              <span style="font-size: 11px; color: var(--primary);">Dense (1.0)</span>
             </div>
             <div style="font-size: 11px; color: var(--text-muted); margin-top: 4px;" id="alphaLabel">Equal Balance (RRF Combined)</div>
           </div>
@@ -665,10 +665,10 @@ println!("Retrieved {} documents with <0.4ms round-trip latency!", response.into
       }
     }
 
-    function switchTab(tabId) {
+    function switchTab(tabId, evt) {
       document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
       document.querySelectorAll('.tab-pane').forEach(pane => pane.classList.remove('active'));
-      event.target.classList.add('active');
+      if (evt && evt.target) evt.target.classList.add('active');
       const activePane = document.getElementById('tab-' + tabId);
       if (activePane) activePane.classList.add('active');
 
@@ -682,9 +682,9 @@ println!("Retrieved {} documents with <0.4ms round-trip latency!", response.into
     function updateAlphaLabel(val) {
       const label = document.getElementById('alphaLabel');
       const v = parseFloat(val);
-      if (v === 0.0) label.textContent = '100% Dense Similarity (Pure Vector)';
-      else if (v === 1.0) label.textContent = '100% BM25 Lexical Score (Pure Keyword)';
-      else label.textContent = `Hybrid Reciprocal Rank Fusion (Alpha: ${v})`;
+      if (v === 0.0) label.textContent = '100% BM25 Lexical Score (Pure Keyword)';
+      else if (v === 1.0) label.textContent = '100% Dense Similarity (Pure Vector)';
+      else label.textContent = `Hybrid Linear Fusion (Alpha: ${v})`;
     }
 
     function generateRandomVector() {
@@ -767,31 +767,54 @@ println!("Retrieved {} documents with <0.4ms round-trip latency!", response.into
     function renderResults(results) {
       const container = document.getElementById('resultsContainer');
       document.getElementById('resultsCountBadge').textContent = `${results.length} results`;
+      container.replaceChildren();
 
       if (results.length === 0) {
-        container.innerHTML = '<div style="text-align: center; color: var(--text-muted); padding: 40px;">No matching documents found.</div>';
+        const empty = document.createElement('div');
+        empty.style.cssText = 'text-align: center; color: var(--text-muted); padding: 40px;';
+        empty.textContent = 'No matching documents found.';
+        container.appendChild(empty);
         return;
       }
 
-      let html = '';
       results.forEach((r, idx) => {
-        const score = typeof r.score === 'number' ? r.score.toFixed(4) : r.score;
-        const widthPct = Math.min(100, Math.max(10, (r.score || 0.5) * 100));
-        html += `
-          <div class="result-item">
-            <div class="result-header">
-              <span class="doc-id">#${idx + 1} • ${r.id}</span>
-              <span class="score-badge">Score: ${score}</span>
-            </div>
-            <div class="score-bar-bg">
-              <div class="score-bar-fill" style="width: ${widthPct}%"></div>
-            </div>
-            <div class="doc-text">${escapeHtml(r.text || '(No text content)')}</div>
-            <div class="meta-box">${escapeHtml(JSON.stringify(r.metadata || {}, null, 2))}</div>
-          </div>
-        `;
+        const score = typeof r.score === 'number' ? r.score.toFixed(4) : String(r.score ?? '');
+        const widthPct = Math.min(100, Math.max(10, (Number(r.score) || 0.5) * 100));
+
+        const item = document.createElement('div');
+        item.className = 'result-item';
+
+        const header = document.createElement('div');
+        header.className = 'result-header';
+
+        const docIdSpan = document.createElement('span');
+        docIdSpan.className = 'doc-id';
+        docIdSpan.textContent = `#${idx + 1} • ${String(r.id ?? '')}`;
+
+        const scoreBadge = document.createElement('span');
+        scoreBadge.className = 'score-badge';
+        scoreBadge.textContent = `Score: ${score}`;
+
+        header.append(docIdSpan, scoreBadge);
+
+        const barBg = document.createElement('div');
+        barBg.className = 'score-bar-bg';
+        const barFill = document.createElement('div');
+        barFill.className = 'score-bar-fill';
+        barFill.style.width = `${widthPct}%`;
+        barBg.appendChild(barFill);
+
+        const docText = document.createElement('div');
+        docText.className = 'doc-text';
+        docText.textContent = r.text || '(No text content)';
+
+        const metaBox = document.createElement('div');
+        metaBox.className = 'meta-box';
+        metaBox.textContent = JSON.stringify(r.metadata || {}, null, 2);
+
+        item.append(header, barBg, docText, metaBox);
+        container.appendChild(item);
       });
-      container.innerHTML = html;
     }
 
     /* Ingestion Workbench Functions */
@@ -904,28 +927,66 @@ println!("Retrieved {} documents with <0.4ms round-trip latency!", response.into
 
     function renderExplorerTable(docs) {
       const tbody = document.getElementById('explorerTableBody');
+      tbody.replaceChildren();
       if (docs.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: var(--text-muted); padding: 30px;">No documents in this collection.</td></tr>';
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 5;
+        td.style.cssText = 'text-align: center; color: var(--text-muted); padding: 30px;';
+        td.textContent = 'No documents in this collection.';
+        tr.appendChild(td);
+        tbody.appendChild(tr);
         return;
       }
-      let html = '';
       docs.forEach(doc => {
-        html += `
-          <tr>
-            <td><code style="color: var(--primary); font-family: var(--font-mono); font-size: 11px;">${escapeHtml(doc.id)}</code></td>
-            <td><span class="badge" style="font-size: 10px;">${escapeHtml(doc.namespace || 'default')}</span></td>
-            <td><div style="max-width: 320px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12px;">${escapeHtml(doc.text || '(empty)')}</div></td>
-            <td><pre style="margin: 0; font-size: 11px; max-width: 250px; overflow-x: auto; color: var(--text-muted);">${escapeHtml(JSON.stringify(doc.metadata || {}))}</pre></td>
-            <td>
-              <div style="display: flex; gap: 6px;">
-                <button style="padding: 4px 8px; font-size: 11px;" onclick="openPatchModal('${escapeHtml(doc.id)}', '${escapeHtml(JSON.stringify(doc.metadata || {}))}')">✏️ Edit</button>
-                <button class="btn-danger" style="padding: 4px 8px; font-size: 11px;" onclick="deleteDoc('${escapeHtml(doc.id)}')">🗑️</button>
-              </div>
-            </td>
-          </tr>
-        `;
+        const tr = document.createElement('tr');
+
+        const tdId = document.createElement('td');
+        const codeId = document.createElement('code');
+        codeId.style.cssText = 'color: var(--primary); font-family: var(--font-mono); font-size: 11px;';
+        codeId.textContent = String(doc.id ?? '');
+        tdId.appendChild(codeId);
+
+        const tdNs = document.createElement('td');
+        const nsBadge = document.createElement('span');
+        nsBadge.className = 'badge';
+        nsBadge.style.fontSize = '10px';
+        nsBadge.textContent = doc.namespace || 'default';
+        tdNs.appendChild(nsBadge);
+
+        const tdText = document.createElement('td');
+        const textDiv = document.createElement('div');
+        textDiv.style.cssText = 'max-width: 320px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12px;';
+        textDiv.textContent = doc.text || '(empty)';
+        tdText.appendChild(textDiv);
+
+        const tdMeta = document.createElement('td');
+        const metaPre = document.createElement('pre');
+        metaPre.style.cssText = 'margin: 0; font-size: 11px; max-width: 250px; overflow-x: auto; color: var(--text-muted);';
+        metaPre.textContent = JSON.stringify(doc.metadata || {});
+        tdMeta.appendChild(metaPre);
+
+        const tdActions = document.createElement('td');
+        const btnGroup = document.createElement('div');
+        btnGroup.style.cssText = 'display: flex; gap: 6px;';
+
+        const editBtn = document.createElement('button');
+        editBtn.style.cssText = 'padding: 4px 8px; font-size: 11px;';
+        editBtn.textContent = '✏️ Edit';
+        editBtn.addEventListener('click', () => openPatchModal(String(doc.id ?? ''), JSON.stringify(doc.metadata || {})));
+
+        const delBtn = document.createElement('button');
+        delBtn.className = 'btn-danger';
+        delBtn.style.cssText = 'padding: 4px 8px; font-size: 11px;';
+        delBtn.textContent = '🗑️';
+        delBtn.addEventListener('click', () => deleteDoc(String(doc.id ?? '')));
+
+        btnGroup.append(editBtn, delBtn);
+        tdActions.appendChild(btnGroup);
+
+        tr.append(tdId, tdNs, tdText, tdMeta, tdActions);
+        tbody.appendChild(tr);
       });
-      tbody.innerHTML = html;
     }
 
     function filterExplorerDocs() {
@@ -998,41 +1059,87 @@ println!("Retrieved {} documents with <0.4ms round-trip latency!", response.into
     /* Admin Tab Actions */
     function renderCollectionsTable() {
       const tbody = document.getElementById('collectionsTableBody');
+      tbody.replaceChildren();
       if (collections.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 30px;">No collections found. Click "+ Create Collection" above.</td></tr>';
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 7;
+        td.style.cssText = 'text-align: center; color: var(--text-muted); padding: 30px;';
+        td.textContent = 'No collections found. Click "+ Create Collection" above.';
+        tr.appendChild(td);
+        tbody.appendChild(tr);
         return;
       }
 
-      let html = '';
       collections.forEach(col => {
-        const optimizations = [];
-        if (col.has_hnsw) optimizations.push('<span class="badge badge-green">HNSW Graph</span>');
-        if (col.quantized_sq8) optimizations.push('<span class="badge" style="color: #60a5fa;">SQ8 (75%)</span>');
-        if (col.quantized_bq) optimizations.push('<span class="badge" style="color: #c084fc;">1-Bit BQ (32x)</span>');
-        if (col.quantized_pq) optimizations.push('<span class="badge" style="color: #f472b6;">PQ (64x)</span>');
-        if (optimizations.length === 0) optimizations.push('<span style="color: var(--text-muted); font-size: 11px;">FP32 Dense</span>');
+        const tr = document.createElement('tr');
 
-        html += `
-          <tr>
-            <td><b>${col.name}</b></td>
-            <td><code>${col.dimension}</code></td>
-            <td><code>${col.metric}</code></td>
-            <td>${col.count.toLocaleString()}</td>
-            <td>${col.enable_wal ? '✅ Active' : '❌ Disabled'}</td>
-            <td>${optimizations.join(' ')}</td>
-            <td>
-              <div style="display: flex; gap: 6px; flex-wrap: wrap;">
-                <button style="padding: 4px 8px; font-size: 11px;" onclick="triggerHNSW('${col.name}')">🚀 HNSW</button>
-                <button style="padding: 4px 8px; font-size: 11px;" onclick="triggerSQ8('${col.name}')">📦 SQ8</button>
-                <button style="padding: 4px 8px; font-size: 11px;" onclick="triggerBQ('${col.name}')">🛡️ BQ</button>
-                <button style="padding: 4px 8px; font-size: 11px;" onclick="triggerCompaction('${col.name}')">🧹 Compact</button>
-                <button class="btn-danger" style="padding: 4px 8px; font-size: 11px;" onclick="dropCollection('${col.name}')">🗑️ Drop</button>
-              </div>
-            </td>
-          </tr>
-        `;
+        const tdName = document.createElement('td');
+        const bName = document.createElement('b');
+        bName.textContent = String(col.name ?? '');
+        tdName.appendChild(bName);
+
+        const tdDim = document.createElement('td');
+        const cDim = document.createElement('code');
+        cDim.textContent = String(col.dimension ?? '');
+        tdDim.appendChild(cDim);
+
+        const tdMetric = document.createElement('td');
+        const cMetric = document.createElement('code');
+        cMetric.textContent = String(col.metric ?? '');
+        tdMetric.appendChild(cMetric);
+
+        const tdCount = document.createElement('td');
+        tdCount.textContent = Number(col.count || 0).toLocaleString();
+
+        const tdWal = document.createElement('td');
+        tdWal.textContent = col.enable_wal ? '✅ Active' : '❌ Disabled';
+
+        const tdOpt = document.createElement('td');
+        const addBadge = (text, cls, color) => {
+          const span = document.createElement('span');
+          span.className = cls;
+          if (color) span.style.color = color;
+          span.textContent = text;
+          tdOpt.appendChild(span);
+          tdOpt.appendChild(document.createTextNode(' '));
+        };
+        let hasOpt = false;
+        if (col.has_hnsw) { addBadge('HNSW Graph', 'badge badge-green', null); hasOpt = true; }
+        if (col.quantized_sq8) { addBadge('SQ8 (75%)', 'badge', '#60a5fa'); hasOpt = true; }
+        if (col.quantized_bq) { addBadge('1-Bit BQ (32x)', 'badge', '#c084fc'); hasOpt = true; }
+        if (col.quantized_pq) { addBadge('PQ (64x)', 'badge', '#f472b6'); hasOpt = true; }
+        if (!hasOpt) {
+          const span = document.createElement('span');
+          span.style.cssText = 'color: var(--text-muted); font-size: 11px;';
+          span.textContent = 'FP32 Dense';
+          tdOpt.appendChild(span);
+        }
+
+        const tdActions = document.createElement('td');
+        const btnWrap = document.createElement('div');
+        btnWrap.style.cssText = 'display: flex; gap: 6px; flex-wrap: wrap;';
+        const colName = String(col.name ?? '');
+        const mkBtn = (label, handler, isDanger = false) => {
+          const btn = document.createElement('button');
+          if (isDanger) btn.className = 'btn-danger';
+          btn.style.cssText = 'padding: 4px 8px; font-size: 11px;';
+          btn.textContent = label;
+          btn.addEventListener('click', () => handler(colName));
+          return btn;
+        };
+        btnWrap.append(
+          mkBtn('🚀 HNSW', triggerHNSW),
+          mkBtn('📦 SQ8', triggerSQ8),
+          mkBtn('🛡️ BQ', triggerBQ),
+          mkBtn('🧹 Compact', triggerCompaction),
+          mkBtn('🗑️ Drop', dropCollection, true)
+        );
+        tdActions.appendChild(btnWrap);
+
+        tr.append(tdName, tdDim, tdMetric, tdCount, tdWal, tdOpt, tdActions);
+        tbody.appendChild(tr);
       });
-      tbody.innerHTML = html;
     }
 
     async function triggerHNSW(name) {
@@ -1104,20 +1211,77 @@ println!("Retrieved {} documents with <0.4ms round-trip latency!", response.into
           return;
         }
 
-        sampleVectors = pts.map((p, idx) => {
+        const dim = (pts[0].vector || []).length;
+        const nPts = pts.length;
+        // Center vectors for true 2D PCA via Gram matrix (N x N) power iteration
+        const mean = new Array(dim).fill(0);
+        for (let idx = 0; idx < nPts; idx++) {
+          const v = pts[idx].vector || [];
+          for (let d = 0; d < dim; d++) mean[d] += (v[d] || 0);
+        }
+        for (let d = 0; d < dim; d++) mean[d] /= nPts;
+
+        const centered = pts.map(p => {
           const v = p.vector || [];
-          let x = 0, y = 0;
-          for (let i = 0; i < v.length; i++) {
-            x += v[i] * Math.cos(i);
-            y += v[i] * Math.sin(i);
-          }
-          return {
-            id: p.id,
-            text: p.text || '',
-            px: canvas.width / 2 + x * 35,
-            py: canvas.height / 2 + y * 35,
-          };
+          const row = new Array(dim);
+          for (let d = 0; d < dim; d++) row[d] = (v[d] || 0) - mean[d];
+          return row;
         });
+
+        const gram = Array.from({ length: nPts }, () => new Array(nPts).fill(0));
+        for (let r = 0; r < nPts; r++) {
+          for (let c = r; c < nPts; c++) {
+            let dot = 0;
+            for (let d = 0; d < dim; d++) dot += centered[r][d] * centered[c][d];
+            gram[r][c] = dot;
+            gram[c][r] = dot;
+          }
+        }
+
+        function topEigenvector(mat, size, ortho) {
+          let vec = Array.from({ length: size }, (_, k) => ((k % 5) + 1) / size);
+          const normInit = Math.hypot(...vec) || 1;
+          vec = vec.map(x => x / normInit);
+          for (let iter = 0; iter < 30; iter++) {
+            const next = new Array(size).fill(0);
+            for (let r = 0; r < size; r++) {
+              let sum = 0;
+              for (let c = 0; c < size; c++) sum += mat[r][c] * vec[c];
+              next[r] = sum;
+            }
+            if (ortho) {
+              let proj = 0;
+              for (let r = 0; r < size; r++) proj += next[r] * ortho[r];
+              for (let r = 0; r < size; r++) next[r] -= proj * ortho[r];
+            }
+            const norm = Math.hypot(...next);
+            if (norm < 1e-12) break;
+            for (let r = 0; r < size; r++) vec[r] = next[r] / norm;
+          }
+          let rayleigh = 0;
+          for (let r = 0; r < size; r++) {
+            let rowDot = 0;
+            for (let c = 0; c < size; c++) rowDot += mat[r][c] * vec[c];
+            rayleigh += vec[r] * rowDot;
+          }
+          const scale = Math.sqrt(Math.max(0, rayleigh));
+          return { dir: vec, coords: vec.map(x => x * scale) };
+        }
+
+        const pc1 = topEigenvector(gram, nPts, null);
+        const pc2 = topEigenvector(gram, nPts, pc1.dir);
+        let maxAbs = 1e-6;
+        for (let idx = 0; idx < nPts; idx++) {
+          maxAbs = Math.max(maxAbs, Math.abs(pc1.coords[idx]), Math.abs(pc2.coords[idx]));
+        }
+        const plotScale = (Math.min(canvas.width, canvas.height) * 0.38) / maxAbs;
+
+        sampleVectors = pts.map((p, idx) => ({
+          id: p.id,
+          text: p.text || '',
+          px: canvas.width / 2 + pc1.coords[idx] * plotScale,
+          py: canvas.height / 2 + pc2.coords[idx] * plotScale,
+        }));
 
         sampleVectors.forEach(pt => {
           ctx.beginPath();

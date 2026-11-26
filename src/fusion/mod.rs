@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct FusedCandidate {
@@ -9,6 +9,15 @@ pub struct FusedCandidate {
     pub bm25_score: f32,
     pub sparse_score: f32,
     pub colbert_score: f32,
+}
+
+#[inline]
+fn sanitize_finite(val: f32) -> f32 {
+    if val.is_finite() {
+        val
+    } else {
+        0.0
+    }
 }
 
 /// Candidate-pruned Reciprocal Rank Fusion (RRF).
@@ -40,9 +49,10 @@ pub fn reciprocal_rank_fusion(
     // Candidate bound M = min(top_k * 4, 200)
     let m_bound = (top_k * 4).min(200);
 
-    // 1. Top dense candidates
+    // 1. Top dense candidates (finite scores only so un-reranked -inf docs are excluded)
     let mut dense_pairs: Vec<(usize, f32)> = valid_indices
         .iter()
+        .filter(|&&i| dense_scores[i].is_finite())
         .map(|&i| (i, dense_scores[i]))
         .collect();
 
@@ -56,7 +66,7 @@ pub fn reciprocal_rank_fusion(
             dense_ranks.insert(idx, rank + 1);
         }
     }
-    // If all candidate dense scores are non-positive (e.g. opposing cosine), award rank to all candidates
+    // If all candidate dense scores are non-positive (e.g. opposing cosine), award rank to all finite candidates
     if dense_ranks.is_empty() && !top_dense.is_empty() {
         for (rank, &(idx, _)) in top_dense.iter().enumerate() {
             dense_ranks.insert(idx, rank + 1);
@@ -66,7 +76,7 @@ pub fn reciprocal_rank_fusion(
     // 2. Top BM25 candidates (strictly positive scores)
     let mut bm25_pairs: Vec<(usize, f32)> = valid_indices
         .iter()
-        .filter(|&&i| bm25_scores[i] > 0.0)
+        .filter(|&&i| bm25_scores[i].is_finite() && bm25_scores[i] > 0.0)
         .map(|&i| (i, bm25_scores[i]))
         .collect();
 
@@ -79,15 +89,16 @@ pub fn reciprocal_rank_fusion(
         bm25_ranks.insert(idx, rank + 1);
     }
 
-    // 3. Candidate union
-    let mut union_set = Vec::new();
+    // 3. Candidate union (O(n) HashSet deduplication)
+    let mut union_set = Vec::with_capacity(top_dense.len() + top_bm25.len());
+    let mut seen = HashSet::with_capacity(top_dense.len() + top_bm25.len());
     for &(idx, _) in top_dense {
-        if !union_set.contains(&idx) {
+        if seen.insert(idx) {
             union_set.push(idx);
         }
     }
     for &(idx, _) in top_bm25 {
-        if !union_set.contains(&idx) {
+        if seen.insert(idx) {
             union_set.push(idx);
         }
     }
@@ -108,8 +119,8 @@ pub fn reciprocal_rank_fusion(
         candidates.push(FusedCandidate {
             doc_idx,
             score,
-            dense_score: dense_scores[doc_idx],
-            bm25_score: bm25_scores[doc_idx],
+            dense_score: sanitize_finite(dense_scores[doc_idx]),
+            bm25_score: sanitize_finite(bm25_scores[doc_idx]),
             sparse_score: 0.0,
             colbert_score: 0.0,
         });
@@ -157,27 +168,57 @@ pub fn linear_score_fusion(
 
     for &i in &valid_indices {
         let d = dense_scores[i];
+        if d.is_finite() {
+            if d < d_min {
+                d_min = d;
+            }
+            if d > d_max {
+                d_max = d;
+            }
+        }
         let b = bm25_scores[i];
-        if d < d_min { d_min = d; }
-        if d > d_max { d_max = d; }
-        if b < b_min { b_min = b; }
-        if b > b_max { b_max = b; }
+        if b.is_finite() {
+            if b < b_min {
+                b_min = b;
+            }
+            if b > b_max {
+                b_max = b;
+            }
+        }
     }
 
-    let d_range = (d_max - d_min).max(1e-12);
-    let b_range = (b_max - b_min).max(1e-12);
+    let d_range = if d_max > d_min { (d_max - d_min).max(1e-12) } else { 1.0 };
+    let b_range = if b_max > b_min { (b_max - b_min).max(1e-12) } else { 1.0 };
 
     let mut scored: Vec<FusedCandidate> = valid_indices
         .iter()
         .map(|&i| {
-            let d_norm = if d_max > d_min { (dense_scores[i] - d_min) / d_range } else { 1.0 };
-            let b_norm = if b_max > b_min { (bm25_scores[i] - b_min) / b_range } else { 0.0 };
+            let d = dense_scores[i];
+            let d_norm = if !d.is_finite() {
+                0.0
+            } else if d_max > d_min {
+                (d - d_min) / d_range
+            } else if d_min.is_finite() {
+                1.0
+            } else {
+                0.0
+            };
+
+            let b = bm25_scores[i];
+            let b_norm = if !b.is_finite() {
+                0.0
+            } else if b_max > b_min {
+                (b - b_min) / b_range
+            } else {
+                0.0
+            };
+
             let score = alpha * d_norm + (1.0 - alpha) * b_norm;
             FusedCandidate {
                 doc_idx: i,
                 score,
-                dense_score: dense_scores[i],
-                bm25_score: bm25_scores[i],
+                dense_score: sanitize_finite(d),
+                bm25_score: sanitize_finite(b),
                 sparse_score: 0.0,
                 colbert_score: 0.0,
             }
@@ -190,6 +231,7 @@ pub fn linear_score_fusion(
 }
 
 /// Tri-modal Reciprocal Rank Fusion (RRF) across Dense + BM25 + Neural Sparse vectors.
+#[allow(clippy::too_many_arguments)]
 pub fn tri_modal_reciprocal_rank_fusion(
     dense_scores: &[f32],
     bm25_scores: &[f32],
@@ -217,8 +259,12 @@ pub fn tri_modal_reciprocal_rank_fusion(
 
     let m_bound = (top_k * 4).min(200);
 
-    // 1. Dense ranks
-    let mut dense_pairs: Vec<(usize, f32)> = valid_indices.iter().map(|&i| (i, dense_scores[i])).collect();
+    // 1. Dense ranks (finite scores only)
+    let mut dense_pairs: Vec<(usize, f32)> = valid_indices
+        .iter()
+        .filter(|&&i| dense_scores[i].is_finite())
+        .map(|&i| (i, dense_scores[i]))
+        .collect();
     dense_pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
     let k_dense = m_bound.min(dense_pairs.len());
     let top_dense = &dense_pairs[..k_dense];
@@ -238,7 +284,7 @@ pub fn tri_modal_reciprocal_rank_fusion(
     // 2. BM25 ranks
     let mut bm25_pairs: Vec<(usize, f32)> = valid_indices
         .iter()
-        .filter(|&&i| bm25_scores[i] > 0.0)
+        .filter(|&&i| bm25_scores[i].is_finite() && bm25_scores[i] > 0.0)
         .map(|&i| (i, bm25_scores[i]))
         .collect();
     bm25_pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
@@ -253,7 +299,7 @@ pub fn tri_modal_reciprocal_rank_fusion(
     // 3. Sparse ranks
     let mut sparse_pairs: Vec<(usize, f32)> = valid_indices
         .iter()
-        .filter(|&&i| sparse_scores[i] > 0.0)
+        .filter(|&&i| sparse_scores[i].is_finite() && sparse_scores[i] > 0.0)
         .map(|&i| (i, sparse_scores[i]))
         .collect();
     sparse_pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
@@ -265,20 +311,22 @@ pub fn tri_modal_reciprocal_rank_fusion(
         sparse_ranks.insert(idx, rank + 1);
     }
 
-    // 4. Candidate union
-    let mut union_set = Vec::new();
+    // 4. Candidate union (O(n) HashSet deduplication)
+    let cap = top_dense.len() + top_bm25.len() + top_sparse.len();
+    let mut union_set = Vec::with_capacity(cap);
+    let mut seen = HashSet::with_capacity(cap);
     for &(idx, _) in top_dense {
-        if !union_set.contains(&idx) {
+        if seen.insert(idx) {
             union_set.push(idx);
         }
     }
     for &(idx, _) in top_bm25 {
-        if !union_set.contains(&idx) {
+        if seen.insert(idx) {
             union_set.push(idx);
         }
     }
     for &(idx, _) in top_sparse {
-        if !union_set.contains(&idx) {
+        if seen.insert(idx) {
             union_set.push(idx);
         }
     }
@@ -302,9 +350,9 @@ pub fn tri_modal_reciprocal_rank_fusion(
         candidates.push(FusedCandidate {
             doc_idx,
             score,
-            dense_score: dense_scores[doc_idx],
-            bm25_score: bm25_scores[doc_idx],
-            sparse_score: sparse_scores[doc_idx],
+            dense_score: sanitize_finite(dense_scores[doc_idx]),
+            bm25_score: sanitize_finite(bm25_scores[doc_idx]),
+            sparse_score: sanitize_finite(sparse_scores[doc_idx]),
             colbert_score: 0.0,
         });
     }
@@ -321,6 +369,7 @@ pub fn tri_modal_reciprocal_rank_fusion(
 }
 
 /// Quad-modal Reciprocal Rank Fusion (RRF) across Dense + BM25 + Neural Sparse + ColBERT MaxSim.
+#[allow(clippy::too_many_arguments)]
 pub fn quad_modal_reciprocal_rank_fusion(
     dense_scores: &[f32],
     bm25_scores: &[f32],
@@ -350,8 +399,12 @@ pub fn quad_modal_reciprocal_rank_fusion(
 
     let m_bound = (top_k * 4).min(200);
 
-    // 1. Dense ranks
-    let mut dense_pairs: Vec<(usize, f32)> = valid_indices.iter().map(|&i| (i, dense_scores[i])).collect();
+    // 1. Dense ranks (finite scores only)
+    let mut dense_pairs: Vec<(usize, f32)> = valid_indices
+        .iter()
+        .filter(|&&i| dense_scores[i].is_finite())
+        .map(|&i| (i, dense_scores[i]))
+        .collect();
     dense_pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
     let k_dense = m_bound.min(dense_pairs.len());
     let top_dense = &dense_pairs[..k_dense];
@@ -371,7 +424,7 @@ pub fn quad_modal_reciprocal_rank_fusion(
     // 2. BM25 ranks
     let mut bm25_pairs: Vec<(usize, f32)> = valid_indices
         .iter()
-        .filter(|&&i| bm25_scores[i] > 0.0)
+        .filter(|&&i| bm25_scores[i].is_finite() && bm25_scores[i] > 0.0)
         .map(|&i| (i, bm25_scores[i]))
         .collect();
     bm25_pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
@@ -386,7 +439,7 @@ pub fn quad_modal_reciprocal_rank_fusion(
     // 3. Sparse ranks
     let mut sparse_pairs: Vec<(usize, f32)> = valid_indices
         .iter()
-        .filter(|&&i| sparse_scores[i] > 0.0)
+        .filter(|&&i| sparse_scores[i].is_finite() && sparse_scores[i] > 0.0)
         .map(|&i| (i, sparse_scores[i]))
         .collect();
     sparse_pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
@@ -401,7 +454,7 @@ pub fn quad_modal_reciprocal_rank_fusion(
     // 4. ColBERT MaxSim ranks
     let mut colbert_pairs: Vec<(usize, f32)> = valid_indices
         .iter()
-        .filter(|&&i| colbert_scores[i] > 0.0)
+        .filter(|&&i| colbert_scores[i].is_finite() && colbert_scores[i] > 0.0)
         .map(|&i| (i, colbert_scores[i]))
         .collect();
     colbert_pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
@@ -413,25 +466,27 @@ pub fn quad_modal_reciprocal_rank_fusion(
         colbert_ranks.insert(idx, rank + 1);
     }
 
-    // 5. Candidate union
-    let mut union_set = Vec::new();
+    // 5. Candidate union (O(n) HashSet deduplication)
+    let cap = top_dense.len() + top_bm25.len() + top_sparse.len() + top_colbert.len();
+    let mut union_set = Vec::with_capacity(cap);
+    let mut seen = HashSet::with_capacity(cap);
     for &(idx, _) in top_dense {
-        if !union_set.contains(&idx) {
+        if seen.insert(idx) {
             union_set.push(idx);
         }
     }
     for &(idx, _) in top_bm25 {
-        if !union_set.contains(&idx) {
+        if seen.insert(idx) {
             union_set.push(idx);
         }
     }
     for &(idx, _) in top_sparse {
-        if !union_set.contains(&idx) {
+        if seen.insert(idx) {
             union_set.push(idx);
         }
     }
     for &(idx, _) in top_colbert {
-        if !union_set.contains(&idx) {
+        if seen.insert(idx) {
             union_set.push(idx);
         }
     }
@@ -458,10 +513,10 @@ pub fn quad_modal_reciprocal_rank_fusion(
         candidates.push(FusedCandidate {
             doc_idx,
             score,
-            dense_score: dense_scores[doc_idx],
-            bm25_score: bm25_scores[doc_idx],
-            sparse_score: sparse_scores[doc_idx],
-            colbert_score: colbert_scores[doc_idx],
+            dense_score: sanitize_finite(dense_scores[doc_idx]),
+            bm25_score: sanitize_finite(bm25_scores[doc_idx]),
+            sparse_score: sanitize_finite(sparse_scores[doc_idx]),
+            colbert_score: sanitize_finite(colbert_scores[doc_idx]),
         });
     }
 

@@ -474,9 +474,13 @@ class PlaygroundHandler(BaseHTTPRequestHandler):
             self._serve_static(STATIC_DIR / "index.html")
             return
 
-        # Other static files
+        # Other static files — resolve and confine to STATIC_DIR
         safe_path = path.lstrip("/")
-        self._serve_static(STATIC_DIR / safe_path)
+        resolved = (STATIC_DIR / safe_path).resolve()
+        if not str(resolved).startswith(str(STATIC_DIR.resolve())):
+            self.send_error(403, "Forbidden: path traversal detected")
+            return
+        self._serve_static(resolved)
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
@@ -577,7 +581,7 @@ def main() -> None:
     print("  ╔══════════════════════════════════════════════════╗")
     print("  ║      ⚡ SutraSearch Playground                   ║")
     print("  ║      Hybrid Vector + BM25 Search Engine          ║")
-    print("  ║      Powered by SutraDB v2.0                     ║")
+    print("  ║      Powered by SutraDB v5.1.0                    ║")
     print("  ╚══════════════════════════════════════════════════╝")
     print()
 

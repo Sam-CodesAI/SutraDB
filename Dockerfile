@@ -1,12 +1,32 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # SutraDB v5.1.0 Industrial Hardened Production Dockerfile
-# Conforms strictly to supply-chain hardening standards:
-# - Unprivileged non-root service execution (UID 10001:10001)
-# - No compilers or build toolchains in production runtime
-# - Dual binary gRPC (50051) + REST/Workbench (8765) runtime
-# - Minimal attack surface based on python:3.12-slim
+# Multi-stage build: Rust builder compiles the gRPC binary + Python wheel,
+# then copies only artifacts into the production runner.
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── Stage 1: Rust builder ────────────────────────────────────────────────────
+FROM rust:1.82-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --break-system-packages maturin
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY src/ src/
+COPY proto/ proto/
+
+# Build the standalone gRPC server binary (release)
+RUN cargo build --release --bin sutradb-server
+
+# Build the Python extension wheel
+COPY pyproject.toml README.md ./
+COPY sutradb/ sutradb/
+RUN maturin build --release --out /wheels
+
+# ── Stage 2: Production runner ───────────────────────────────────────────────
 FROM python:3.12-slim AS runner
 
 ENV PYTHONUNBUFFERED=1 \
@@ -24,12 +44,12 @@ RUN groupadd -g 10001 nonroot && \
 
 WORKDIR /app
 
-# Copy pre-compiled standalone binary gRPC server
-COPY dist/bin/sutradb-server /usr/local/bin/sutradb-server
+# Copy binary from builder
+COPY --from=builder /build/target/release/sutradb-server /usr/local/bin/sutradb-server
 
-# Copy pre-compiled release wheel and install runtime dependencies
-COPY dist/wheels /wheels
-RUN pip install --no-cache-dir --no-index --find-links=/wheels /wheels/sutradb_core*.whl && \
+# Copy and install wheel from builder
+COPY --from=builder /wheels /wheels
+RUN pip install --no-cache-dir /wheels/sutradb_core*.whl && \
     rm -rf /wheels
 
 # Copy operational scripts
@@ -43,7 +63,7 @@ RUN mkdir -p /data /app && chown -R nonroot:nonroot /data /app
 # Switch to unprivileged non-root user
 USER 10001:10001
 
-# Expose gRPC port (50051) and REST/Workbench port (8765)
+# Expose gRPC port (50051) and REST/HTTP Bridge port (8765)
 EXPOSE 50051 8765
 
 VOLUME ["/data"]

@@ -290,7 +290,7 @@ def run_benchmark(
 
             t0 = time.perf_counter()
             col.insert(docs)
-            col.build_hnsw(m=16, ef_construction=64, ef_search=32)
+            col.build_hnsw(m=32, ef_construction=200, ef_search=160)
             ingest_time = time.perf_counter() - t0
             ram_peak = measure_memory_mb()
 

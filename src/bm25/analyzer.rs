@@ -183,7 +183,7 @@ pub fn split_identifier(s: &str) -> Vec<String> {
     tokens.push(s.to_string());
 
     // Split on delimiters '_' and '-'
-    let parts: Vec<&str> = s.split(|c| c == '_' || c == '-').filter(|p| !p.is_empty()).collect();
+    let parts: Vec<&str> = s.split(['_', '-']).filter(|p| !p.is_empty()).collect();
     for part in parts {
         let chars: Vec<char> = part.chars().collect();
         if chars.is_empty() {

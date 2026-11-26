@@ -1,11 +1,8 @@
 use super::Metric;
 use crate::error::SutraError;
 
-/// Computes the dot product of two single-precision float slices.
-/// Uses 8-way loop unrolling to maximize CPU pipeline throughput and enable SIMD FMA vectorization.
-#[inline]
-pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
-    assert_eq!(a.len(), b.len(), "Slices must have equal length for dot product");
+#[inline(always)]
+fn dot_product_scalar(a: &[f32], b: &[f32]) -> f32 {
     let len = a.len();
     let mut sum0 = 0.0f32;
     let mut sum1 = 0.0f32;
@@ -40,14 +37,11 @@ pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
             total += a.get_unchecked(base + i) * b.get_unchecked(base + i);
         }
     }
-
     total
 }
 
-/// Computes squared Euclidean distance ||a - b||^2 using 8-way unrolling.
-#[inline]
-pub fn euclidean_distance_squared(a: &[f32], b: &[f32]) -> f32 {
-    assert_eq!(a.len(), b.len(), "Slices must have equal length for Euclidean distance");
+#[inline(always)]
+fn euclidean_distance_squared_scalar(a: &[f32], b: &[f32]) -> f32 {
     let len = a.len();
     let mut sum0 = 0.0f32;
     let mut sum1 = 0.0f32;
@@ -92,8 +86,322 @@ pub fn euclidean_distance_squared(a: &[f32], b: &[f32]) -> f32 {
             total += d * d;
         }
     }
-
     total
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn hsum_m256(v: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    let hi = _mm256_extractf128_ps(v, 1);
+    let lo = _mm256_castps256_ps128(v);
+    let sum128 = _mm_add_ps(lo, hi);
+    let hi64 = _mm_movehl_ps(sum128, sum128);
+    let sum64 = _mm_add_ps(sum128, hi64);
+    let hi32 = _mm_shuffle_ps(sum64, sum64, 0x55);
+    _mm_cvtss_f32(_mm_add_ss(sum64, hi32))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_product_avx2(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let len = a.len();
+    let pa = a.as_ptr();
+    let pb = b.as_ptr();
+
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
+
+    let mut i = 0usize;
+    while i + 32 <= len {
+        let a0 = _mm256_loadu_ps(pa.add(i));
+        let b0 = _mm256_loadu_ps(pb.add(i));
+        let a1 = _mm256_loadu_ps(pa.add(i + 8));
+        let b1 = _mm256_loadu_ps(pb.add(i + 8));
+        let a2 = _mm256_loadu_ps(pa.add(i + 16));
+        let b2 = _mm256_loadu_ps(pb.add(i + 16));
+        let a3 = _mm256_loadu_ps(pa.add(i + 24));
+        let b3 = _mm256_loadu_ps(pb.add(i + 24));
+
+        acc0 = _mm256_fmadd_ps(a0, b0, acc0);
+        acc1 = _mm256_fmadd_ps(a1, b1, acc1);
+        acc2 = _mm256_fmadd_ps(a2, b2, acc2);
+        acc3 = _mm256_fmadd_ps(a3, b3, acc3);
+        i += 32;
+    }
+
+    while i + 8 <= len {
+        let va = _mm256_loadu_ps(pa.add(i));
+        let vb = _mm256_loadu_ps(pb.add(i));
+        acc0 = _mm256_fmadd_ps(va, vb, acc0);
+        i += 8;
+    }
+
+    let combined = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+    let mut total = hsum_m256(combined);
+    while i < len {
+        total += *pa.add(i) * *pb.add(i);
+        i += 1;
+    }
+    total
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn dot_product_avx512(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let len = a.len();
+    let pa = a.as_ptr();
+    let pb = b.as_ptr();
+
+    let mut acc0 = _mm512_setzero_ps();
+    let mut acc1 = _mm512_setzero_ps();
+    let mut acc2 = _mm512_setzero_ps();
+    let mut acc3 = _mm512_setzero_ps();
+
+    let mut i = 0usize;
+    while i + 64 <= len {
+        let a0 = _mm512_loadu_ps(pa.add(i));
+        let b0 = _mm512_loadu_ps(pb.add(i));
+        let a1 = _mm512_loadu_ps(pa.add(i + 16));
+        let b1 = _mm512_loadu_ps(pb.add(i + 16));
+        let a2 = _mm512_loadu_ps(pa.add(i + 32));
+        let b2 = _mm512_loadu_ps(pb.add(i + 32));
+        let a3 = _mm512_loadu_ps(pa.add(i + 48));
+        let b3 = _mm512_loadu_ps(pb.add(i + 48));
+
+        acc0 = _mm512_fmadd_ps(a0, b0, acc0);
+        acc1 = _mm512_fmadd_ps(a1, b1, acc1);
+        acc2 = _mm512_fmadd_ps(a2, b2, acc2);
+        acc3 = _mm512_fmadd_ps(a3, b3, acc3);
+        i += 64;
+    }
+
+    while i + 16 <= len {
+        let va = _mm512_loadu_ps(pa.add(i));
+        let vb = _mm512_loadu_ps(pb.add(i));
+        acc0 = _mm512_fmadd_ps(va, vb, acc0);
+        i += 16;
+    }
+
+    let combined = _mm512_add_ps(_mm512_add_ps(acc0, acc1), _mm512_add_ps(acc2, acc3));
+    let mut total = _mm512_reduce_add_ps(combined);
+    while i < len {
+        total += *pa.add(i) * *pb.add(i);
+        i += 1;
+    }
+    total
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn euclidean_distance_squared_avx2(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let len = a.len();
+    let pa = a.as_ptr();
+    let pb = b.as_ptr();
+
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
+
+    let mut i = 0usize;
+    while i + 32 <= len {
+        let d0 = _mm256_sub_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)));
+        let d1 = _mm256_sub_ps(_mm256_loadu_ps(pa.add(i + 8)), _mm256_loadu_ps(pb.add(i + 8)));
+        let d2 = _mm256_sub_ps(_mm256_loadu_ps(pa.add(i + 16)), _mm256_loadu_ps(pb.add(i + 16)));
+        let d3 = _mm256_sub_ps(_mm256_loadu_ps(pa.add(i + 24)), _mm256_loadu_ps(pb.add(i + 24)));
+
+        acc0 = _mm256_fmadd_ps(d0, d0, acc0);
+        acc1 = _mm256_fmadd_ps(d1, d1, acc1);
+        acc2 = _mm256_fmadd_ps(d2, d2, acc2);
+        acc3 = _mm256_fmadd_ps(d3, d3, acc3);
+        i += 32;
+    }
+
+    while i + 8 <= len {
+        let d = _mm256_sub_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)));
+        acc0 = _mm256_fmadd_ps(d, d, acc0);
+        i += 8;
+    }
+
+    let combined = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+    let mut total = hsum_m256(combined);
+    while i < len {
+        let d = *pa.add(i) - *pb.add(i);
+        total += d * d;
+        i += 1;
+    }
+    total
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn euclidean_distance_squared_avx512(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let len = a.len();
+    let pa = a.as_ptr();
+    let pb = b.as_ptr();
+
+    let mut acc0 = _mm512_setzero_ps();
+    let mut acc1 = _mm512_setzero_ps();
+    let mut acc2 = _mm512_setzero_ps();
+    let mut acc3 = _mm512_setzero_ps();
+
+    let mut i = 0usize;
+    while i + 64 <= len {
+        let d0 = _mm512_sub_ps(_mm512_loadu_ps(pa.add(i)), _mm512_loadu_ps(pb.add(i)));
+        let d1 = _mm512_sub_ps(_mm512_loadu_ps(pa.add(i + 16)), _mm512_loadu_ps(pb.add(i + 16)));
+        let d2 = _mm512_sub_ps(_mm512_loadu_ps(pa.add(i + 32)), _mm512_loadu_ps(pb.add(i + 32)));
+        let d3 = _mm512_sub_ps(_mm512_loadu_ps(pa.add(i + 48)), _mm512_loadu_ps(pb.add(i + 48)));
+
+        acc0 = _mm512_fmadd_ps(d0, d0, acc0);
+        acc1 = _mm512_fmadd_ps(d1, d1, acc1);
+        acc2 = _mm512_fmadd_ps(d2, d2, acc2);
+        acc3 = _mm512_fmadd_ps(d3, d3, acc3);
+        i += 64;
+    }
+
+    while i + 16 <= len {
+        let d = _mm512_sub_ps(_mm512_loadu_ps(pa.add(i)), _mm512_loadu_ps(pb.add(i)));
+        acc0 = _mm512_fmadd_ps(d, d, acc0);
+        i += 16;
+    }
+
+    let combined = _mm512_add_ps(_mm512_add_ps(acc0, acc1), _mm512_add_ps(acc2, acc3));
+    let mut total = _mm512_reduce_add_ps(combined);
+    while i < len {
+        let d = *pa.add(i) - *pb.add(i);
+        total += d * d;
+        i += 1;
+    }
+    total
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn dot_product_neon(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    let len = a.len();
+    let pa = a.as_ptr();
+    let pb = b.as_ptr();
+
+    let mut acc0 = vdupq_n_f32(0.0);
+    let mut acc1 = vdupq_n_f32(0.0);
+    let mut acc2 = vdupq_n_f32(0.0);
+    let mut acc3 = vdupq_n_f32(0.0);
+
+    let mut i = 0usize;
+    while i + 16 <= len {
+        acc0 = vfmaq_f32(acc0, vld1q_f32(pa.add(i)), vld1q_f32(pb.add(i)));
+        acc1 = vfmaq_f32(acc1, vld1q_f32(pa.add(i + 4)), vld1q_f32(pb.add(i + 4)));
+        acc2 = vfmaq_f32(acc2, vld1q_f32(pa.add(i + 8)), vld1q_f32(pb.add(i + 8)));
+        acc3 = vfmaq_f32(acc3, vld1q_f32(pa.add(i + 12)), vld1q_f32(pb.add(i + 12)));
+        i += 16;
+    }
+    while i + 4 <= len {
+        acc0 = vfmaq_f32(acc0, vld1q_f32(pa.add(i)), vld1q_f32(pb.add(i)));
+        i += 4;
+    }
+
+    let combined = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+    let mut total = vaddvq_f32(combined);
+    while i < len {
+        total += *pa.add(i) * *pb.add(i);
+        i += 1;
+    }
+    total
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn euclidean_distance_squared_neon(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    let len = a.len();
+    let pa = a.as_ptr();
+    let pb = b.as_ptr();
+
+    let mut acc0 = vdupq_n_f32(0.0);
+    let mut acc1 = vdupq_n_f32(0.0);
+    let mut acc2 = vdupq_n_f32(0.0);
+    let mut acc3 = vdupq_n_f32(0.0);
+
+    let mut i = 0usize;
+    while i + 16 <= len {
+        let d0 = vsubq_f32(vld1q_f32(pa.add(i)), vld1q_f32(pb.add(i)));
+        let d1 = vsubq_f32(vld1q_f32(pa.add(i + 4)), vld1q_f32(pb.add(i + 4)));
+        let d2 = vsubq_f32(vld1q_f32(pa.add(i + 8)), vld1q_f32(pb.add(i + 8)));
+        let d3 = vsubq_f32(vld1q_f32(pa.add(i + 12)), vld1q_f32(pb.add(i + 12)));
+        acc0 = vfmaq_f32(acc0, d0, d0);
+        acc1 = vfmaq_f32(acc1, d1, d1);
+        acc2 = vfmaq_f32(acc2, d2, d2);
+        acc3 = vfmaq_f32(acc3, d3, d3);
+        i += 16;
+    }
+    while i + 4 <= len {
+        let d = vsubq_f32(vld1q_f32(pa.add(i)), vld1q_f32(pb.add(i)));
+        acc0 = vfmaq_f32(acc0, d, d);
+        i += 4;
+    }
+
+    let combined = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+    let mut total = vaddvq_f32(combined);
+    while i < len {
+        let d = *pa.add(i) - *pb.add(i);
+        total += d * d;
+        i += 1;
+    }
+    total
+}
+
+/// Computes the dot product of two single-precision float slices using runtime-dispatched
+/// hardware SIMD intrinsics (AVX-512F, AVX2/FMA, ARM NEON, or 8-way scalar fallback).
+#[inline]
+pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "Slices must have equal length for dot product");
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") {
+            return unsafe { dot_product_avx512(a, b) };
+        }
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return unsafe { dot_product_avx2(a, b) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            return unsafe { dot_product_neon(a, b) };
+        }
+    }
+    dot_product_scalar(a, b)
+}
+
+/// Computes squared Euclidean distance ||a - b||^2 using runtime-dispatched hardware SIMD intrinsics.
+#[inline]
+pub fn euclidean_distance_squared(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "Slices must have equal length for Euclidean distance");
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") {
+            return unsafe { euclidean_distance_squared_avx512(a, b) };
+        }
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return unsafe { euclidean_distance_squared_avx2(a, b) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            return unsafe { euclidean_distance_squared_neon(a, b) };
+        }
+    }
+    euclidean_distance_squared_scalar(a, b)
 }
 
 /// Normalizes a vector in-place to unit L2 length.
@@ -216,6 +524,61 @@ pub fn batch_distances(
         vectors
             .iter()
             .map(|v| compute_vector_score(query, v, metric, is_normalized).unwrap_or(0.0))
+            .collect()
+    }
+}
+
+/// Computes similarity scores over a contiguous flat `f32` vector arena (`n * dim`).
+pub fn try_batch_distances_flat(
+    query: &[f32],
+    flat_vectors: &[f32],
+    dim: usize,
+    metric: Metric,
+    is_normalized: bool,
+) -> Result<Vec<f32>, SutraError> {
+    use rayon::prelude::*;
+
+    if dim == 0 || flat_vectors.is_empty() {
+        return Ok(Vec::new());
+    }
+    if query.len() != dim {
+        return Err(SutraError::DimensionMismatch {
+            expected: dim,
+            got: query.len(),
+        });
+    }
+    let n = flat_vectors.len() / dim;
+    if n >= 64 {
+        flat_vectors
+            .par_chunks_exact(dim)
+            .map(|v| compute_vector_score(query, v, metric, is_normalized))
+            .collect()
+    } else {
+        flat_vectors
+            .chunks_exact(dim)
+            .map(|v| compute_vector_score(query, v, metric, is_normalized))
+            .collect()
+    }
+}
+
+/// Fallible batch distance computation propagating dimension mismatch errors across Rayon threads.
+pub fn try_batch_distances(
+    query: &[f32],
+    vectors: &[Vec<f32>],
+    metric: Metric,
+    is_normalized: bool,
+) -> Result<Vec<f32>, SutraError> {
+    use rayon::prelude::*;
+
+    if vectors.len() >= 64 {
+        vectors
+            .par_iter()
+            .map(|v| compute_vector_score(query, v, metric, is_normalized))
+            .collect()
+    } else {
+        vectors
+            .iter()
+            .map(|v| compute_vector_score(query, v, metric, is_normalized))
             .collect()
     }
 }

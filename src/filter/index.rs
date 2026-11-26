@@ -13,14 +13,34 @@ pub fn float_to_sortable_u64(f: f64) -> u64 {
     }
 }
 
+enum IndexEval {
+    Exact(RoaringBitmap),
+    Superset(RoaringBitmap),
+}
+
+impl IndexEval {
+    fn into_parts(self) -> (RoaringBitmap, bool) {
+        match self {
+            Self::Exact(bm) => (bm, true),
+            Self::Superset(bm) => (bm, false),
+        }
+    }
+}
+
 /// Inverted and B-Tree Secondary Index for metadata fields.
 /// Enables sub-microsecond set intersection and range scans using Roaring Bitmaps.
 #[derive(Debug, Clone, Default)]
 pub struct SecondaryMetadataIndex {
-    /// Categorical inverted index: field_name -> field_value_str -> RoaringBitmap of doc_ids
+    /// Categorical inverted index: field_name -> type-tagged value key ("s:<str>", "b:true"/"b:false", "n:<num>") -> RoaringBitmap of doc_ids
     categorical: HashMap<String, HashMap<String, RoaringBitmap>>,
     /// Numerical range index: field_name -> sortable_u64 -> RoaringBitmap of doc_ids
     numerical: HashMap<String, BTreeMap<u64, RoaringBitmap>>,
+    /// Presence index for all non-null fields (including objects and empty arrays)
+    field_exists: HashMap<String, RoaringBitmap>,
+    /// Reverse maps for O(k) document removal
+    doc_categorical_keys: HashMap<u32, Vec<(String, String)>>,
+    doc_numerical_keys: HashMap<u32, Vec<(String, u64)>>,
+    doc_exists_keys: HashMap<u32, Vec<String>>,
     /// All active document IDs in this index
     all_docs: RoaringBitmap,
     /// Total indexed document count
@@ -44,6 +64,22 @@ impl SecondaryMetadataIndex {
         }
     }
 
+    fn categorical_string_key(s: &str) -> String {
+        format!("s:{}", s)
+    }
+
+    fn categorical_bool_key(b: bool) -> &'static str {
+        if b {
+            "b:true"
+        } else {
+            "b:false"
+        }
+    }
+
+    fn categorical_number_key(n: &serde_json::Number) -> String {
+        format!("n:{}", n)
+    }
+
     fn index_object_recursive(&mut self, prefix: &str, map: &serde_json::Map<String, Value>, doc_id: u32) {
         for (key, val) in map {
             let full_key = if prefix.is_empty() {
@@ -55,63 +91,134 @@ impl SecondaryMetadataIndex {
             match val {
                 Value::Null => {}
                 Value::Bool(b) => {
-                    self.insert_categorical(&full_key, if *b { "true" } else { "false" }, doc_id);
+                    self.insert_exists(&full_key, doc_id);
+                    self.insert_categorical(&full_key, Self::categorical_bool_key(*b), doc_id);
                 }
                 Value::Number(num) => {
+                    self.insert_exists(&full_key, doc_id);
                     if let Some(f) = num.as_f64() {
                         self.insert_numerical(&full_key, f, doc_id);
+                    } else {
+                        self.insert_categorical(&full_key, &Self::categorical_number_key(num), doc_id);
                     }
-                    self.insert_categorical(&full_key, &num.to_string(), doc_id);
                 }
                 Value::String(s) => {
-                    self.insert_categorical(&full_key, s, doc_id);
+                    self.insert_exists(&full_key, doc_id);
+                    self.insert_categorical(&full_key, &Self::categorical_string_key(s), doc_id);
                 }
                 Value::Array(arr) => {
+                    self.insert_exists(&full_key, doc_id);
                     for item in arr {
                         match item {
-                            Value::String(s) => self.insert_categorical(&full_key, s, doc_id),
+                            Value::String(s) => {
+                                self.insert_categorical(&full_key, &Self::categorical_string_key(s), doc_id)
+                            }
                             Value::Number(n) => {
                                 if let Some(f) = n.as_f64() {
                                     self.insert_numerical(&full_key, f, doc_id);
+                                } else {
+                                    self.insert_categorical(&full_key, &Self::categorical_number_key(n), doc_id);
                                 }
-                                self.insert_categorical(&full_key, &n.to_string(), doc_id);
                             }
-                            Value::Bool(b) => self.insert_categorical(&full_key, if *b { "true" } else { "false" }, doc_id),
+                            Value::Bool(b) => {
+                                self.insert_categorical(&full_key, Self::categorical_bool_key(*b), doc_id)
+                            }
                             _ => {}
                         }
                     }
                 }
                 Value::Object(inner_map) => {
+                    self.insert_exists(&full_key, doc_id);
                     self.index_object_recursive(&full_key, inner_map, doc_id);
                 }
             }
         }
     }
 
+    fn insert_exists(&mut self, field: &str, doc_id: u32) {
+        let bitmap = self.field_exists.entry(field.to_string()).or_default();
+        if bitmap.insert(doc_id) {
+            self.doc_exists_keys
+                .entry(doc_id)
+                .or_default()
+                .push(field.to_string());
+        }
+    }
+
     fn insert_categorical(&mut self, field: &str, value: &str, doc_id: u32) {
         let field_map = self.categorical.entry(field.to_string()).or_default();
         let bitmap = field_map.entry(value.to_string()).or_default();
-        bitmap.insert(doc_id);
+        if bitmap.insert(doc_id) {
+            self.doc_categorical_keys
+                .entry(doc_id)
+                .or_default()
+                .push((field.to_string(), value.to_string()));
+        }
     }
 
     fn insert_numerical(&mut self, field: &str, value: f64, doc_id: u32) {
         let sort_key = float_to_sortable_u64(value);
         let field_btree = self.numerical.entry(field.to_string()).or_default();
         let bitmap = field_btree.entry(sort_key).or_default();
-        bitmap.insert(doc_id);
+        if bitmap.insert(doc_id) {
+            self.doc_numerical_keys
+                .entry(doc_id)
+                .or_default()
+                .push((field.to_string(), sort_key));
+        }
     }
 
-    /// Removes a document ID from all indexes.
+    /// Removes a document ID from all indexes in O(k) time where k is the document's indexed keys.
     pub fn remove_document(&mut self, doc_id: u32) {
         self.all_docs.remove(doc_id);
-        for field_map in self.categorical.values_mut() {
-            for bitmap in field_map.values_mut() {
-                bitmap.remove(doc_id);
+        if let Some(keys) = self.doc_categorical_keys.remove(&doc_id) {
+            for (field, val) in keys {
+                let mut remove_field = false;
+                if let Some(field_map) = self.categorical.get_mut(&field) {
+                    let mut remove_val = false;
+                    if let Some(bitmap) = field_map.get_mut(&val) {
+                        bitmap.remove(doc_id);
+                        remove_val = bitmap.is_empty();
+                    }
+                    if remove_val {
+                        field_map.remove(&val);
+                    }
+                    remove_field = field_map.is_empty();
+                }
+                if remove_field {
+                    self.categorical.remove(&field);
+                }
             }
         }
-        for field_btree in self.numerical.values_mut() {
-            for bitmap in field_btree.values_mut() {
-                bitmap.remove(doc_id);
+        if let Some(keys) = self.doc_numerical_keys.remove(&doc_id) {
+            for (field, sort_key) in keys {
+                let mut remove_field = false;
+                if let Some(field_btree) = self.numerical.get_mut(&field) {
+                    let mut remove_key = false;
+                    if let Some(bitmap) = field_btree.get_mut(&sort_key) {
+                        bitmap.remove(doc_id);
+                        remove_key = bitmap.is_empty();
+                    }
+                    if remove_key {
+                        field_btree.remove(&sort_key);
+                    }
+                    remove_field = field_btree.is_empty();
+                }
+                if remove_field {
+                    self.numerical.remove(&field);
+                }
+            }
+        }
+        if let Some(keys) = self.doc_exists_keys.remove(&doc_id) {
+            for field in keys {
+                let mut remove_field = false;
+                if let Some(bitmap) = self.field_exists.get_mut(&field) {
+                    bitmap.remove(doc_id);
+                    remove_field = bitmap.is_empty();
+                }
+                if remove_field {
+                    self.field_exists.remove(&field);
+                }
             }
         }
     }
@@ -120,6 +227,10 @@ impl SecondaryMetadataIndex {
     pub fn clear(&mut self) {
         self.categorical.clear();
         self.numerical.clear();
+        self.field_exists.clear();
+        self.doc_categorical_keys.clear();
+        self.doc_numerical_keys.clear();
+        self.doc_exists_keys.clear();
         self.all_docs.clear();
         self.doc_count = 0;
     }
@@ -133,6 +244,12 @@ impl SecondaryMetadataIndex {
     /// Returns `Some(RoaringBitmap)` if the filter or part of it was evaluated via index,
     /// or `None` if the filter is null/empty.
     pub fn evaluate_filter(&self, filter: Option<&Value>) -> Option<RoaringBitmap> {
+        self.evaluate_filter_checked(filter).map(|(bm, _)| bm)
+    }
+
+    /// Evaluates a query filter AST against secondary indexes and reports whether the returned
+    /// bitmap is exact (`true`) or an over-approximating superset (`false`) requiring FilterEngine verification.
+    pub fn evaluate_filter_checked(&self, filter: Option<&Value>) -> Option<(RoaringBitmap, bool)> {
         let filter_val = filter?;
         if filter_val.is_null() {
             return None;
@@ -143,48 +260,82 @@ impl SecondaryMetadataIndex {
             return None;
         }
 
-        Some(self.evaluate_object(filter_obj))
+        Some(self.evaluate_object_checked(filter_obj).into_parts())
     }
 
-    fn evaluate_object(&self, obj: &serde_json::Map<String, Value>) -> RoaringBitmap {
+    fn evaluate_object_checked(&self, obj: &serde_json::Map<String, Value>) -> IndexEval {
         let mut result_bitmap = self.all_docs.clone();
+        let mut all_exact = true;
         let mut first = true;
 
         for (key, val) in obj {
-            let field_bitmap = match key.as_str() {
+            let (field_bitmap, field_exact) = match key.as_str() {
                 "$and" => {
                     let mut and_bm = self.all_docs.clone();
+                    let mut and_exact = true;
                     if let Value::Array(arr) = val {
                         for sub in arr {
-                            if let Value::Object(sub_obj) = sub {
-                                and_bm &= self.evaluate_object(sub_obj);
+                            match sub {
+                                Value::Object(sub_obj) if !sub_obj.is_empty() => {
+                                    let (sub_bm, sub_exact) =
+                                        self.evaluate_object_checked(sub_obj).into_parts();
+                                    and_bm &= sub_bm;
+                                    and_exact &= sub_exact;
+                                }
+                                Value::Object(_) | Value::Null => {}
+                                _ => {
+                                    and_exact = false;
+                                }
                             }
                         }
+                    } else {
+                        and_bm = RoaringBitmap::new();
                     }
-                    and_bm
+                    if !and_exact {
+                        and_bm = self.all_docs.clone();
+                    }
+                    (and_bm, and_exact)
                 }
                 "$or" => {
                     let mut or_bm = RoaringBitmap::new();
+                    let mut or_exact = true;
                     if let Value::Array(arr) = val {
                         for sub in arr {
-                            if let Value::Object(sub_obj) = sub {
-                                or_bm |= self.evaluate_object(sub_obj);
+                            match sub {
+                                Value::Object(sub_obj) if !sub_obj.is_empty() => {
+                                    let (sub_bm, sub_exact) =
+                                        self.evaluate_object_checked(sub_obj).into_parts();
+                                    or_bm |= sub_bm;
+                                    or_exact &= sub_exact;
+                                }
+                                Value::Object(_) | Value::Null => {
+                                    or_bm = self.all_docs.clone();
+                                }
+                                _ => {
+                                    or_bm = self.all_docs.clone();
+                                    or_exact = false;
+                                }
                             }
                         }
                     }
-                    or_bm
-                }
-                "$not" => {
-                    if let Value::Object(sub_obj) = val {
-                        let sub_bm = self.evaluate_object(sub_obj);
-                        &self.all_docs - &sub_bm
-                    } else {
-                        RoaringBitmap::new()
+                    if !or_exact {
+                        or_bm = self.all_docs.clone();
                     }
+                    (or_bm, or_exact)
                 }
-                _ => self.evaluate_field_condition(key, val),
+                "$not" => match val {
+                    Value::Object(sub_obj) if !sub_obj.is_empty() => {
+                        match self.evaluate_object_checked(sub_obj) {
+                            IndexEval::Exact(sub_bm) => (&self.all_docs - &sub_bm, true),
+                            IndexEval::Superset(_) => (self.all_docs.clone(), false),
+                        }
+                    }
+                    _ => (RoaringBitmap::new(), true),
+                },
+                _ => self.evaluate_field_condition_checked(key, val).into_parts(),
             };
 
+            all_exact &= field_exact;
             if first {
                 result_bitmap = field_bitmap;
                 first = false;
@@ -193,162 +344,158 @@ impl SecondaryMetadataIndex {
             }
         }
 
-        result_bitmap
+        if all_exact {
+            IndexEval::Exact(result_bitmap)
+        } else {
+            IndexEval::Superset(result_bitmap)
+        }
     }
 
-    fn evaluate_field_condition(&self, field: &str, condition: &Value) -> RoaringBitmap {
+    fn match_scalar_exact(&self, field: &str, val: &Value) -> Option<RoaringBitmap> {
+        match val {
+            Value::String(s) => Some(self.get_categorical_exact(field, &Self::categorical_string_key(s))),
+            Value::Bool(b) => Some(self.get_categorical_exact(field, Self::categorical_bool_key(*b))),
+            Value::Number(n) => Some(if let Some(f) = n.as_f64() {
+                self.get_numerical_exact(field, f)
+            } else {
+                self.get_categorical_exact(field, &Self::categorical_number_key(n))
+            }),
+            _ => None,
+        }
+    }
+
+    fn evaluate_field_condition_checked(&self, field: &str, condition: &Value) -> IndexEval {
+        // Dotted array-index paths (e.g. "items.0") are resolved by FilterEngine, not flat index keys
+        if field.split('.').any(|p| p.parse::<usize>().is_ok()) {
+            return IndexEval::Superset(self.all_docs.clone());
+        }
+
         match condition {
-            Value::String(s) => {
-                self.get_categorical_exact(field, s)
-            }
-            Value::Bool(b) => {
-                self.get_categorical_exact(field, if *b { "true" } else { "false" })
-            }
-            Value::Number(num) => {
-                if let Some(f) = num.as_f64() {
-                    self.get_numerical_exact(field, f)
+            Value::String(_) | Value::Bool(_) | Value::Number(_) => {
+                if let Some(bm) = self.match_scalar_exact(field, condition) {
+                    IndexEval::Exact(bm)
                 } else {
-                    self.get_categorical_exact(field, &num.to_string())
+                    IndexEval::Superset(self.all_docs.clone())
                 }
             }
-            Value::Null => {
-                self.get_null_or_missing(field)
-            }
+            Value::Null => IndexEval::Exact(self.get_null_or_missing(field)),
             Value::Object(map) => {
                 let has_op = map.keys().any(|k| k.starts_with('$'));
                 if !has_op {
-                    // Fallback to all docs for custom structural objects
-                    return self.all_docs.clone();
+                    return IndexEval::Superset(self.all_docs.clone());
                 }
 
                 let mut cond_bm = self.all_docs.clone();
+                let mut cond_exact = true;
                 let mut first = true;
 
                 for (op, target) in map {
-                    let op_bm = match op.as_str() {
+                    let (op_bm, op_exact) = match op.as_str() {
                         "$eq" => match target {
-                            Value::String(s) => self.get_categorical_exact(field, s),
-                            Value::Bool(b) => self.get_categorical_exact(field, if *b { "true" } else { "false" }),
-                            Value::Number(n) => {
-                                if let Some(f) = n.as_f64() {
-                                    self.get_numerical_exact(field, f)
-                                } else {
-                                    self.get_categorical_exact(field, &n.to_string())
-                                }
-                            }
-                            Value::Null => self.get_null_or_missing(field),
-                            _ => self.all_docs.clone(),
+                            Value::Null => (self.get_null_or_missing(field), true),
+                            _ => match self.match_scalar_exact(field, target) {
+                                Some(bm) => (bm, true),
+                                None => (self.all_docs.clone(), false),
+                            },
                         },
-                        "$ne" => {
-                            let match_bm = match target {
-                                Value::String(s) => self.get_categorical_exact(field, s),
-                                Value::Bool(b) => self.get_categorical_exact(field, if *b { "true" } else { "false" }),
-                                Value::Number(n) => {
-                                    if let Some(f) = n.as_f64() {
-                                        self.get_numerical_exact(field, f)
-                                    } else {
-                                        self.get_categorical_exact(field, &n.to_string())
-                                    }
-                                }
-                                Value::Null => self.get_null_or_missing(field),
-                                _ => RoaringBitmap::new(),
-                            };
-                            &self.all_docs - &match_bm
-                        }
+                        "$ne" => match target {
+                            Value::Null => (&self.all_docs - &self.get_null_or_missing(field), true),
+                            _ => match self.match_scalar_exact(field, target) {
+                                Some(bm) => (&self.all_docs - &bm, true),
+                                None => (self.all_docs.clone(), false),
+                            },
+                        },
                         "$in" => {
                             let mut in_bm = RoaringBitmap::new();
+                            let mut exact = true;
                             if let Value::Array(arr) = target {
                                 for item in arr {
-                                    match item {
-                                        Value::String(s) => in_bm |= self.get_categorical_exact(field, s),
-                                        Value::Number(n) => {
-                                            if let Some(f) = n.as_f64() {
-                                                in_bm |= self.get_numerical_exact(field, f);
-                                            } else {
-                                                in_bm |= self.get_categorical_exact(field, &n.to_string());
-                                            }
-                                        }
-                                        Value::Bool(b) => in_bm |= self.get_categorical_exact(field, if *b { "true" } else { "false" }),
-                                        _ => {}
+                                    if let Some(bm) = self.match_scalar_exact(field, item) {
+                                        in_bm |= bm;
+                                    } else {
+                                        exact = false;
                                     }
                                 }
+                            } else {
+                                exact = false;
                             }
-                            in_bm
+                            if !exact {
+                                in_bm = self.all_docs.clone();
+                            }
+                            (in_bm, exact)
                         }
                         "$nin" => {
                             let mut in_bm = RoaringBitmap::new();
+                            let mut exact = true;
                             if let Value::Array(arr) = target {
                                 for item in arr {
-                                    match item {
-                                        Value::String(s) => in_bm |= self.get_categorical_exact(field, s),
-                                        Value::Number(n) => {
-                                            if let Some(f) = n.as_f64() {
-                                                in_bm |= self.get_numerical_exact(field, f);
-                                            } else {
-                                                in_bm |= self.get_categorical_exact(field, &n.to_string());
-                                            }
-                                        }
-                                        Value::Bool(b) => in_bm |= self.get_categorical_exact(field, if *b { "true" } else { "false" }),
-                                        _ => {}
+                                    if let Some(bm) = self.match_scalar_exact(field, item) {
+                                        in_bm |= bm;
+                                    } else {
+                                        exact = false;
                                     }
                                 }
                             }
-                            &self.all_docs - &in_bm
+                            if exact {
+                                (&self.all_docs - &in_bm, true)
+                            } else {
+                                (self.all_docs.clone(), false)
+                            }
                         }
                         "$gt" => {
                             if let Some(f) = target.as_f64() {
-                                self.get_numerical_range(field, Some(f), None, false, false)
+                                (
+                                    self.get_numerical_range(field, Some(f), None, false, false),
+                                    true,
+                                )
                             } else {
-                                self.all_docs.clone()
+                                (self.all_docs.clone(), false)
                             }
                         }
                         "$gte" => {
                             if let Some(f) = target.as_f64() {
-                                self.get_numerical_range(field, Some(f), None, true, false)
+                                (
+                                    self.get_numerical_range(field, Some(f), None, true, false),
+                                    true,
+                                )
                             } else {
-                                self.all_docs.clone()
+                                (self.all_docs.clone(), false)
                             }
                         }
                         "$lt" => {
                             if let Some(f) = target.as_f64() {
-                                self.get_numerical_range(field, None, Some(f), false, false)
+                                (
+                                    self.get_numerical_range(field, None, Some(f), false, false),
+                                    true,
+                                )
                             } else {
-                                self.all_docs.clone()
+                                (self.all_docs.clone(), false)
                             }
                         }
                         "$lte" => {
                             if let Some(f) = target.as_f64() {
-                                self.get_numerical_range(field, None, Some(f), false, true)
+                                (
+                                    self.get_numerical_range(field, None, Some(f), false, true),
+                                    true,
+                                )
                             } else {
-                                self.all_docs.clone()
+                                (self.all_docs.clone(), false)
                             }
                         }
                         "$exists" => {
-                            let expected = target.as_bool().unwrap_or(true);
-                            let mut exists_bm = RoaringBitmap::new();
-                            if let Some(field_map) = self.categorical.get(field) {
-                                for bm in field_map.values() {
-                                    exists_bm |= bm;
-                                }
-                            }
-                            if let Some(field_btree) = self.numerical.get(field) {
-                                for bm in field_btree.values() {
-                                    exists_bm |= bm;
-                                }
-                            }
+                            let expected = target.as_bool().unwrap_or(false);
+                            let exists_bm =
+                                self.field_exists.get(field).cloned().unwrap_or_default();
                             if expected {
-                                exists_bm
+                                (exists_bm, true)
                             } else {
-                                &self.all_docs - &exists_bm
+                                (&self.all_docs - &exists_bm, true)
                             }
                         }
-                        _ => {
-                            // Unsupported operators by index (like $regex, $geo_within) match all for now,
-                            // allowing exact post-filtering to verify
-                            self.all_docs.clone()
-                        }
+                        _ => (self.all_docs.clone(), false),
                     };
 
+                    cond_exact &= op_exact;
                     if first {
                         cond_bm = op_bm;
                         first = false;
@@ -356,24 +503,18 @@ impl SecondaryMetadataIndex {
                         cond_bm &= op_bm;
                     }
                 }
-                cond_bm
+                if cond_exact {
+                    IndexEval::Exact(cond_bm)
+                } else {
+                    IndexEval::Superset(cond_bm)
+                }
             }
-            _ => self.all_docs.clone(),
+            _ => IndexEval::Superset(self.all_docs.clone()),
         }
     }
 
     fn get_null_or_missing(&self, field: &str) -> RoaringBitmap {
-        let mut non_null = RoaringBitmap::new();
-        if let Some(field_map) = self.categorical.get(field) {
-            for bm in field_map.values() {
-                non_null |= bm;
-            }
-        }
-        if let Some(field_btree) = self.numerical.get(field) {
-            for bm in field_btree.values() {
-                non_null |= bm;
-            }
-        }
+        let non_null = self.field_exists.get(field).cloned().unwrap_or_default();
         &self.all_docs - &non_null
     }
 
@@ -450,7 +591,7 @@ mod tests {
 
     #[test]
     fn test_float_to_sortable_u64_ordering() {
-        let values = vec![-100.0, -10.5, -0.01, 0.0, 0.0001, 42.0, 1000.5];
+        let values = [-100.0, -10.5, -0.01, 0.0, 0.0001, 42.0, 1000.5];
         for i in 0..values.len() - 1 {
             let u_a = float_to_sortable_u64(values[i]);
             let u_b = float_to_sortable_u64(values[i + 1]);

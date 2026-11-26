@@ -1,5 +1,7 @@
 use thiserror::Error;
+#[cfg(feature = "python")]
 use pyo3::exceptions::{PyIOError, PyKeyError, PyRuntimeError, PyValueError};
+#[cfg(feature = "python")]
 use pyo3::PyErr;
 
 #[derive(Error, Debug)]
@@ -41,6 +43,7 @@ pub enum SutraError {
     Lock(String),
 }
 
+#[cfg(feature = "python")]
 impl From<SutraError> for PyErr {
     fn from(err: SutraError) -> PyErr {
         match err {

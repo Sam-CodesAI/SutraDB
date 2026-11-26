@@ -5,6 +5,35 @@ use serde::{Deserialize, Serialize};
 use crate::distance::simd::{dot_product, normalize_in_place};
 use crate::error::SutraError;
 
+/// Fallible exact ColBERT Late Interaction MaxSim score returning DimensionMismatch on mismatched token dims.
+pub fn try_compute_maxsim(query_tokens: &[Vec<f32>], doc_tokens: &[Vec<f32>]) -> Result<f32, SutraError> {
+    if query_tokens.is_empty() || doc_tokens.is_empty() {
+        return Ok(0.0);
+    }
+
+    let mut total_score = 0.0f32;
+    for q in query_tokens {
+        let mut max_sim = f32::NEG_INFINITY;
+        for d in doc_tokens {
+            if q.len() != d.len() {
+                return Err(SutraError::DimensionMismatch {
+                    expected: d.len(),
+                    got: q.len(),
+                });
+            }
+            let sim = dot_product(q, d);
+            if sim > max_sim {
+                max_sim = sim;
+            }
+        }
+        if max_sim != f32::NEG_INFINITY {
+            total_score += max_sim;
+        }
+    }
+
+    Ok(total_score)
+}
+
 /// Computes the exact ColBERT Late Interaction MaxSim score between a query token matrix
 /// and a document token matrix:
 ///
@@ -18,6 +47,9 @@ pub fn compute_maxsim(query_tokens: &[Vec<f32>], doc_tokens: &[Vec<f32>]) -> f32
     for q in query_tokens {
         let mut max_sim = f32::NEG_INFINITY;
         for d in doc_tokens {
+            if q.len() != d.len() {
+                continue;
+            }
             let sim = dot_product(q, d);
             if sim > max_sim {
                 max_sim = sim;
@@ -65,14 +97,47 @@ impl ColbertIndex {
         self.doc_tokens.is_empty()
     }
 
+    /// Fallibly adds or updates a document's token embeddings after validating token dimensions.
+    pub fn try_add_document(&mut self, doc_id: u32, mut tokens: Vec<Vec<f32>>) -> Result<(), SutraError> {
+        for t in &mut tokens {
+            if t.len() != self.token_dim {
+                return Err(SutraError::DimensionMismatch {
+                    expected: self.token_dim,
+                    got: t.len(),
+                });
+            }
+            normalize_in_place(t);
+        }
+
+        // Remove stale postings if doc_id is being overwritten
+        self.remove_document(doc_id);
+
+        // If centroids exist, map new document's tokens into centroid postings
+        if let Some(ref mut c) = self.centroids {
+            let mut matched_centroids = HashSet::new();
+            for t in &tokens {
+                if let Some(c_idx) = find_nearest_centroid(t, &c.centroids) {
+                    matched_centroids.insert(c_idx);
+                }
+            }
+            for c_idx in matched_centroids {
+                c.postings.entry(c_idx).or_default().push(doc_id);
+            }
+        }
+
+        self.doc_tokens.insert(doc_id, tokens);
+        Ok(())
+    }
+
     /// Adds or updates a document's token embeddings.
     /// Normalizes each token in-place to unit sphere for accurate cosine dot products.
     pub fn add_document(&mut self, doc_id: u32, mut tokens: Vec<Vec<f32>>) {
+        tokens.retain(|t| t.len() == self.token_dim);
         for t in &mut tokens {
-            if t.len() == self.token_dim {
-                normalize_in_place(t);
-            }
+            normalize_in_place(t);
         }
+
+        self.remove_document(doc_id);
 
         // If centroids exist, map new document's tokens into centroid postings
         if let Some(ref mut c) = self.centroids {
@@ -117,6 +182,12 @@ impl ColbertIndex {
         let mut sample_tokens: Vec<Vec<f32>> = Vec::new();
         for tokens in self.doc_tokens.values() {
             for t in tokens {
+                if t.len() != self.token_dim {
+                    return Err(SutraError::DimensionMismatch {
+                        expected: self.token_dim,
+                        got: t.len(),
+                    });
+                }
                 sample_tokens.push(t.clone());
             }
         }
@@ -202,25 +273,29 @@ impl ColbertIndex {
         Ok(())
     }
 
-    /// Queries the ColBERT index using Late Interaction MaxSim.
-    /// If centroids are trained and document pool > 512, performs sub-linear candidate pruning.
-    /// Otherwise, evaluates parallel Rayon SIMD MaxSim across all active documents.
-    pub fn query_maxsim(
+    /// Fallibly queries the ColBERT index using Late Interaction MaxSim, propagating dimension mismatches.
+    pub fn try_query_maxsim(
         &self,
         query_tokens: &[Vec<f32>],
         mask: Option<&[bool]>,
         top_k: usize,
-    ) -> Vec<(u32, f32)> {
-        if query_tokens.is_empty() || self.doc_tokens.is_empty() {
-            return Vec::new();
+    ) -> Result<Vec<(u32, f32)>, SutraError> {
+        for q in query_tokens {
+            if q.len() != self.token_dim {
+                return Err(SutraError::DimensionMismatch {
+                    expected: self.token_dim,
+                    got: q.len(),
+                });
+            }
+        }
+        if top_k == 0 || query_tokens.is_empty() || self.doc_tokens.is_empty() {
+            return Ok(Vec::new());
         }
 
         // Normalize query tokens copy
         let mut norm_queries = query_tokens.to_vec();
         for q in &mut norm_queries {
-            if q.len() == self.token_dim {
-                normalize_in_place(q);
-            }
+            normalize_in_place(q);
         }
 
         // Step 1: Candidate identification
@@ -258,7 +333,7 @@ impl ColbertIndex {
         };
 
         if candidate_doc_ids.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         // Step 2: Parallel Rayon SIMD MaxSim evaluation over candidate pool
@@ -275,7 +350,31 @@ impl ColbertIndex {
         // Sort descending by MaxSim score
         scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scores.truncate(top_k);
-        scores
+        Ok(scores)
+    }
+
+    /// Queries the ColBERT index using Late Interaction MaxSim.
+    /// If centroids are trained and document pool > 512, performs sub-linear candidate pruning.
+    /// Otherwise, evaluates parallel Rayon SIMD MaxSim across all active documents.
+    pub fn query_maxsim(
+        &self,
+        query_tokens: &[Vec<f32>],
+        mask: Option<&[bool]>,
+        top_k: usize,
+    ) -> Vec<(u32, f32)> {
+        if top_k == 0 || query_tokens.is_empty() || self.doc_tokens.is_empty() {
+            return Vec::new();
+        }
+        let filtered_queries: Vec<Vec<f32>> = query_tokens
+            .iter()
+            .filter(|q| q.len() == self.token_dim)
+            .cloned()
+            .collect();
+        if filtered_queries.is_empty() {
+            return Vec::new();
+        }
+        self.try_query_maxsim(&filtered_queries, mask, top_k)
+            .unwrap_or_default()
     }
 
     fn gather_active_candidates(&self, mask: Option<&[bool]>) -> Vec<u32> {
@@ -300,19 +399,27 @@ fn find_nearest_centroid(token: &[f32], centroids: &[Vec<f32>]) -> Option<usize>
     let mut best_sim = f32::NEG_INFINITY;
     let mut best_idx = 0;
     for (i, c) in centroids.iter().enumerate() {
+        if token.len() != c.len() {
+            continue;
+        }
         let sim = dot_product(token, c);
         if sim > best_sim {
             best_sim = sim;
             best_idx = i;
         }
     }
-    Some(best_idx)
+    if best_sim == f32::NEG_INFINITY {
+        None
+    } else {
+        Some(best_idx)
+    }
 }
 
 fn find_top_centroids(token: &[f32], centroids: &[Vec<f32>], top_n: usize) -> Vec<usize> {
     let mut scored: Vec<(usize, f32)> = centroids
         .iter()
         .enumerate()
+        .filter(|(_, c)| token.len() == c.len())
         .map(|(i, c)| (i, dot_product(token, c)))
         .collect();
 
@@ -359,7 +466,7 @@ mod tests {
 
         let doc1 = vec![
             vec![1.0, 0.0, 0.0, 0.0],
-            vec![0.7071, 0.7071, 0.0, 0.0],
+            vec![std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2, 0.0, 0.0],
         ];
         let doc2 = vec![
             vec![0.0, 1.0, 0.0, 0.0],

@@ -94,7 +94,7 @@ class ConsistentHashRing:
             idx = 0
         return self._ring[self._sorted_keys[idx]]
 
-    def get_preference_list(self, key: str, count: usize) -> List[str]:
+    def get_preference_list(self, key: str, count: int) -> List[str]:
         """Returns distinct physical nodes responsible for replicating this key."""
         if self._native is not None:
             return self._native.get_preference_list(key, count)
@@ -285,9 +285,22 @@ class DistributedCollection:
         bm25_weight: float = 1.0,
         sparse_weight: float = 1.0,
         colbert_weight: float = 1.0,
+        alpha: Optional[float] = None,
         use_ann: bool = False
     ) -> List[SearchResult]:
         """Parallel scatter-gather query executing across all shards with global top-k fusion."""
+        if top_k <= 0:
+            return []
+
+        has_vector = vector is not None
+        has_text = bool(text and text.strip())
+        has_sparse = bool(sparse_vector and len(sparse_vector) > 0)
+        has_colbert = bool(colbert_tokens and len(colbert_tokens) > 0)
+        active_modalities = int(has_vector) + int(has_text) + int(has_sparse) + int(has_colbert)
+
+        is_global_fusion = hybrid and active_modalities >= 2 and len(self.shards) > 1
+        shard_top_k = max(top_k * 4, 200) if is_global_fusion else top_k
+
         # Scatter query in parallel across all shards
         def query_shard(shard: Collection) -> List[SearchResult]:
             return shard.query(
@@ -297,11 +310,14 @@ class DistributedCollection:
                 colbert_tokens=colbert_tokens,
                 filter=filter,
                 namespace=namespace,
-                top_k=top_k,
+                top_k=shard_top_k,
                 hybrid=hybrid,
                 rrf_constant=rrf_constant,
                 dense_weight=dense_weight,
                 bm25_weight=bm25_weight,
+                sparse_weight=sparse_weight,
+                colbert_weight=colbert_weight,
+                alpha=alpha,
                 use_ann=use_ann
             )
 
@@ -309,14 +325,75 @@ class DistributedCollection:
             futures = [pool.submit(query_shard, s) for s in self.shards.values()]
             shard_results = [f.result() for f in futures]
 
-        # Gather and global merge: deduplicate by document id, sort descending by score
+        # Gather and deduplicate by document id across shards
         merged_candidates: Dict[str, SearchResult] = {}
         for s_list in shard_results:
             for item in s_list:
                 if item.id not in merged_candidates or item.score > merged_candidates[item.id].score:
                     merged_candidates[item.id] = item
 
-        sorted_results = sorted(merged_candidates.values(), key=lambda x: x.score, reverse=True)
+        candidates = list(merged_candidates.values())
+        if not candidates:
+            return []
+
+        # Perform global multi-modal fusion so per-shard ranks do not distort global weights
+        if is_global_fusion:
+            import math
+            m_bound = min(top_k * 4, 200, len(candidates))
+
+            if alpha is not None and active_modalities == 2 and has_vector and has_text:
+                d_vals = [c.dense_score if c.dense_score is not None and math.isfinite(c.dense_score) else 0.0 for c in candidates]
+                b_vals = [c.bm25_score if c.bm25_score is not None and math.isfinite(c.bm25_score) else 0.0 for c in candidates]
+                d_min, d_max = min(d_vals), max(d_vals)
+                b_min, b_max = min(b_vals), max(b_vals)
+                d_range = max(d_max - d_min, 1e-12) if d_max > d_min else 1.0
+                b_range = max(b_max - b_min, 1e-12) if b_max > b_min else 1.0
+                for c, d, b in zip(candidates, d_vals, b_vals):
+                    dn = (d - d_min) / d_range if d_max > d_min else 1.0
+                    bn = (b - b_min) / b_range if b_max > b_min else 0.0
+                    c.score = alpha * dn + (1.0 - alpha) * bn
+            else:
+                def global_ranks(attr: str, allow_non_pos: bool = False) -> Dict[str, int]:
+                    scored_items = []
+                    for c in candidates:
+                        val = getattr(c, attr)
+                        if val is not None and math.isfinite(float(val)):
+                            scored_items.append((c.id, float(val)))
+                    scored_items.sort(key=lambda x: x[1], reverse=True)
+                    top_items = scored_items[:m_bound]
+                    ranks: Dict[str, int] = {
+                        doc_id: rank for rank, (doc_id, val) in enumerate(top_items, start=1) if val > 0.0
+                    }
+                    if not ranks and allow_non_pos and top_items:
+                        ranks = {doc_id: rank for rank, (doc_id, _) in enumerate(top_items, start=1)}
+                    return ranks
+
+                d_ranks = global_ranks("dense_score", allow_non_pos=True) if has_vector else {}
+                b_ranks = global_ranks("bm25_score", allow_non_pos=False) if has_text else {}
+                s_ranks = global_ranks("sparse_score", allow_non_pos=False) if has_sparse else {}
+                c_ranks = global_ranks("colbert_score", allow_non_pos=False) if has_colbert else {}
+
+                for c in candidates:
+                    s = 0.0
+                    if c.id in d_ranks:
+                        s += dense_weight / (rrf_constant + d_ranks[c.id])
+                    if c.id in b_ranks:
+                        s += bm25_weight / (rrf_constant + b_ranks[c.id])
+                    if c.id in s_ranks:
+                        s += sparse_weight / (rrf_constant + s_ranks[c.id])
+                    if c.id in c_ranks:
+                        s += colbert_weight / (rrf_constant + c_ranks[c.id])
+                    c.score = s
+
+        sorted_results = sorted(
+            candidates,
+            key=lambda x: (
+                x.score,
+                x.dense_score if x.dense_score is not None else float("-inf"),
+                x.colbert_score if x.colbert_score is not None else float("-inf"),
+            ),
+            reverse=True,
+        )
         return sorted_results[:top_k]
 
     def count(self) -> int:

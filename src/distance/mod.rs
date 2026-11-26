@@ -1,7 +1,10 @@
+pub mod arena;
 pub mod bq;
 pub mod pq;
 pub mod simd;
 pub mod sq8;
+
+pub use arena::{BQArena, PQArena, SQ8Arena, VectorArena, VectorStore};
 
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
