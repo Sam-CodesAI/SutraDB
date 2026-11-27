@@ -1,8 +1,10 @@
 pub mod header;
+pub mod index_file;
 pub mod wal;
 pub mod mmap;
 
 pub use header::{SutraHeader, HEADER_MAGIC_V2, HEADER_MAGIC_V3, HEADER_MAGIC_V4, HEADER_SIZE};
+pub use index_file::{index_sidecar_path, IndexStorage, PersistedIndexes, RestoredIndexes};
 pub use wal::{WriteAheadLog, WalRecord};
 pub use mmap::MmapVectorStorage;
 

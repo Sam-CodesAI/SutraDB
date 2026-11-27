@@ -17,8 +17,8 @@ use crate::fusion::{linear_score_fusion, reciprocal_rank_fusion};
 use crate::index::hnsw::{HNSWConfig, HNSWIndex};
 use crate::index::ivf::{auto_n_lists, IVFConfig, IVFIndex};
 use crate::storage::{
-    validate_collection_name, BinaryStorage, MmapVectorStorage, WalRecord, WriteAheadLog,
-    HEADER_MAGIC_V4,
+    validate_collection_name, BinaryStorage, IndexStorage, MmapVectorStorage, PersistedIndexes,
+    WalRecord, WriteAheadLog, HEADER_MAGIC_V4,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -726,12 +726,11 @@ impl NativeCollection {
         let mut index = HNSWIndex::new(cfg);
         let is_cosine = self.metric == Metric::Cosine;
 
-        for (i, v) in self.vectors.iter().enumerate() {
-            if i < self.tombstones.len() && self.tombstones[i] {
-                continue;
-            }
-            index.insert(i as u32, v, &self.vectors, self.metric, is_cosine)?;
-        }
+        let active_ids: Vec<u32> = (0..self.documents.len())
+            .filter(|&i| i >= self.tombstones.len() || !self.tombstones[i])
+            .map(|i| i as u32)
+            .collect();
+        index.build_batch(&active_ids, &self.vectors, self.metric, is_cosine)?;
 
         self.hnsw = Some(index);
         self.dirty_index = false;
@@ -974,10 +973,15 @@ impl NativeCollection {
         // Sub-microsecond filter evaluation via SecondaryMetadataIndex
         let mut mask = vec![true; n];
         let mut index_exact = true;
-        if let Some((bitmap, is_exact)) = self.metadata_index.evaluate_filter_checked(filter) {
+        let eval_res = self.metadata_index.evaluate_filter_checked(filter);
+        let mut exact_filter_bitmap: Option<roaring::RoaringBitmap> = None;
+        if let Some((bitmap, is_exact)) = eval_res {
             index_exact = is_exact;
             for (i, m) in mask.iter_mut().enumerate() {
                 *m = bitmap.contains(i as u32);
+            }
+            if is_exact && !filter.is_some_and(crate::filter::has_complex_operators) && namespace.is_none() {
+                exact_filter_bitmap = Some(bitmap);
             }
         }
 
@@ -1016,11 +1020,9 @@ impl NativeCollection {
         let has_colbert = colbert_tokens.map(|ct| !ct.is_empty()).unwrap_or(false);
 
         // 2. Cost-Based Query Planning:
-        // If valid_count is small (<= 512 or < 2% of collection),
-        // HNSW graph walking suffers from filter collapse (hitting dead ends).
-        // Bypassing HNSW to direct SIMD scan over the small candidate pool guarantees 100% recall in microseconds!
-        let valid_ratio = valid_count as f32 / n as f32;
-        let should_bypass_hnsw = valid_count <= 512 || valid_ratio < 0.02;
+        // Only bypass HNSW for tiny candidate pools (<= 32) where exact SIMD scan finishes in microseconds;
+        // larger filtered queries (including 1% selectivity on large corpora) traverse HNSW with in-flight bitmap filtering.
+        let should_bypass_hnsw = valid_count <= 32;
 
         let is_cosine = self.metric == Metric::Cosine;
         let mut dense_scores = if has_vector {
@@ -1043,7 +1045,18 @@ impl NativeCollection {
             {
                 if let Some(ref hnsw) = self.hnsw {
                     let ef = hnsw.config.ef_search.max(top_k);
-                    let ann_res = hnsw.search(&normalized_q, &self.vectors, top_k, ef, self.metric, is_cosine, Some(&mask))?;
+                    let ann_res = if let Some(ref bm) = exact_filter_bitmap {
+                        hnsw.search_with_bitmap(&normalized_q, &self.vectors, top_k, ef, self.metric, is_cosine, Some(bm))?
+                    } else if filter.is_some() || namespace.is_some() {
+                        let bm: roaring::RoaringBitmap = mask
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, &ok)| if ok { Some(i as u32) } else { None })
+                            .collect();
+                        hnsw.search_with_bitmap(&normalized_q, &self.vectors, top_k, ef, self.metric, is_cosine, Some(&bm))?
+                    } else {
+                        hnsw.search_with_bitmap(&normalized_q, &self.vectors, top_k, ef, self.metric, is_cosine, None)?
+                    };
                     return Ok(ann_res.into_iter().map(|(id, score)| {
                         let doc = &self.documents[id as usize];
                         NativeSearchResult {
@@ -1289,6 +1302,25 @@ impl NativeCollection {
                     metadata: doc.metadata.clone(),
                     dense_score: Some(score),
                     bm25_score: None,
+                    sparse_score: None,
+                    colbert_score: None,
+                    namespace: doc.namespace.clone(),
+                }
+            }).collect());
+        }
+
+        // Fast-path return for pure BM25 lexical query without allocating O(N) score buffers
+        if has_text && (!hybrid || num_modalities < 2) && !has_vector && !has_colbert && !has_sparse {
+            let valid = self.bm25.search_top_k(text.unwrap(), top_k, Some(&mask));
+            return Ok(valid.into_iter().map(|(idx, score)| {
+                let doc = &self.documents[idx];
+                NativeSearchResult {
+                    id: doc.id.clone(),
+                    score,
+                    text: doc.text.clone(),
+                    metadata: doc.metadata.clone(),
+                    dense_score: None,
+                    bm25_score: Some(score),
                     sparse_score: None,
                     colbert_score: None,
                     namespace: doc.namespace.clone(),
@@ -1629,6 +1661,42 @@ impl NativeCollection {
             wal.clear()?;
         }
 
+        let parent_crc32 = if let Some(ref mmap) = self.mmap_storage {
+            mmap.header().crc32
+        } else {
+            MmapVectorStorage::open_lazy(&p)?.header().crc32
+        };
+
+        let persisted = PersistedIndexes {
+            hnsw: self.hnsw.as_ref(),
+            ivf: self.ivf.as_ref(),
+            bq: if self.use_bq {
+                Some((&self.bq_vectors, self.bq_centroid.as_deref()))
+            } else {
+                None
+            },
+            pq: if self.use_pq {
+                self.pq_codebook
+                    .as_ref()
+                    .map(|cb| (&self.pq_vectors, cb))
+            } else {
+                None
+            },
+            colbert_centroids: self
+                .colbert_index
+                .centroids
+                .as_ref()
+                .map(|cc| (self.colbert_index.token_dim, cc)),
+            dirty_index: self.dirty_index,
+        };
+        let _idx_written = IndexStorage::write_for_parent(
+            &p,
+            doc_count,
+            dim,
+            parent_crc32,
+            &persisted,
+        )?;
+
         Ok(written)
     }
 
@@ -1646,6 +1714,13 @@ impl NativeCollection {
         let header = storage.header().clone();
         self.dimension = header.dimension as usize;
         self.metric = Metric::from_str(&header.metric)?;
+
+        let mut restored_idx = IndexStorage::read_for_parent(
+            &p,
+            header.doc_count,
+            header.dimension,
+            header.crc32,
+        )?;
 
         let doc_count = header.doc_count as usize;
         let doc_vals: Vec<Value> = serde_json::from_slice(storage.metadata_bytes())
@@ -1680,6 +1755,17 @@ impl NativeCollection {
         self.hnsw = None;
         self.ivf = None;
         self.dirty_index = false;
+
+        let mut has_persisted_colbert_centroids = false;
+        if let Some(ref mut sidecar) = restored_idx {
+            if let Some((token_dim, cc)) = sidecar.colbert_centroids.take() {
+                if token_dim == self.dimension {
+                    self.colbert_index.centroids = Some(cc);
+                    self.colbert_index.is_trained = true;
+                    has_persisted_colbert_centroids = true;
+                }
+            }
+        }
 
         let is_v4_sq8 = header.magic == *HEADER_MAGIC_V4 && header.quant_mode == 1;
         if is_v4_sq8 {
@@ -1741,7 +1827,11 @@ impl NativeCollection {
                 self.sparse_index.add_document(i as u32, sv);
             }
             if let Some(ref tokens) = colbert_tokens {
-                self.colbert_index.try_add_document(i as u32, tokens.clone())?;
+                if has_persisted_colbert_centroids {
+                    self.colbert_index.restore_document_tokens(i as u32, tokens.clone())?;
+                } else {
+                    self.colbert_index.try_add_document(i as u32, tokens.clone())?;
+                }
             }
 
             self.id_to_index.insert(id.clone(), i);
@@ -1754,6 +1844,22 @@ impl NativeCollection {
             self.use_sq8 = true;
         } else if header.quant_mode == 1 {
             self.enable_sq8();
+        }
+
+        if let Some(sidecar) = restored_idx {
+            self.hnsw = sidecar.hnsw;
+            self.ivf = sidecar.ivf;
+            if let Some((bq_arena, centroid)) = sidecar.bq {
+                self.bq_vectors = bq_arena;
+                self.bq_centroid = centroid;
+                self.use_bq = true;
+            }
+            if let Some((pq_arena, pq_codebook)) = sidecar.pq {
+                self.pq_vectors = pq_arena;
+                self.pq_codebook = Some(pq_codebook);
+                self.use_pq = true;
+            }
+            self.dirty_index = sidecar.dirty_index;
         }
 
         let corpus: Vec<String> = self.documents.iter().map(|d| d.text.clone()).collect();
@@ -1769,6 +1875,10 @@ impl NativeCollection {
     pub fn compact(&mut self) -> Result<(), SutraError> {
         let has_tombstones = self.tombstones.iter().any(|&t| t);
         if !has_tombstones {
+            if let Some(ref mut hnsw) = self.hnsw {
+                hnsw.compact_tombstones();
+            }
+            self.bm25.compact_postings();
             return Ok(());
         }
 
@@ -1901,6 +2011,7 @@ impl NativeCollection {
         }
         if let Some(ref hnsw) = self.hnsw {
             if let Some(obj) = stats.as_object_mut() {
+                let hnsw_bytes = hnsw.memory_bytes();
                 obj.insert(
                     "hnsw".to_string(),
                     serde_json::json!({
@@ -1910,6 +2021,8 @@ impl NativeCollection {
                         "ef_construction": hnsw.config.ef_construction,
                         "ef_search": hnsw.config.ef_search,
                         "dirty": self.dirty_index,
+                        "memory_bytes": hnsw_bytes,
+                        "memory_mb": (hnsw_bytes as f64) / (1024.0 * 1024.0),
                     }),
                 );
             }

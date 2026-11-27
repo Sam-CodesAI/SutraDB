@@ -24,6 +24,64 @@ HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 assert HEADER_SIZE == 64, f"Header size must be 64 bytes, got {HEADER_SIZE}"
 
 
+def _decode_wal_binary(payload: bytes) -> Optional[Dict[str, Any]]:
+    """Decodes SutraDB binary WAL record (`SWB1`) into a dict matching JSON WAL entries."""
+    if not payload.startswith(b"SWB1"):
+        return None
+    off = 4
+    n = len(payload)
+    if off + 2 > n:
+        return None
+    (op_len,) = struct.unpack_from("<H", payload, off)
+    off += 2
+    if off + op_len + 4 > n:
+        return None
+    op = payload[off : off + op_len].decode("utf-8")
+    off += op_len
+    (doc_count,) = struct.unpack_from("<I", payload, off)
+    off += 4
+    docs = []
+    for _ in range(doc_count):
+        if off + 5 > n:
+            return None
+        flag = payload[off]
+        off += 1
+        (json_len,) = struct.unpack_from("<I", payload, off)
+        off += 4
+        if off + json_len > n:
+            return None
+        doc_obj = json.loads(payload[off : off + json_len].decode("utf-8"))
+        off += json_len
+        if flag == 1:
+            if off + 4 > n:
+                return None
+            (v_len,) = struct.unpack_from("<I", payload, off)
+            off += 4
+            byte_len = v_len * 4
+            if off + byte_len > n:
+                return None
+            doc_obj["vector"] = list(struct.unpack_from(f"<{v_len}f", payload, off))
+            off += byte_len
+        docs.append(doc_obj)
+    if off + 4 > n:
+        return None
+    (id_count,) = struct.unpack_from("<I", payload, off)
+    off += 4
+    ids = []
+    for _ in range(id_count):
+        if off + 4 > n:
+            return None
+        (id_len,) = struct.unpack_from("<I", payload, off)
+        off += 4
+        if off + id_len > n:
+            return None
+        ids.append(payload[off : off + id_len].decode("utf-8"))
+        off += id_len
+    if off != n:
+        return None
+    return {"op": op, "docs": docs, "ids": ids}
+
+
 class BinaryStorage:
     """Manages reading and writing memory-aligned .sutra binary files."""
 
@@ -349,7 +407,13 @@ class WriteAheadLog:
                     break
                 if zlib.crc32(payload) != expected_crc:
                     break
-                entries.append(json.loads(payload.decode("utf-8")))
+                if payload.startswith(b"SWB1"):
+                    rec = _decode_wal_binary(payload)
+                    if rec is None:
+                        break
+                    entries.append(rec)
+                else:
+                    entries.append(json.loads(payload.decode("utf-8")))
 
         return entries
 

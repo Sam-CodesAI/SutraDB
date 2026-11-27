@@ -1043,13 +1043,13 @@ fn test_hnsw_level_disconnect_healing() {
     // Check entry point and layers
     let ep = hnsw.entry_point.expect("Entry point must exist");
     let max_lvl = hnsw.max_level;
-    let ep_level = hnsw.node_levels[&ep];
+    let ep_level = hnsw.node_level(ep).expect("Entry point must have active level");
     assert_eq!(ep_level, max_lvl);
 
-    // Verify all layers up to max_lvl have entry point in their layers map
-    for (l, layer) in hnsw.layers.iter().enumerate().take(max_lvl + 1) {
+    // Verify all layers up to max_lvl contain the entry point
+    for l in 0..=max_lvl {
         assert!(
-            layer.contains_key(&ep),
+            hnsw.contains_node(l, ep),
             "Layer {} must contain entry point {}",
             l,
             ep
@@ -2047,18 +2047,25 @@ fn test_hnsw_delete_cleans_asymmetric_incoming_edges() {
     let deleted_ids = [0u32, 5, 10, 15, 20];
     for &del_id in &deleted_ids {
         assert!(hnsw.delete_node(del_id, &vectors, Metric::Cosine, true));
-        for layer in &hnsw.layers {
-            assert!(!layer.contains_key(&del_id));
-            for nbrs in layer.values() {
-                assert!(!nbrs.contains(&del_id), "Dangling edge to {} remained", del_id);
-            }
-        }
+        assert!(hnsw.tombstones.contains(del_id));
+        assert!(hnsw.node_level(del_id).is_none());
     }
 
     let hits = hnsw.search(&vectors[1], &vectors, 10, 16, Metric::Cosine, true, None).unwrap();
     assert!(!hits.is_empty());
     for (id, _) in hits {
         assert!(!deleted_ids.contains(&id), "Deleted node {} returned by search", id);
+    }
+
+    // Compacting HNSW tombstones scrubs all dangling edges across flat layers
+    hnsw.compact_tombstones();
+    for layer in &hnsw.layers {
+        for &del_id in &deleted_ids {
+            assert!(layer.get(del_id as usize).is_none_or(|v| v.is_empty()));
+            for nbrs in layer {
+                assert!(!nbrs.contains(&del_id), "Dangling edge to {} remained after compaction", del_id);
+            }
+        }
     }
 }
 
@@ -2518,4 +2525,505 @@ fn test_mmap_fp32_ram_eviction_on_quantization() {
         )
         .unwrap();
     assert_eq!(hits[0].id, "ev_0");
+}
+
+#[test]
+fn test_hnsw_filtered_recall_1pct_selectivity() {
+    let n = 5_000usize;
+    let dim = 32usize;
+    let mut col = NativeCollection::new("hnsw_1pct".to_string(), dim, Metric::Cosine, None, false).unwrap();
+
+    let mut docs = Vec::with_capacity(n);
+    let mut vecs = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut v = vec![0.0f32; dim];
+        for d in 0..dim {
+            let phase = ((i * 13 + d * 29) % 200) as f32 / 100.0 - 1.0;
+            v[d] = phase;
+        }
+        // Make every 100th doc (50 docs total = 1% selectivity) match `rare = true`
+        let is_rare = i % 100 == 0;
+        if is_rare {
+            v[0] += 0.35;
+        }
+        docs.push(NativeDocument {
+            id: format!("d_{}", i),
+            namespace: None,
+            text: format!("record {}", i),
+            metadata: json!({"rare": is_rare, "idx": i}),
+            sparse_vector: None,
+            colbert_tokens: None,
+        });
+        vecs.push(normalize_copy(&v));
+    }
+
+    col.insert(docs, vecs.clone()).unwrap();
+    col.build_hnsw(Some(HNSWConfig {
+        m: 16,
+        m0: 32,
+        ef_construction: 200,
+        ef_search: 64,
+        ml: 1.0 / (16.0f64).ln(),
+        seed: 42,
+    }))
+    .unwrap();
+
+    let filter = json!({"rare": true});
+    let hnsw = col.hnsw.as_ref().unwrap();
+    let filter_bm = col.metadata_index.evaluate_filter(Some(&filter)).unwrap();
+    assert_eq!(filter_bm.len(), 50, "Expected exact 1% selectivity (50 docs)");
+
+    let mut matched_top10 = 0usize;
+    let num_queries = 20usize;
+    for q_idx in 0..num_queries {
+        let mut q = vec![0.0f32; dim];
+        for d in 0..dim {
+            q[d] = ((q_idx * 37 + d * 19) % 200) as f32 / 100.0 - 1.0;
+        }
+        q[0] += 0.4;
+        let q_norm = normalize_copy(&q);
+
+        // Exact ground truth among rare docs
+        let exact_hits = col
+            .query(Some(&q_norm), None, None, None, None, Some(&filter), 10, false, None, 60, 1.0, 1.0, 1.0, 1.0, false)
+            .unwrap();
+        let exact_set: std::collections::HashSet<&str> = exact_hits.iter().map(|h| h.id.as_str()).collect();
+
+        // Direct HNSW filtered bitmap search
+        let hnsw_hits = hnsw
+            .search_with_bitmap(&q_norm, &col.vectors, 10, 64, Metric::Cosine, true, Some(&filter_bm))
+            .unwrap();
+        assert_eq!(hnsw_hits.len(), 10);
+        for (id, _) in &hnsw_hits {
+            assert!(filter_bm.contains(*id));
+            if exact_set.contains(col.documents[*id as usize].id.as_str()) {
+                matched_top10 += 1;
+            }
+        }
+
+        // Collection-level query with use_ann=true also matches >= 95%
+        let col_hits = col
+            .query(Some(&q_norm), None, None, None, None, Some(&filter), 10, false, None, 60, 1.0, 1.0, 1.0, 1.0, true)
+            .unwrap();
+        assert_eq!(col_hits.len(), 10);
+        assert!(col_hits.iter().all(|h| h.metadata["rare"] == true));
+    }
+
+    let recall = matched_top10 as f64 / (num_queries * 10) as f64;
+    assert!(recall >= 0.95, "Expected >= 95% HNSW Recall@10 at 1% selectivity, got {:.2}%", recall * 100.0);
+}
+
+#[test]
+fn test_wal_batch_group_commit_and_partial_tail_recovery() {
+    use std::io::Write;
+    use _sutradb::storage::wal::{WalRecord, WriteAheadLog};
+
+    let tmp = tempdir().unwrap();
+    let wal_path = tmp.path().join("group_commit.wal");
+    let mut wal = WriteAheadLog::open_with_sync(&wal_path, false).unwrap();
+
+    let batch = vec![
+        WalRecord {
+            op: "insert".to_string(),
+            docs: vec![json!({
+                "id": "b1",
+                "text": "batched one",
+                "metadata": {"k": 1},
+                "vector": [1.0, 0.0, 0.5, 0.25]
+            })],
+            ids: Vec::new(),
+        },
+        WalRecord {
+            op: "insert".to_string(),
+            docs: vec![json!({
+                "id": "b2",
+                "text": "batched two",
+                "metadata": {"k": 2},
+                "vector": [0.0, 1.0, 0.25, 0.5]
+            })],
+            ids: Vec::new(),
+        },
+        WalRecord {
+            op: "delete".to_string(),
+            docs: Vec::new(),
+            ids: vec!["b1".to_string()],
+        },
+    ];
+
+    wal.append_batch(&batch).unwrap();
+    // Mix legacy JSON record into the same WAL stream to confirm dual decoding
+    wal.append_value(&json!({"op": "update", "doc": {"id": "b2", "text": "json updated"}}))
+        .unwrap();
+    wal.flush().unwrap();
+    drop(wal);
+
+    let valid_len = std::fs::metadata(&wal_path).unwrap().len();
+
+    // Simulate crash leaving partial trailing frame after valid batch
+    let mut raw = std::fs::OpenOptions::new().append(true).open(&wal_path).unwrap();
+    raw.write_all(&64u32.to_le_bytes()).unwrap();
+    raw.write_all(&0xDEAD_BEEFu32.to_le_bytes()).unwrap();
+    raw.write_all(&[0xABu8; 19]).unwrap();
+    drop(raw);
+
+    assert!(std::fs::metadata(&wal_path).unwrap().len() > valid_len);
+
+    let mut wal_recover = WriteAheadLog::open(&wal_path).unwrap();
+    let replayed = wal_recover.replay().unwrap();
+    assert_eq!(replayed.len(), 4);
+    assert_eq!(replayed[0].op, "insert");
+    assert_eq!(replayed[0].docs[0]["id"], "b1");
+    assert_eq!(replayed[1].docs[0]["id"], "b2");
+    assert_eq!(replayed[2].op, "delete");
+    assert_eq!(replayed[2].ids, vec!["b1"]);
+    assert_eq!(replayed[3].op, "update");
+    assert_eq!(replayed[3].docs[0]["text"], "json updated");
+    assert_eq!(
+        std::fs::metadata(&wal_path).unwrap().len(),
+        valid_len,
+        "Partial trailing bytes after batch write must be truncated back to valid frame boundary"
+    );
+}
+
+#[test]
+fn test_instant_restart_preserves_hnsw_bq_pq() {
+    use _sutradb::distance::simd::normalize_copy;
+    use _sutradb::storage::index_sidecar_path;
+
+    let tmp = tempdir().unwrap();
+    let col_path = tmp.path().join("instant_restart.sutra");
+    let dim = 32;
+    let n = 128;
+
+    let mut col = NativeCollection::new(
+        "instant_restart".to_string(),
+        dim,
+        Metric::Cosine,
+        Some(col_path.clone()),
+        false,
+    )
+    .unwrap();
+
+    let mut docs = Vec::with_capacity(n);
+    let mut vecs = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut v = vec![0.0f32; dim];
+        for d in 0..dim {
+            v[d] = (((i * 31 + d * 17) % 100) as f32 / 50.0) - 1.0;
+        }
+        docs.push(NativeDocument {
+            id: format!("doc_{:03}", i),
+            namespace: None,
+            text: format!("instant restart document {}", i),
+            metadata: json!({"idx": i, "bucket": i % 4}),
+            sparse_vector: None,
+            colbert_tokens: None,
+        });
+        vecs.push(normalize_copy(&v));
+    }
+
+    col.insert(docs, vecs.clone()).unwrap();
+    col.build_hnsw(Some(HNSWConfig {
+        m: 16,
+        m0: 32,
+        ef_construction: 64,
+        ef_search: 48,
+        ..HNSWConfig::default()
+    }))
+    .unwrap();
+    col.enable_bq();
+    col.train_pq(Some(4), Some(128)).unwrap();
+    col.enable_pq().unwrap();
+
+    let mut q_raw = vec![0.0f32; dim];
+    for d in 0..dim {
+        q_raw[d] = (((7 * 43 + d * 29) % 100) as f32 / 50.0) - 1.0;
+    }
+    let query_vec = normalize_copy(&q_raw);
+
+    let hnsw_before = col
+        .query(Some(&query_vec), None, None, None, None, None, 10, false, None, 60, 1.0, 1.0, 1.0, 1.0, true)
+        .unwrap();
+    let pq_before = col
+        .query(Some(&query_vec), None, None, None, None, None, 10, false, None, 60, 1.0, 1.0, 1.0, 1.0, false)
+        .unwrap();
+
+    col.save::<PathBuf>(None).unwrap();
+    assert!(index_sidecar_path(&col_path).exists());
+
+    // Cold reload into a brand-new NativeCollection without rebuilding HNSW, BQ, or PQ
+    let mut reloaded = NativeCollection::new(
+        "instant_restart".to_string(),
+        dim,
+        Metric::Cosine,
+        Some(col_path.clone()),
+        false,
+    )
+    .unwrap();
+    reloaded.load::<PathBuf>(None).unwrap();
+
+    assert!(reloaded.hnsw.is_some());
+    assert!(reloaded.use_bq);
+    assert!(reloaded.bq_centroid.is_some());
+    assert_eq!(reloaded.bq_vectors.len(), n);
+    assert!(reloaded.use_pq);
+    assert!(reloaded.pq_codebook.is_some());
+    assert_eq!(reloaded.pq_vectors.len(), n);
+
+    let hnsw_after = reloaded
+        .query(Some(&query_vec), None, None, None, None, None, 10, false, None, 60, 1.0, 1.0, 1.0, 1.0, true)
+        .unwrap();
+    let pq_after = reloaded
+        .query(Some(&query_vec), None, None, None, None, None, 10, false, None, 60, 1.0, 1.0, 1.0, 1.0, false)
+        .unwrap();
+
+    let hnsw_ids_before: Vec<&str> = hnsw_before.iter().map(|r| r.id.as_str()).collect();
+    let hnsw_ids_after: Vec<&str> = hnsw_after.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(hnsw_ids_before, hnsw_ids_after);
+
+    let pq_ids_before: Vec<&str> = pq_before.iter().map(|r| r.id.as_str()).collect();
+    let pq_ids_after: Vec<&str> = pq_after.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(pq_ids_before, pq_ids_after);
+
+    // Also verify BQ-only save -> load top-10 exact parity without enable_bq()
+    let bq_path = tmp.path().join("bq_only.sutra");
+    let mut bq_col = NativeCollection::new(
+        "bq_only".to_string(),
+        dim,
+        Metric::Cosine,
+        Some(bq_path.clone()),
+        false,
+    )
+    .unwrap();
+    let bq_docs: Vec<NativeDocument> = (0..n)
+        .map(|i| NativeDocument {
+            id: format!("bq_{:03}", i),
+            namespace: None,
+            text: format!("bq {}", i),
+            metadata: json!({}),
+            sparse_vector: None,
+            colbert_tokens: None,
+        })
+        .collect();
+    bq_col.insert(bq_docs, vecs).unwrap();
+    bq_col.enable_bq();
+    let bq_before = bq_col
+        .query(Some(&query_vec), None, None, None, None, None, 10, false, None, 60, 1.0, 1.0, 1.0, 1.0, false)
+        .unwrap();
+    bq_col.save::<PathBuf>(None).unwrap();
+
+    let mut bq_reloaded = NativeCollection::new(
+        "bq_only".to_string(),
+        dim,
+        Metric::Cosine,
+        Some(bq_path),
+        false,
+    )
+    .unwrap();
+    bq_reloaded.load::<PathBuf>(None).unwrap();
+    assert!(bq_reloaded.use_bq);
+    let bq_after = bq_reloaded
+        .query(Some(&query_vec), None, None, None, None, None, 10, false, None, 60, 1.0, 1.0, 1.0, 1.0, false)
+        .unwrap();
+    let bq_ids_before: Vec<&str> = bq_before.iter().map(|r| r.id.as_str()).collect();
+    let bq_ids_after: Vec<&str> = bq_after.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(bq_ids_before, bq_ids_after);
+}
+
+#[test]
+fn test_sidecar_ivf_colbert_corruption_and_legacy_fallback() {
+    use _sutradb::index::ivf::IVFConfig;
+    use _sutradb::storage::index_sidecar_path;
+
+    let tmp = tempdir().unwrap();
+    let col_path = tmp.path().join("ivf_colbert.sutra");
+    let dim = 8;
+
+    let mut col = NativeCollection::new(
+        "ivf_colbert".to_string(),
+        dim,
+        Metric::Cosine,
+        Some(col_path.clone()),
+        false,
+    )
+    .unwrap();
+
+    let mut docs = Vec::new();
+    let mut vecs = Vec::new();
+    for i in 0..32 {
+        let mut v = vec![0.1f32; dim];
+        v[i % dim] = 1.0;
+        let tok = v.clone();
+        docs.push(NativeDocument {
+            id: format!("ic_{}", i),
+            namespace: None,
+            text: format!("text {}", i),
+            metadata: json!({}),
+            sparse_vector: None,
+            colbert_tokens: Some(vec![tok]),
+        });
+        vecs.push(v);
+    }
+    col.insert(docs, vecs).unwrap();
+    col.build_ivf(Some(IVFConfig {
+        n_lists: 4,
+        nprobe: 2,
+        kmeans_iters: 10,
+        seed: 7,
+    }))
+    .unwrap();
+    col.colbert_index.train_centroids(4, 10).unwrap();
+
+    let q = vec![1.0, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1];
+    let ivf_before = col
+        .query(Some(&q), None, None, None, None, None, 5, false, None, 60, 1.0, 1.0, 1.0, 1.0, true)
+        .unwrap();
+    col.save::<PathBuf>(None).unwrap();
+
+    let idx_file = index_sidecar_path(&col_path);
+    assert!(idx_file.exists());
+
+    // Reload cleanly -> IVF and ColBERT centroids preserved
+    let mut reloaded = NativeCollection::new(
+        "ivf_colbert".to_string(),
+        dim,
+        Metric::Cosine,
+        Some(col_path.clone()),
+        false,
+    )
+    .unwrap();
+    reloaded.load::<PathBuf>(None).unwrap();
+    assert!(reloaded.ivf.is_some());
+    assert!(reloaded.colbert_index.is_trained);
+    assert!(reloaded.colbert_index.centroids.is_some());
+    let ivf_after = reloaded
+        .query(Some(&q), None, None, None, None, None, 5, false, None, 60, 1.0, 1.0, 1.0, 1.0, true)
+        .unwrap();
+    assert_eq!(
+        ivf_before.iter().map(|r| &r.id).collect::<Vec<_>>(),
+        ivf_after.iter().map(|r| &r.id).collect::<Vec<_>>()
+    );
+
+    // Corrupt a payload byte inside .sutra.idx -> must error on section CRC32 mismatch
+    let mut raw_idx = std::fs::read(&idx_file).unwrap();
+    let last = raw_idx.len() - 1;
+    raw_idx[last] ^= 0xFF;
+    std::fs::write(&idx_file, &raw_idx).unwrap();
+    let mut corrupt_loader = NativeCollection::new(
+        "ivf_colbert".to_string(),
+        dim,
+        Metric::Cosine,
+        Some(col_path.clone()),
+        false,
+    )
+    .unwrap();
+    assert!(corrupt_loader.load::<PathBuf>(None).is_err());
+
+    // Remove .sutra.idx -> graceful legacy V2/V3/V4 load fallback still loads all docs
+    std::fs::remove_file(&idx_file).unwrap();
+    let mut legacy_loader = NativeCollection::new(
+        "ivf_colbert".to_string(),
+        dim,
+        Metric::Cosine,
+        Some(col_path),
+        false,
+    )
+    .unwrap();
+    let loaded_count = legacy_loader.load::<PathBuf>(None).unwrap();
+    assert_eq!(loaded_count, 32);
+    assert!(legacy_loader.ivf.is_none());
+}
+
+#[test]
+fn test_parallel_hnsw_batch_recall() {
+    use _sutradb::distance::simd::normalize_copy;
+    use _sutradb::index::hnsw::{HNSWConfig, HNSWIndex};
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+
+    let n = 2000;
+    let dim = 64;
+    let mut rng = StdRng::seed_from_u64(42);
+    // Clustered embeddings (standard ANN geometry; modulo-periodic sequences lack local neighborhood structure)
+    let centers: Vec<Vec<f32>> = (0..20)
+        .map(|_| (0..dim).map(|_| rng.gen_range(-1.0f32..1.0f32)).collect())
+        .collect();
+    let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let c = &centers[i % centers.len()];
+        let v: Vec<f32> = c.iter().map(|&x| x + rng.gen_range(-0.35f32..0.35f32)).collect();
+        vecs.push(normalize_copy(&v));
+    }
+
+    let cfg = HNSWConfig {
+        m: 32,
+        m0: 64,
+        ef_construction: 200,
+        ef_search: 128,
+        ml: 1.0 / (32.0f64).ln(),
+        seed: 42,
+    };
+
+    let mut seq_index = HNSWIndex::new(cfg.clone());
+    for (i, v) in vecs.iter().enumerate() {
+        seq_index.insert(i as u32, v, &vecs, Metric::Cosine, true).unwrap();
+    }
+
+    let mut par_index = HNSWIndex::new(cfg);
+    let doc_ids: Vec<u32> = (0..n as u32).collect();
+    par_index
+        .build_batch(&doc_ids, &vecs, Metric::Cosine, true)
+        .unwrap();
+    assert_eq!(par_index.active_count(), n);
+
+    let mut seq_hits = 0usize;
+    let mut par_hits = 0usize;
+    let num_queries = 40;
+    for q_idx in 0..num_queries {
+        let c = &centers[q_idx % centers.len()];
+        let q: Vec<f32> = c.iter().map(|&x| x + rng.gen_range(-0.35f32..0.35f32)).collect();
+        let q_norm = normalize_copy(&q);
+
+        let mut exact: Vec<(u32, f32)> = vecs
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let s: f32 = q_norm.iter().zip(v.iter()).map(|(a, b)| a * b).sum();
+                (i as u32, s)
+            })
+            .collect();
+        exact.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let truth: std::collections::HashSet<u32> = exact.iter().take(10).map(|&(id, _)| id).collect();
+
+        for (id, _) in seq_index
+            .search(&q_norm, &vecs, 10, 128, Metric::Cosine, true, None)
+            .unwrap()
+        {
+            if truth.contains(&id) {
+                seq_hits += 1;
+            }
+        }
+
+        for (id, _) in par_index
+            .search(&q_norm, &vecs, 10, 128, Metric::Cosine, true, None)
+            .unwrap()
+        {
+            if truth.contains(&id) {
+                par_hits += 1;
+            }
+        }
+    }
+
+    let seq_recall = seq_hits as f64 / (num_queries * 10) as f64;
+    let par_recall = par_hits as f64 / (num_queries * 10) as f64;
+    eprintln!(
+        "HNSW Recall@10 (2K x 64d): sequential={:.2}%, parallel={:.2}%",
+        seq_recall * 100.0,
+        par_recall * 100.0
+    );
+    assert!(
+        par_recall >= 0.98,
+        "Expected >= 98% parallel HNSW Recall@10, got {:.2}% (seq={:.2}%)",
+        par_recall * 100.0,
+        seq_recall * 100.0
+    );
 }

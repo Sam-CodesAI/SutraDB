@@ -952,7 +952,27 @@ impl PyNativeCollection {
                 .inner
                 .read()
                 .map_err(|e| SutraError::Lock(e.to_string()))?;
-            Ok(guard.hnsw.as_ref().map(|h| h.layers.clone()))
+            Ok(guard.hnsw.as_ref().map(|h| {
+                h.layers
+                    .iter()
+                    .enumerate()
+                    .map(|(lvl, layer_nodes)| {
+                        let mut map = HashMap::new();
+                        for (node_idx, nbrs) in layer_nodes.iter().enumerate() {
+                            let id = node_idx as u32;
+                            if h.node_level(id).is_some_and(|max_l| lvl <= max_l) {
+                                let clean_nbrs: Vec<u32> = nbrs
+                                    .iter()
+                                    .copied()
+                                    .filter(|&n| !h.tombstones.contains(n))
+                                    .collect();
+                                map.insert(id, clean_nbrs);
+                            }
+                        }
+                        map
+                    })
+                    .collect()
+            }))
         })
         .map_err(Into::into)
     }

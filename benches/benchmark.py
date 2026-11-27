@@ -38,6 +38,7 @@ class BenchmarkResult:
     ram_base_mb: float
     ram_peak_mb: float
     ram_net_mb: float
+    rss_delta_mb: float
     ram_compression_ratio: float
     p50_ms: float
     p90_ms: float
@@ -47,8 +48,10 @@ class BenchmarkResult:
     min_ms: float
     max_ms: float
     qps: float
-    recall_at_1: float
-    recall_at_k: float
+    recall_at_1: Optional[float]
+    recall_at_k: Optional[float]
+    cold_restart_ms: Optional[float] = None
+    hnsw_build_docs_per_sec: Optional[float] = None
 
 
 class BenchmarkDataset:
@@ -191,7 +194,8 @@ def run_benchmark(
             predicted_ids.append([f"doc_{idx:06d}" for idx in sorted_idx])
 
         rec_1, rec_k = calculate_recall(predicted_ids, gt_indices, top_k)
-        net_ram = max(ram_peak - ram_base, (n_docs * dim * 4) / (1024 * 1024))
+        net_ram = (n_docs * dim * 4) / (1024.0 * 1024.0)
+        rss_delta = max(ram_peak - ram_base, net_ram)
         results.append(
             BenchmarkResult(
                 engine="NumPy",
@@ -203,6 +207,7 @@ def run_benchmark(
                 ram_base_mb=ram_base,
                 ram_peak_mb=ram_peak,
                 ram_net_mb=net_ram,
+                rss_delta_mb=rss_delta,
                 ram_compression_ratio=1.0,
                 p50_ms=float(np.percentile(latencies, 50)),
                 p90_ms=float(np.percentile(latencies, 90)),
@@ -231,14 +236,16 @@ def run_benchmark(
     if not enabled_variants or "sutradb_flat" in enabled_variants:
         print("\n[2/8] Benchmarking SutraDB Flat (Exact Rust SIMD)...")
         with tempfile.TemporaryDirectory() as tmp_dir:
+            docs = build_doc_batch()
             gc.collect()
             ram_base = measure_memory_mb()
             col = Collection("bench_flat", dimension=dim, metric=Metric.COSINE)
-            docs = build_doc_batch()
 
             t0 = time.perf_counter()
             col.insert(docs)
             ingest_time = time.perf_counter() - t0
+            del docs
+            gc.collect()
             ram_peak = measure_memory_mb()
 
             for i in range(min(warmup, n_queries)):
@@ -253,7 +260,9 @@ def run_benchmark(
                 predicted_ids.append([r.id for r in res])
 
             rec_1, rec_k = calculate_recall(predicted_ids, gt_indices, top_k)
-            net_ram = max(ram_peak - ram_base, raw_f32_ram_mb)
+            col_stats = col.stats()
+            vec_ram = float(col_stats.get("vector_memory_mb", raw_f32_ram_mb))
+            rss_delta = max(ram_peak - ram_base, vec_ram)
             results.append(
                 BenchmarkResult(
                     engine="SutraDB",
@@ -264,7 +273,8 @@ def run_benchmark(
                     ingest_docs_per_sec=n_docs / max(ingest_time, 1e-6),
                     ram_base_mb=ram_base,
                     ram_peak_mb=ram_peak,
-                    ram_net_mb=net_ram,
+                    ram_net_mb=vec_ram,
+                    rss_delta_mb=rss_delta,
                     ram_compression_ratio=1.0,
                     p50_ms=float(np.percentile(latencies, 50)),
                     p90_ms=float(np.percentile(latencies, 90)),
@@ -283,15 +293,20 @@ def run_benchmark(
     if not enabled_variants or "sutradb_hnsw" in enabled_variants:
         print("\n[3/8] Benchmarking SutraDB HNSW (Graph ANN)...")
         with tempfile.TemporaryDirectory() as tmp_dir:
+            snap_path = Path(tmp_dir) / "bench_hnsw.sutra"
+            docs = build_doc_batch()
             gc.collect()
             ram_base = measure_memory_mb()
-            col = Collection("bench_hnsw", dimension=dim, metric=Metric.COSINE)
-            docs = build_doc_batch()
+            col = Collection("bench_hnsw", dimension=dim, metric=Metric.COSINE, storage_path=snap_path)
 
             t0 = time.perf_counter()
             col.insert(docs)
+            t_build0 = time.perf_counter()
             col.build_hnsw(m=32, ef_construction=200, ef_search=160)
+            build_time = time.perf_counter() - t_build0
             ingest_time = time.perf_counter() - t0
+            del docs
+            gc.collect()
             ram_peak = measure_memory_mb()
 
             for i in range(min(warmup, n_queries)):
@@ -306,7 +321,19 @@ def run_benchmark(
                 predicted_ids.append([r.id for r in res])
 
             rec_1, rec_k = calculate_recall(predicted_ids, gt_indices, top_k)
-            net_ram = max(ram_peak - ram_base, raw_f32_ram_mb * 1.25)
+            col_stats = col.stats()
+            hnsw_mem_mb = float(col_stats.get("hnsw", {}).get("memory_mb", 0.0))
+            vec_idx_ram = float(col_stats.get("vector_memory_mb", raw_f32_ram_mb)) + hnsw_mem_mb
+            rss_delta = max(ram_peak - ram_base, vec_idx_ram)
+
+            # Measure instant-restart cold load time (save + load .sutra + .sutra.idx sidecar)
+            col.save()
+            t_load0 = time.perf_counter()
+            reloaded = Collection("bench_hnsw", dimension=dim, metric=Metric.COSINE, storage_path=snap_path)
+            reloaded.load()
+            cold_restart_ms = (time.perf_counter() - t_load0) * 1000.0
+            assert reloaded.stats().get("has_hnsw", False), "Cold restart did not restore HNSW index"
+
             results.append(
                 BenchmarkResult(
                     engine="SutraDB",
@@ -317,7 +344,8 @@ def run_benchmark(
                     ingest_docs_per_sec=n_docs / max(ingest_time, 1e-6),
                     ram_base_mb=ram_base,
                     ram_peak_mb=ram_peak,
-                    ram_net_mb=net_ram,
+                    ram_net_mb=vec_idx_ram,
+                    rss_delta_mb=rss_delta,
                     ram_compression_ratio=1.0,
                     p50_ms=float(np.percentile(latencies, 50)),
                     p90_ms=float(np.percentile(latencies, 90)),
@@ -329,6 +357,8 @@ def run_benchmark(
                     qps=1000.0 / float(np.mean(latencies)),
                     recall_at_1=rec_1,
                     recall_at_k=rec_k,
+                    cold_restart_ms=cold_restart_ms,
+                    hnsw_build_docs_per_sec=n_docs / max(build_time, 1e-6),
                 )
             )
 
@@ -336,15 +366,17 @@ def run_benchmark(
     if not enabled_variants or "sutradb_sq8" in enabled_variants:
         print("\n[4/8] Benchmarking SutraDB SQ8 (8-Bit Quantization)...")
         with tempfile.TemporaryDirectory() as tmp_dir:
+            docs = build_doc_batch()
             gc.collect()
             ram_base = measure_memory_mb()
             col = Collection("bench_sq8", dimension=dim, metric=Metric.COSINE)
-            docs = build_doc_batch()
 
             t0 = time.perf_counter()
             col.insert(docs)
             col.enable_sq8()
             ingest_time = time.perf_counter() - t0
+            del docs
+            gc.collect()
             ram_peak = measure_memory_mb()
 
             for i in range(min(warmup, n_queries)):
@@ -360,6 +392,7 @@ def run_benchmark(
 
             rec_1, rec_k = calculate_recall(predicted_ids, gt_indices, top_k)
             sq8_vector_ram = (n_docs * dim * 1.0) / (1024.0 * 1024.0)
+            rss_delta = max(ram_peak - ram_base, sq8_vector_ram)
             results.append(
                 BenchmarkResult(
                     engine="SutraDB",
@@ -371,6 +404,7 @@ def run_benchmark(
                     ram_base_mb=ram_base,
                     ram_peak_mb=ram_peak,
                     ram_net_mb=sq8_vector_ram,
+                    rss_delta_mb=rss_delta,
                     ram_compression_ratio=4.0,  # 32-bit to 8-bit = 4x (75% savings)
                     p50_ms=float(np.percentile(latencies, 50)),
                     p90_ms=float(np.percentile(latencies, 90)),
@@ -389,15 +423,17 @@ def run_benchmark(
     if not enabled_variants or "sutradb_bq" in enabled_variants:
         print("\n[5/8] Benchmarking SutraDB 1-Bit BQ (32x Binary Quantization)...")
         with tempfile.TemporaryDirectory() as tmp_dir:
+            docs = build_doc_batch()
             gc.collect()
             ram_base = measure_memory_mb()
             col = Collection("bench_bq", dimension=dim, metric=Metric.COSINE)
-            docs = build_doc_batch()
 
             t0 = time.perf_counter()
             col.insert(docs)
             col.enable_bq()
             ingest_time = time.perf_counter() - t0
+            del docs
+            gc.collect()
             ram_peak = measure_memory_mb()
 
             for i in range(min(warmup, n_queries)):
@@ -413,6 +449,7 @@ def run_benchmark(
 
             rec_1, rec_k = calculate_recall(predicted_ids, gt_indices, top_k)
             bq_vector_ram = (n_docs * (dim // 8) * 1.0) / (1024.0 * 1024.0)
+            rss_delta = max(ram_peak - ram_base, bq_vector_ram)
             results.append(
                 BenchmarkResult(
                     engine="SutraDB",
@@ -424,6 +461,7 @@ def run_benchmark(
                     ram_base_mb=ram_base,
                     ram_peak_mb=ram_peak,
                     ram_net_mb=bq_vector_ram,
+                    rss_delta_mb=rss_delta,
                     ram_compression_ratio=32.0,  # 32x RAM reduction
                     p50_ms=float(np.percentile(latencies, 50)),
                     p90_ms=float(np.percentile(latencies, 90)),
@@ -442,10 +480,10 @@ def run_benchmark(
     if not enabled_variants or "sutradb_pq" in enabled_variants:
         print("\n[6/8] Benchmarking SutraDB PQ (Product Quantization ADC)...")
         with tempfile.TemporaryDirectory() as tmp_dir:
+            docs = build_doc_batch()
             gc.collect()
             ram_base = measure_memory_mb()
             col = Collection("bench_pq", dimension=dim, metric=Metric.COSINE)
-            docs = build_doc_batch()
 
             m_subspaces = 16 if dim % 16 == 0 else 8
             t0 = time.perf_counter()
@@ -453,6 +491,8 @@ def run_benchmark(
             col.train_pq(m=m_subspaces)
             col.enable_pq()
             ingest_time = time.perf_counter() - t0
+            del docs
+            gc.collect()
             ram_peak = measure_memory_mb()
 
             for i in range(min(warmup, n_queries)):
@@ -468,6 +508,7 @@ def run_benchmark(
 
             rec_1, rec_k = calculate_recall(predicted_ids, gt_indices, top_k)
             pq_vector_ram = (n_docs * m_subspaces * 1.0) / (1024.0 * 1024.0)
+            rss_delta = max(ram_peak - ram_base, pq_vector_ram)
             compression = (dim * 4.0) / m_subspaces
             results.append(
                 BenchmarkResult(
@@ -480,6 +521,7 @@ def run_benchmark(
                     ram_base_mb=ram_base,
                     ram_peak_mb=ram_peak,
                     ram_net_mb=pq_vector_ram,
+                    rss_delta_mb=rss_delta,
                     ram_compression_ratio=compression,
                     p50_ms=float(np.percentile(latencies, 50)),
                     p90_ms=float(np.percentile(latencies, 90)),
@@ -498,14 +540,16 @@ def run_benchmark(
     if not enabled_variants or "sutradb_bm25" in enabled_variants:
         print("\n[7/8] Benchmarking SutraDB BM25 Lexical Engine...")
         with tempfile.TemporaryDirectory() as tmp_dir:
+            docs = build_doc_batch()
             gc.collect()
             ram_base = measure_memory_mb()
             col = Collection("bench_bm25", dimension=dim, metric=Metric.COSINE)
-            docs = build_doc_batch()
 
             t0 = time.perf_counter()
             col.insert(docs)
             ingest_time = time.perf_counter() - t0
+            del docs
+            gc.collect()
             ram_peak = measure_memory_mb()
 
             for i in range(min(warmup, n_queries)):
@@ -517,6 +561,8 @@ def run_benchmark(
                 _ = col.query(text=query_texts[i], top_k=top_k)
                 latencies.append((time.perf_counter() - start) * 1000.0)
 
+            rss_delta = max(ram_peak - ram_base, 0.0)
+            bm25_est_mb = max((n_docs * 200.0) / (1024.0 * 1024.0), 0.1)
             results.append(
                 BenchmarkResult(
                     engine="SutraDB",
@@ -527,7 +573,8 @@ def run_benchmark(
                     ingest_docs_per_sec=n_docs / max(ingest_time, 1e-6),
                     ram_base_mb=ram_base,
                     ram_peak_mb=ram_peak,
-                    ram_net_mb=max(ram_peak - ram_base, 2.0),
+                    ram_net_mb=bm25_est_mb,
+                    rss_delta_mb=rss_delta,
                     ram_compression_ratio=1.0,
                     p50_ms=float(np.percentile(latencies, 50)),
                     p90_ms=float(np.percentile(latencies, 90)),
@@ -537,8 +584,8 @@ def run_benchmark(
                     min_ms=float(np.min(latencies)),
                     max_ms=float(np.max(latencies)),
                     qps=1000.0 / float(np.mean(latencies)),
-                    recall_at_1=1.0,  # Pure text queries do not match vector ground truth
-                    recall_at_k=1.0,
+                    recall_at_1=None,
+                    recall_at_k=None,
                 )
             )
 
@@ -546,29 +593,30 @@ def run_benchmark(
     if not enabled_variants or "sutradb_hybrid" in enabled_variants:
         print("\n[8/8] Benchmarking SutraDB Hybrid RRF (Dense + BM25)...")
         with tempfile.TemporaryDirectory() as tmp_dir:
+            docs = build_doc_batch()
             gc.collect()
             ram_base = measure_memory_mb()
             col = Collection("bench_hybrid", dimension=dim, metric=Metric.COSINE)
-            docs = build_doc_batch()
 
             t0 = time.perf_counter()
             col.insert(docs)
             ingest_time = time.perf_counter() - t0
+            del docs
+            gc.collect()
             ram_peak = measure_memory_mb()
 
             for i in range(min(warmup, n_queries)):
                 _ = col.query(vector=query_vectors[i], text=query_texts[i], top_k=top_k, alpha=0.5)
 
             latencies = []
-            predicted_ids = []
             for i in range(n_queries):
                 start = time.perf_counter()
-                res = col.query(vector=query_vectors[i], text=query_texts[i], top_k=top_k, alpha=0.5)
+                _ = col.query(vector=query_vectors[i], text=query_texts[i], top_k=top_k, alpha=0.5)
                 latencies.append((time.perf_counter() - start) * 1000.0)
-                predicted_ids.append([r.id for r in res])
 
-            rec_1, rec_k = calculate_recall(predicted_ids, gt_indices, top_k)
-            net_ram = max(ram_peak - ram_base, raw_f32_ram_mb)
+            col_stats = col.stats()
+            vec_ram = float(col_stats.get("vector_memory_mb", raw_f32_ram_mb))
+            rss_delta = max(ram_peak - ram_base, vec_ram)
             results.append(
                 BenchmarkResult(
                     engine="SutraDB",
@@ -579,7 +627,8 @@ def run_benchmark(
                     ingest_docs_per_sec=n_docs / max(ingest_time, 1e-6),
                     ram_base_mb=ram_base,
                     ram_peak_mb=ram_peak,
-                    ram_net_mb=net_ram,
+                    ram_net_mb=vec_ram,
+                    rss_delta_mb=rss_delta,
                     ram_compression_ratio=1.0,
                     p50_ms=float(np.percentile(latencies, 50)),
                     p90_ms=float(np.percentile(latencies, 90)),
@@ -589,29 +638,52 @@ def run_benchmark(
                     min_ms=float(np.min(latencies)),
                     max_ms=float(np.max(latencies)),
                     qps=1000.0 / float(np.mean(latencies)),
-                    recall_at_1=rec_1,
-                    recall_at_k=rec_k,
+                    recall_at_1=None,  # Not comparable to random pure-dense synthetic vectors
+                    recall_at_k=None,
                 )
             )
 
     return results
 
 
+def _format_recall(r: BenchmarkResult, precision: int = 1) -> str:
+    if r.recall_at_k is not None:
+        return f"{r.recall_at_k * 100:.{precision}f}%"
+    if r.variant.startswith("Hybrid"):
+        return "N/A (Hybrid)"
+    return "N/A"
+
+
 def print_ascii_table(results: List[BenchmarkResult]):
     """Pretty prints benchmark comparison table adhering to column widths."""
-    print("\n" + "=" * 78)
+    print("\n" + "=" * 92)
     print(" 🚀 SUTRADB COMPARATIVE BENCHMARK SUMMARY")
-    print("=" * 78)
-    header = f"{'Engine Variant':<26} | {'P50 (ms)':<8} | {'P99 (ms)':<8} | {'QPS':<7} | {'RAM (MB)':<8} | {'Recall@10':<9}"
+    print("=" * 92)
+    header = (
+        f"{'Engine Variant':<26} | {'P50 (ms)':<8} | {'P99 (ms)':<8} | "
+        f"{'QPS':<6} | {'Vec RAM':<8} | {'RSS Δ':<8} | {'Recall@10':<12}"
+    )
     print(header)
-    print("-" * 78)
+    print("-" * 92)
 
     for r in results:
-        rec_str = f"{r.recall_at_k*100:.1f}%" if r.variant != "BM25 Lexical" else "N/A"
+        rec_str = _format_recall(r, precision=1)
         name = f"{r.engine} {r.variant}"
-        row = f"{name:<26} | {r.p50_ms:>8.3f} | {r.p99_ms:>8.3f} | {r.qps:>7.0f} | {r.ram_net_mb:>8.1f} | {rec_str:>9}"
+        row = (
+            f"{name:<26} | {r.p50_ms:>8.3f} | {r.p99_ms:>8.3f} | {r.qps:>6.0f} | "
+            f"{r.ram_net_mb:>6.1f}MB | {r.rss_delta_mb:>6.1f}MB | {rec_str:>12}"
+        )
         print(row)
-    print("=" * 78)
+    for r in results:
+        if r.cold_restart_ms is not None or r.hnsw_build_docs_per_sec is not None:
+            print("-" * 92)
+            parts = []
+            if r.hnsw_build_docs_per_sec is not None:
+                parts.append(f"HNSW build: {r.hnsw_build_docs_per_sec:,.0f} docs/s")
+            if r.cold_restart_ms is not None:
+                parts.append(f"Cold-restart load (.sutra + .sutra.idx): {r.cold_restart_ms:.2f} ms")
+            print(" | ".join(parts))
+    print("=" * 92)
 
 
 def generate_markdown_report(results: List[BenchmarkResult], output_path: Path):
@@ -620,7 +692,7 @@ def generate_markdown_report(results: List[BenchmarkResult], output_path: Path):
     cpu_arch = platform.machine()
     py_ver = platform.python_version()
 
-    report = f"""# 📊 SutraDB v5.1.0 Empirical Benchmark Report
+    report = f"""# 📊 SutraDB v6.0.0 Empirical Benchmark Report
 
 Generated automatically on: `{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}`
 
@@ -636,17 +708,27 @@ Generated automatically on: `{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime
 
 ## 📈 Latency, Throughput & Compression Results
 
-| Engine Variant | Ingestion (docs/s) | P50 (ms) | P95 (ms) | P99 (ms) | QPS | Vector RAM | Compression | Recall@10 |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| Engine Variant | Ingestion (docs/s) | P50 (ms) | P95 (ms) | P99 (ms) | QPS | Vector/Index RAM | RSS Δ | Compression | Recall@10 |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 """
 
     for r in results:
-        rec_str = f"{r.recall_at_k*100:.2f}%" if r.variant != "BM25 Lexical" else "N/A"
+        rec_str = _format_recall(r, precision=2)
         name = f"**{r.engine}** ({r.variant})"
         report += (
             f"| {name} | {r.ingest_docs_per_sec:>9,.0f} | {r.p50_ms:>7.3f} | {r.p95_ms:>7.3f} | "
-            f"{r.p99_ms:>7.3f} | {r.qps:>6,.0f} | {r.ram_net_mb:>6.1f} MB | {r.ram_compression_ratio:.0f}x | {rec_str} |\n"
+            f"{r.p99_ms:>7.3f} | {r.qps:>6,.0f} | {r.ram_net_mb:>6.1f} MB | {r.rss_delta_mb:>6.1f} MB | "
+            f"{r.ram_compression_ratio:.0f}x | {rec_str} |\n"
         )
+
+    restart_rows = [r for r in results if r.cold_restart_ms is not None or r.hnsw_build_docs_per_sec is not None]
+    if restart_rows:
+        report += "\n## ⚡ Parallel HNSW Build & Instant-Restart Snapshot Performance\n"
+        for r in restart_rows:
+            if r.hnsw_build_docs_per_sec is not None:
+                report += f"- **Parallel HNSW Build Throughput (`m=32, ef_construction=200`):** `{r.hnsw_build_docs_per_sec:,.0f} docs/s` (`{r.ingest_docs_per_sec:,.0f} docs/s` end-to-end insert+build)\n"
+            if r.cold_restart_ms is not None:
+                report += f"- **Cold-Restart Load (`.sutra` + `.sutra.idx` sidecar restore):** `{r.cold_restart_ms:.2f} ms`\n"
 
     report += """
 ---

@@ -97,6 +97,26 @@ impl ColbertIndex {
         self.doc_tokens.is_empty()
     }
 
+    /// Restores document tokens directly without recomputing centroid postings when centroids
+    /// and postings were loaded directly from an `.sutra.idx` sidecar.
+    pub fn restore_document_tokens(
+        &mut self,
+        doc_id: u32,
+        mut tokens: Vec<Vec<f32>>,
+    ) -> Result<(), SutraError> {
+        for t in &mut tokens {
+            if t.len() != self.token_dim {
+                return Err(SutraError::DimensionMismatch {
+                    expected: self.token_dim,
+                    got: t.len(),
+                });
+            }
+            normalize_in_place(t);
+        }
+        self.doc_tokens.insert(doc_id, tokens);
+        Ok(())
+    }
+
     /// Fallibly adds or updates a document's token embeddings after validating token dimensions.
     pub fn try_add_document(&mut self, doc_id: u32, mut tokens: Vec<Vec<f32>>) -> Result<(), SutraError> {
         for t in &mut tokens {

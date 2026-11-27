@@ -1,11 +1,10 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
-use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tokio::task::JoinSet;
@@ -17,7 +16,7 @@ use crate::error::SutraError;
 use crate::grpc::proto::sutra_service_server::SutraService;
 use crate::grpc::proto::*;
 use crate::sparse::SparseVector;
-use crate::storage::{MmapVectorStorage, WalRecord, WriteAheadLog};
+use crate::storage::{MmapVectorStorage, WriteAheadLog};
 use crate::validate_collection_name;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,52 +85,7 @@ pub(crate) fn write_manifest_for_collection(col: &NativeCollection) -> std::io::
 }
 
 pub(crate) fn count_wal_records(wal_path: &Path) -> u64 {
-    let mut reader = match File::open(wal_path) {
-        Ok(f) => f,
-        Err(_) => return 0,
-    };
-    let file_len = match reader.metadata() {
-        Ok(m) => m.len(),
-        Err(_) => return 0,
-    };
-    if file_len == 0 {
-        return 0;
-    }
-
-    let mut count: u64 = 0;
-    let mut offset: u64 = 0;
-    loop {
-        let mut header = [0u8; 8];
-        if reader.read_exact(&mut header).is_err() {
-            break;
-        }
-        let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
-        let expected_crc = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-
-        if offset.saturating_add(8).saturating_add(len as u64) > file_len {
-            break;
-        }
-
-        let mut payload = vec![0u8; len];
-        if reader.read_exact(&mut payload).is_err() {
-            break;
-        }
-
-        let mut hasher = Hasher::new();
-        hasher.update(&payload);
-        if hasher.finalize() != expected_crc {
-            break;
-        }
-
-        if serde_json::from_slice::<WalRecord>(&payload).is_err() {
-            break;
-        }
-
-        count += 1;
-        offset += 8 + len as u64;
-    }
-
-    count
+    WriteAheadLog::count_records_at(wal_path)
 }
 
 pub(crate) fn wal_records_for_collection(col: &NativeCollection) -> u64 {
