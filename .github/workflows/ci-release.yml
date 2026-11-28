@@ -40,7 +40,8 @@ jobs:
 
       - name: Build Local Wheel & Run Pytest
         run: |
-          pip install .
+          pip install --no-build-isolation .
+          python -c "import sys, pathlib, shutil; sys.path = [p for p in sys.path if p not in ('', '.')]; import sutradb._sutradb as m; shutil.copy2(m.__file__, pathlib.Path('sutradb') / pathlib.Path(m.__file__).name)"
           pytest -v
 
   build-wheels:
