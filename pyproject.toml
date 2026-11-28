@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "sutradb-core"
 version = "5.5.0"
-description = "Industrial-grade, zero-dependency hybrid vector search & BM25 lexical engine with HNSW, SQ8, and IVF-Flat indexing in Rust."
+description = "Embedded Rust + Python hybrid vector database (HNSW, BM25, WAND sparse, ColBERT) with AVX2/NEON SIMD, 32x BQ quantization, and sub-ms Roaring filtering."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -14,16 +14,15 @@ authors = [
 ]
 keywords = [
     "vector-database",
-    "embeddings",
-    "semantic-search",
-    "bm25",
     "hybrid-search",
     "hnsw",
-    "sq8",
+    "bm25",
     "rag",
-    "llm",
-    "machine-learning",
-    "rust"
+    "colbert",
+    "embeddings",
+    "rust",
+    "simd",
+    "embedded-database",
 ]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
@@ -46,10 +45,11 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://sam-codes.vercel.app"
+Homepage = "https://pypi.org/project/sutradb-core/"
 Repository = "https://github.com/Sam-CodesAI/SutraDB"
+Changelog = "https://github.com/Sam-CodesAI/SutraDB/releases"
+Issues = "https://github.com/Sam-CodesAI/SutraDB/issues"
 Documentation = "https://github.com/Sam-CodesAI/SutraDB#readme"
-"Bug Tracker" = "https://github.com/Sam-CodesAI/SutraDB/issues"
 
 [project.optional-dependencies]
 dev = [

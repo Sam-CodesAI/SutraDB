@@ -3,8 +3,12 @@ name = "sutradb-core"
 version = "5.5.0"
 edition = "2021"
 authors = ["Samarth Nimangre <samarthknimangre@gmail.com>"]
-description = "High-performance, zero-dependency hybrid vector search & BM25 lexical engine in Rust."
+description = "Embedded Rust + Python hybrid vector database (HNSW, BM25, WAND sparse, ColBERT) with AVX2/NEON SIMD, 32x BQ quantization, and sub-ms Roaring filtering."
 license = "MIT"
+repository = "https://github.com/Sam-CodesAI/SutraDB"
+homepage = "https://pypi.org/project/sutradb-core/"
+keywords = ["vector-database", "hnsw", "bm25", "simd", "hybrid-search"]
+categories = ["database-implementations", "algorithms", "science"]
 
 [lib]
 name = "_sutradb"

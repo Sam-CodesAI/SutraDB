@@ -18,104 +18,38 @@
 
 > **सूत्र (Sūtra)**: *An aphorism or thread of knowledge designed to hold vast wisdom in the most concise, unbreakable form.*
 
-**SutraDB** is an industrial-grade, ultra-fast vector & BM25 hybrid search engine built with a native **Rust core** and zero-overhead **PyO3 Python bindings**. It combines runtime hardware CPU auto-dispatch (**AVX-512, AVX2, ARM NEON**), Rayon GIL-free multicore parallel processing, an advanced **Linguistic NLP Analyzer Pipeline** (Porter stemming, Spanish/French/German suffix stemmers, CJK bigrams, code identifier splitting), **Product Quantization (PQ)** (up to 64x RAM reduction with Asymmetric Distance Computation), **1-Bit Binary Quantization (BQ)** (32x RAM reduction), **SQ8 Scalar Quantization** (75% RAM reduction), **dynamic online HNSW deletion & healing**, **geo-spatial metadata filtering**, **IVF-Flat** indexing, **multi-tenant namespace isolation**, **zero-copy memory mapping (`memmap2`)**, and official connectors for **LangChain** and **LlamaIndex**.
+**SutraDB** is an **embedded Rust + Python hybrid vector database** engineered for **local RAG**, AI agents, and voice pipelines with **zero Docker** required. Inside a single PyO3 ABI3 wheel (or standalone Rust binary), it combines dense **HNSW**, **BM25** lexical search, **WAND sparse** retrieval, and **ColBERT** MaxSim reranking over contiguous memory slabs with runtime AVX-512, AVX2+FMA, and ARM NEON SIMD. A cost-based `RoaringBitmap` planner delivers **sub-millisecond metadata filtering** (`0.187 ms` P50 at 100K × 768d, 100% Recall@10), backed by 32× 1-bit binary quantization, `.sutra.idx` sidecars, and a `SWB1` binary WAL.
 
-### ⚡ 5-Second 1-Click Launch (Embedded Workbench)
+---
 
-No compilers, Node, or npm required. Launch the complete dual-daemon stack (Rust gRPC on `:50051` + REST/Workbench on `:8765`):
+## Quickstart
+
+Install prebuilt Linux, macOS, or Windows wheels (`pip install sutradb-core==5.5.0`) and run embedded hybrid search with **zero Docker** setup:
 
 ```bash
-docker run -d \
-  --name sutradb \
-  -p 8765:8765 \
-  -p 50051:50051 \
-  -v sutra_data:/data \
-  samcodesai/sutradb:latest
-
-# Open the Zero-Build Developer Workbench immediately:
-# 👉 http://localhost:8765/ui
+pip install sutradb-core==5.5.0
 ```
 
-Designed specifically for production RAG (Retrieval-Augmented Generation), local AI agents, enterprise document retrieval, and low-latency voice AI where cloud vector database round-trips (>40ms) or Chroma's heavy memory overhead are unacceptable.
-
----
-
-## 🏗️ Architecture
-
+```python
+from sutradb import SutraDB
+db = SutraDB(persist_directory="./sutra_data")
+col = db.get_or_create_collection("kb")
+col.add_texts(["Rust HNSW with Roaring filtering", "BM25 + ColBERT local RAG"], metadatas=[{"tier": "prod"}, {"tier": "prod"}])
+print(col.search("sub-millisecond metadata filtering", filter={"tier": "prod"}, top_k=2))
 ```
-                               CLIENT REQUEST
-       [ Text Query: "P99 latency bug" | Vector: [0.12, ...] | Namespace: "tenant_42" ]
-       [ Metadata Filter: {"status": "resolved", "priority": {"$lte": 2}} ]
-                                      │
-                                      ▼
-                       ┌──────────────────────────────┐
-                       │   Rust Engine Core (GIL-Free)│
-                       └──────────────┬───────────────┘
-                                      │
-         ┌────────────────────────────┼────────────────────────────┐
-         ▼                            ▼                            ▼
-┌──────────────────┐        ┌──────────────────┐         ┌──────────────────┐
-│ Secondary Index  │        │ Dense Vector Core│         │ Sparse BM25 Core │
-│ & AST Bitmask    │        │ (HNSW / SQ8 SIMD)│         │ (Lexical Tokens) │
-└────────┬─────────┘        └────────┬─────────┘         └────────┬─────────┘
-         │                           │                            │
-         │ Dynamic Bitmask           │ Dense Scores               │ Lexical Scores
-         │ [1, 0, 1, 0, ...]         │ [0.94, 0.41, ...]          │ [8.2, 0.0, ...]
-         └─────────────┬─────────────┴──────────────┬─────────────┘
-                       │                            │
-                       ▼                            ▼
-               ┌───────────────┐            ┌───────────────┐
-               │ Masked Dense  │            │ Masked BM25   │
-               │ Top-K Heap    │            │ Top-K Heap    │
-               └───────┬───────┘            └───────┬───────┘
-                       │                            │
-                       └────────────┬───────────────┘
-                                    │
-                                    ▼
-                    ┌───────────────────────────────┐
-                    │ Reciprocal Rank Fusion (RRF)  │
-                    │ Merges semantic + exact words │
-                    └───────────────┬───────────────┘
-                                    │
-                                    ▼
-                    ┌───────────────────────────────┐
-                    │     Ranked Final Results      │
-                    │   P50: <0.15ms | Recall: >98% │
-                    └───────────────────────────────┘
+
+### Optional: 1-Click Workbench & Standalone Server (`:8765` / `:50051`)
+
+```bash
+docker run -d --name sutradb -p 8765:8765 -p 50051:50051 -v sutra_data:/data samcodesai/sutradb:5.5.0
+# Developer Workbench: http://localhost:8765/ui
 ```
 
 ---
 
-## ⚡ Industrial Capabilities (v3.4)
+## Verified 100K × 768d Benchmarks
 
-* **Hardware SIMD Auto-Dispatch & Multicore Rayon Acceleration:** Dynamic runtime detection of AVX-512, AVX2, and ARM NEON CPU vector extensions. Batch distances and unindexed candidate scoring automatically scale across all available CPU cores using Rayon parallel iterators with zero GIL contention.
-* **Linguistic NLP Analyzer Pipeline for BM25:** Production-ready multi-lingual text processing with zero external C dependencies:
-  - Algorithmic Porter Stemmer for English.
-  - Suffix stemmers for Spanish, French, and German.
-  - Pre-compiled zero-allocation stopword pruning across multiple languages.
-  - CJK (Chinese, Japanese, Korean) bigram sliding window tokenization (`自然语言` -> `["自然", "语言"]`).
-  - Code & identifier sub-token splitting (`getUserProfile` -> `["get", "user", "profile"]`, `fetch_jwt_token` -> `["fetch", "jwt", "token"]`).
-* **Native Rust SIMD Core:** Pure Rust computation core releasing the Python GIL during query execution and batch ingestion for zero-overhead multicore scaling.
-* **Product Quantization (PQ) with Asymmetric Distance Computation (ADC):** Decomposes high-dimensional vector spaces into $M$ orthogonal sub-spaces with k-means codebooks, achieving up to **64x RAM reduction**. Query vectors compute precomputed Look-Up Tables (LUT) in L1 cache for sub-millisecond ADC similarity calculation with full-precision two-stage reranking.
-* **1-Bit Binary Quantization (BQ):** Compresses 64 float32 dimensions into a single 64-bit word (`u64`), delivering a staggering **32x RAM reduction** and sub-microsecond hardware `POPCNT` Hamming distance evaluation with two-stage candidate pruning + exact reranking for $>95\%$ recall.
-* **SQ8 Scalar Quantization (8-Bit):** Compresses vectors from 32-bit floats to 8-bit unsigned integers, slashing RAM consumption by **75%** while retaining $>98\%$ recall via asymmetric dot product queries.
-* **Dynamic Online HNSW Graph Deletion & Healing:** Instant node removal with real-time edge re-wiring, neighbor reconnection, and entry point re-election without tombstones or graph fragmentation.
-* **Geo-Spatial Filtering (`$geo_within` & `$geo_box`):** Native great-circle Haversine distance in meters and rectangular bounding box queries supporting coordinate arrays `[lat, lon]` and dictionaries `{"lat": ..., "lon": ...}`.
-* **Dual ANN Indexing (HNSW & IVF-Flat):** 
-  - **HNSW:** Hierarchical Navigable Small World graphs for $O(\log N)$ vector search and dynamic streaming additions.
-  - **IVF-Flat:** Sublinear Voronoi cell clustering with k-means++ for high-density batched workloads.
-* **Official AI Framework Connectors:** First-class integrations for **LangChain** (`sutradb.integrations.langchain`) and **LlamaIndex** (`sutradb.integrations.llamaindex`).
-* **Nested JSON Metadata & Array Filtering:** Dot-notation path resolution (`user.profile.city`) and operators (`$eq`, `$ne`, `$gt`, `$gte`, `$in`, `$all`, `$size`, `$regex`, `$geo_within`, `$geo_box`).
-* **First-Class Multi-Tenancy (Namespaces):** Strict hardware/logical isolation (`namespace="tenant_123"`). Zero cross-tenant data leaks.
-* **Zero-Copy Memory-Mapped Files (`memmap2`):** Direct OS page-cache mapping of `.sutra` binary vectors. Instant cold-start queries without loading gigabytes of data into heap RAM.
-* **Resilient Write-Ahead Log (WAL):** Atomic append-only transaction logging with CRC32 integrity checks, automatic snapshot compaction, and corrupted-tail power-cut auto-healing.
-* **Zero-Dependency Web Console (`/ui` & `/dashboard`):** Real-time monitoring dashboard with in-browser 2D Canvas PCA vector projection and hybrid query builder.
-
----
-
-## 📊 Verified v5.5.0 Benchmarks
-
-Measured on a 2-vCPU Linux `x86_64` host (`AMD EPYC 7763`, `AVX2 / FMA`, `Python 3.14.2`, Cosine metric, `top_k=10`). Full reproducible scripts live in [`benches/benchmark.py`](benches/benchmark.py) and [`benches/scale_benchmark.py`](benches/scale_benchmark.py).
+Measured on a 2-vCPU Linux `x86_64` host (`AMD EPYC 7763`, `AVX2 / FMA`, `Python 3.14.2`, Cosine metric, `top_k=10`). Reproducible scripts live in [`benches/scale_benchmark.py`](benches/scale_benchmark.py) and [`benches/benchmark.py`](benches/benchmark.py).
 
 ### Out-of-L3-Cache Scale (`100,000` vectors × `768` dims — `293.0 MiB` raw FP32)
 
@@ -145,15 +79,75 @@ Measured on a 2-vCPU Linux `x86_64` host (`AMD EPYC 7763`, `AVX2 / FMA`, `Python
 
 ---
 
-## 🚀 Quickstart (Python)
+## Chaos & Durability Verification
 
-### 1. Installation
+Verified with [`benches/peak_stress_test.py`](benches/peak_stress_test.py) against `target/release/sutradb-server` and `sutradb-core==5.5.0`:
 
-```bash
-pip install sutradb-core
+| Torture Scenario | Result | Verified Outcome |
+| :--- | :---: | :--- |
+| **32-Client Concurrent Storm** (`20s`, RBAC + Prometheus + live `compact()`/`save()`) | **PASS** | `3,055 ops` (`152.75 ops/s`), `0` panics, `0` HTTP 500s, exact `/metrics` parity (`2,389` queries) |
+| **3× OS `SIGKILL` (`kill -9`) WAL Recovery** | **PASS** | **`744 / 744`** HTTP-200 acknowledged surviving docs recovered (**100%** durability, `0` ghosts) |
+| **50% Churn + Compact + Cold Reload** (`20K × 256d → 10K → 15K`) | **PASS** | `0` ghost docs across HNSW / 1%-filter / BM25 / SQ8 / BQ, HNSW Recall@10 = **`98.20%`** |
+| **10,000-Query PyO3 Memory-Leak Soak** | **PASS** | `RSS@1K = 291.32 MiB → RSS@10K = 291.32 MiB` (**`+0.00 MiB` delta**) |
+| **Adversarial Fuzz & Security Gauntlet** | **PASS** | `30 / 30` probes cleanly rejected/contained (`NaN`/`1e50`, `../`/NUL, ReDoS regex, cross-tenant RBAC, corrupt `.sutra`/`.sutra.idx`) |
+
+---
+
+## When to Use SutraDB
+
+* **Use SutraDB when:** You want an embedded, single-process Rust + Python vector DB for **local RAG**, voice AI agents, desktop/edge apps, or low-latency microservices needing dense + BM25 + WAND sparse + ColBERT hybrid retrieval and sub-millisecond filtered queries without Docker or cloud roundtrips (up to ~100K–1M vectors per node).
+* **Use something else when:** You need petabyte/100M+ horizontal auto-sharding with multi-segment LSM background compaction (planned for SutraDB v6.0 — consider Qdrant/Milvus today) or deep relational ACID SQL joins across tables (consider `pgvector` in PostgreSQL).
+
+---
+
+## Architecture
+
+```
+                               CLIENT REQUEST
+       [ Text Query: "P99 latency bug" | Vector: [0.12, ...] | Namespace: "tenant_42" ]
+       [ Metadata Filter: {"status": "resolved", "priority": {"$lte": 2}} ]
+                                      │
+                                      ▼
+                       ┌──────────────────────────────┐
+                       │   Rust Engine Core (GIL-Free)│
+                       └──────────────┬───────────────┘
+                                      │
+         ┌────────────────────────────┼────────────────────────────┐
+         ▼                            ▼                            ▼
+┌──────────────────┐        ┌──────────────────┐         ┌──────────────────┐
+│ Roaring Secondary│        │ Dense / Cost-    │         │ Sparse BM25 &    │
+│ & AST Filter     │        │ Based HNSW/SIMD  │         │ WAND SPLADE Core │
+└────────┬─────────┘        └────────┬─────────┘         └────────┬─────────┘
+         │                           │                            │
+         │ Bitmap Mask               │ Exact / ANN Scores         │ Sparse Scores
+         │ (valid_count <= 2048      │ (AVX-512/AVX2/NEON         │ (Block-Max WAND
+         │  bypasses HNSW hops)      │  or 2-Stage BQ/SQ8/PQ)     │  & ColBERT MaxSim)
+         └─────────────┬─────────────┴──────────────┬─────────────┘
+                       │                            │
+                       ▼                            ▼
+                    ┌───────────────────────────────┐
+                    │ Reciprocal Rank Fusion (RRF)  │
+                    │  & Weighted Linear Scorer     │
+                    └───────────────┬───────────────┘
+                                    │
+                                    ▼
+                    ┌───────────────────────────────┐
+                    │ Ranked Final Results + WAL/   │
+                    │ .sutra.idx Atomic Sidecar     │
+                    └───────────────────────────────┘
 ```
 
-Or build locally with `maturin`:
+* **Runtime SIMD Auto-Dispatch & Single-Slab Arenas:** Contiguous `VectorArena`, `SQ8Arena`, `BQArena`, and `PQArena` slabs paired with AVX-512, AVX2+FMA, and ARM NEON kernels (`std::arch`) + Rayon parallelism with zero Python GIL contention.
+* **Linguistic NLP Analyzer Pipeline:** Zero-dependency English Porter stemmer, Spanish/French/German suffix stemmers, CJK bigrams, and code identifier splitting (`getUserProfile` → `["get", "user", "profile"]`).
+* **Quantization Suite:** **SQ8** (4× RAM reduction, `97.90%` Recall@10 at 100K×768d), **1-Bit BQ** (32× RAM reduction with hardware `POPCNT` and two-stage reranking), and **PQ** (up to 64× RAM reduction via subspace k-means ADC).
+* **Persistence, Auth & Observability:** Atomic `.sutra.idx` sidecars, buffered `SWB1` binary WAL with CRC32 partial-tail auto-healing, constant-time API key RBAC (`admin` | `write` | `read`), Prometheus `0.0.4` histograms (`GET /metrics`), and zero-build Developer Workbench (`/ui`).
+
+---
+
+## Detailed Usage Examples (Python, LangChain & LlamaIndex)
+
+### 1. Local Source Build (`maturin`)
+
 ```bash
 git clone https://github.com/Sam-CodesAI/SutraDB.git
 cd SutraDB
@@ -649,13 +643,13 @@ kubectl rollout status statefulset/sutradb -n sutradb
 
 ## 🧪 Test Suite
 
-Run both native Rust and Python test suites:
+Run both native Rust and Python test suites (`332/332` passing):
 
 ```bash
-# 1. Rust engine, cluster & gRPC integration tests (65 tests)
-cargo test
+# 1. Rust engine, cluster & gRPC integration tests (98 tests)
+cargo test --release
 
-# 2. Python test suite (117 tests)
+# 2. Python test suite (234 tests)
 pytest -v
 ```
 
