@@ -4,6 +4,8 @@ Provides bounded payload enforcement (max 10MB), high-throughput asynchronous ex
 and complete document CRUD with vector & lexical query endpoints.
 """
 
+from __future__ import annotations
+
 import hmac
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
