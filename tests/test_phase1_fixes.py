@@ -113,3 +113,106 @@ def test_cors_never_pairs_wildcard_with_credentials(tmp_path):
         acao = resp.headers.get("access-control-allow-origin", "")
         acac = resp.headers.get("access-control-allow-credentials", "").lower()
         assert not (acao == "*" and acac == "true")
+
+
+def test_python_server_rbac_metrics_and_proxy_header_forwarding(tmp_path, monkeypatch):
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    # 1. Standalone FastAPI RBAC + Prometheus histogram verification
+    rbac = json.dumps({
+        "ro-token": {"role": "read", "collections": ["allowed_*"]},
+    })
+    monkeypatch.setenv("SUTRA_API_KEY", "adm-token")
+    monkeypatch.setenv("SUTRA_RBAC_CONFIG", rbac)
+    monkeypatch.delenv("SUTRA_BACKEND_URL", raising=False)
+
+    app = create_app(data_dir=str(tmp_path / "py_auth_data"))
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+        assert client.get("/metrics").status_code == 401
+        assert client.get("/collections", headers={"Authorization": "Bearer wrong"}).status_code == 401
+
+        r_create = client.post(
+            "/collections",
+            json={"name": "allowed_docs", "dimension": 2, "metric": "cosine"},
+            headers={"Authorization": "Bearer adm-token"},
+        )
+        assert r_create.status_code == 201
+        client.post(
+            "/collections",
+            json={"name": "secret_docs", "dimension": 2, "metric": "cosine"},
+            headers={"X-API-Key": "adm-token"},
+        )
+        client.post(
+            "/collections/allowed_docs/insert",
+            json={"documents": [{"id": "p1", "vector": [1.0, 0.0], "text": "hello"}]},
+            headers={"Authorization": "Bearer adm-token"},
+        )
+
+        assert client.get("/collections", headers={"X-API-Key": "ro-token"}).json()["collections"][0]["name"] == "allowed_docs"
+        assert client.post(
+            "/collections/allowed_docs/query",
+            json={"vector": [1.0, 0.0], "top_k": 1, "hybrid": False},
+            headers={"Authorization": "Bearer ro-token"},
+        ).status_code == 200
+        assert client.post(
+            "/collections/allowed_docs/insert",
+            json={"documents": [{"id": "p2", "vector": [0.0, 1.0]}]},
+            headers={"Authorization": "Bearer ro-token"},
+        ).status_code == 403
+        assert client.post(
+            "/collections/secret_docs/query",
+            json={"vector": [1.0, 0.0], "top_k": 1},
+            headers={"X-API-Key": "ro-token"},
+        ).status_code == 403
+
+        metrics_res = client.get("/metrics", headers={"Authorization": "Bearer ro-token"})
+        assert metrics_res.status_code == 200
+        assert 'sutradb_query_duration_seconds_bucket{collection="allowed_docs",mode="flat",le="0.5"}' in metrics_res.text
+        assert "sutradb_ingest_documents_total 1" in metrics_res.text
+        assert "sutradb_errors_total " in metrics_res.text
+
+    # 2. SUTRA_BACKEND_URL proxy forwards Authorization and X-API-Key headers
+    seen_headers = []
+
+    class RecordingHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen_headers.append({
+                "path": self.path,
+                "authorization": self.headers.get("Authorization"),
+                "x_api_key": self.headers.get("X-API-Key"),
+            })
+            payload = b'{"collections":[]}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format, *args):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), RecordingHandler)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        monkeypatch.delenv("SUTRA_API_KEY", raising=False)
+        monkeypatch.delenv("SUTRA_RBAC_CONFIG", raising=False)
+        monkeypatch.setenv("SUTRA_BACKEND_URL", f"http://127.0.0.1:{srv.server_address[1]}")
+        proxy_app = create_app(data_dir=str(tmp_path / "proxy_unused"))
+        with TestClient(proxy_app) as pclient:
+            res = pclient.get(
+                "/collections",
+                headers={"Authorization": "Bearer forwarded-tok", "X-API-Key": "alt-key"},
+            )
+            assert res.status_code == 200
+        assert seen_headers == [{
+            "path": "/collections",
+            "authorization": "Bearer forwarded-tok",
+            "x_api_key": "alt-key",
+        }]
+    finally:
+        srv.shutdown()
+        srv.server_close()

@@ -1101,7 +1101,7 @@ async fn test_http_bridge_endpoints_keepalive_chunked_and_grpc_parity() {
         assert_eq!(code1, 200);
         let j1: serde_json::Value = serde_json::from_slice(&b1).unwrap();
         assert_eq!(j1["status"], "healthy");
-        assert_eq!(j1["version"], "5.1.0");
+        assert_eq!(j1["version"], env!("CARGO_PKG_VERSION"));
 
         let (code2, _h2, b2) =
             raw_http_request(&mut ka_stream, "GET", "/", None, &[("Connection", "close")]).await;
@@ -1540,4 +1540,427 @@ async fn test_grpc_batch_distances_unnormalized_cosine() {
     );
     assert!(resp.scores[1].abs() < 1e-4);
     assert!((resp.scores[2] - 0.6).abs() < 1e-4);
+}
+
+async fn spawn_test_server_with_auth(
+    data_dir: Option<PathBuf>,
+    auth: _sutradb::grpc::AuthConfig,
+) -> (
+    SocketAddr,
+    SocketAddr,
+    watch::Sender<bool>,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let grpc_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let grpc_addr = grpc_listener.local_addr().unwrap();
+    drop(grpc_listener);
+
+    let bridge_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bridge_addr = bridge_listener.local_addr().unwrap();
+
+    let service = SutraGrpcService::with_auth(data_dir, auth);
+    let server = SutraServiceServer::new(service.clone());
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let mut grpc_rx = shutdown_rx.clone();
+    let grpc_handle = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(server)
+            .serve_with_shutdown(grpc_addr, async move {
+                while !*grpc_rx.borrow() {
+                    if grpc_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+    });
+
+    let bridge_handle = tokio::spawn(async move {
+        http_bridge::serve_http_bridge(bridge_listener, service, shutdown_rx)
+            .await
+            .unwrap();
+    });
+
+    sleep(Duration::from_millis(80)).await;
+    (grpc_addr, bridge_addr, shutdown_tx, grpc_handle, bridge_handle)
+}
+
+async fn http_json_with_headers(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    body: Option<serde_json::Value>,
+    headers: &[(&str, &str)],
+) -> (u16, String, Vec<u8>) {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let body_bytes = body.map(|v| serde_json::to_vec(&v).unwrap());
+    let mut all_hdrs: Vec<(&str, &str)> = Vec::with_capacity(headers.len() + 2);
+    if body_bytes.is_some() {
+        all_hdrs.push(("Content-Type", "application/json"));
+    }
+    all_hdrs.extend_from_slice(headers);
+    all_hdrs.push(("Connection", "close"));
+    raw_http_request(&mut stream, method, path, body_bytes.as_deref(), &all_hdrs).await
+}
+
+fn grpc_req_with_bearer<T>(msg: T, token: Option<&str>) -> tonic::Request<T> {
+    let mut req = tonic::Request::new(msg);
+    if let Some(tok) = token {
+        let val: tonic::metadata::MetadataValue<_> = format!("Bearer {}", tok).parse().unwrap();
+        req.metadata_mut().insert("authorization", val);
+    }
+    req
+}
+
+#[tokio::test]
+async fn test_auth_disabled_allows_open_access_and_rbac_enforces_roles_and_metrics() {
+    use _sutradb::grpc::auth::constant_time_eq;
+    use _sutradb::grpc::AuthConfig;
+
+    assert!(constant_time_eq(b"secret-alpha", b"secret-alpha"));
+    assert!(!constant_time_eq(b"secret-alpha", b"secret-beta"));
+    assert!(!constant_time_eq(b"short", b"longer-secret"));
+
+    // (a) Open access when no API keys are configured
+    {
+        let tmp_open = tempdir().unwrap();
+        let open_auth = AuthConfig::from_parts(None, None).unwrap();
+        assert!(!open_auth.is_enabled());
+        let (grpc_addr, bridge_addr, tx, gh, bh) =
+            spawn_test_server_with_auth(Some(tmp_open.path().to_path_buf()), open_auth).await;
+
+        let mut client = SutraServiceClient::connect(format!("http://{}", grpc_addr))
+            .await
+            .unwrap();
+        let cr = client
+            .create_collection(CreateCollectionRequest {
+                collection_name: "open_col".into(),
+                dimension: 4,
+                metric: "cosine".into(),
+                data_dir: None,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(cr.success);
+
+        let (m_code, _, _) =
+            http_json_with_headers(bridge_addr, "GET", "/metrics", None, &[]).await;
+        assert_eq!(m_code, 200);
+
+        let _ = tx.send(true);
+        let _ = gh.await;
+        let _ = bh.await;
+    }
+
+    // (b), (c), (d) Auth + RBAC + Prometheus Histograms
+    let tmp = tempdir().unwrap();
+    let rbac_json = r#"{
+        "reader-key": {"role": "read", "collections": ["public_*"]},
+        "writer-key": {"role": "write", "collections": ["public_*", "work_col"]}
+    }"#;
+    let auth = AuthConfig::from_parts(Some("admin-secret"), Some(rbac_json)).unwrap();
+    assert!(auth.is_enabled());
+
+    let (grpc_addr, bridge_addr, tx, gh, bh) =
+        spawn_test_server_with_auth(Some(tmp.path().to_path_buf()), auth).await;
+
+    let mut client = SutraServiceClient::connect(format!("http://{}", grpc_addr))
+        .await
+        .unwrap();
+
+    // Public health checks work without authentication
+    assert!(client.health(HealthRequest {}).await.is_ok());
+    let (h_code, _, _) = http_json_with_headers(bridge_addr, "GET", "/health", None, &[]).await;
+    assert_eq!(h_code, 200);
+
+    // (b) Missing or invalid key -> 401 on HTTP and Unauthenticated on gRPC
+    let (unauth_metrics, _, _) =
+        http_json_with_headers(bridge_addr, "GET", "/metrics", None, &[]).await;
+    assert_eq!(unauth_metrics, 401);
+    let (bad_key_cols, _, _) = http_json_with_headers(
+        bridge_addr,
+        "GET",
+        "/collections",
+        None,
+        &[("Authorization", "Bearer wrong-key")],
+    )
+    .await;
+    assert_eq!(bad_key_cols, 401);
+
+    let grpc_unauth = client
+        .list_collections(ListCollectionsRequest {})
+        .await
+        .unwrap_err();
+    assert_eq!(grpc_unauth.code(), Code::Unauthenticated);
+    let grpc_bad = client
+        .list_collections(grpc_req_with_bearer(ListCollectionsRequest {}, Some("wrong-key")))
+        .await
+        .unwrap_err();
+    assert_eq!(grpc_bad.code(), Code::Unauthenticated);
+
+    // Admin creates public_docs, private_docs, work_col and seeds documents
+    for cname in ["public_docs", "private_docs", "work_col"] {
+        let cr = client
+            .create_collection(grpc_req_with_bearer(
+                CreateCollectionRequest {
+                    collection_name: cname.into(),
+                    dimension: 4,
+                    metric: "cosine".into(),
+                    data_dir: None,
+                },
+                Some("admin-secret"),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(cr.success);
+
+        client
+            .insert(grpc_req_with_bearer(
+                InsertRequest {
+                    collection_name: cname.into(),
+                    documents: vec![
+                        Document {
+                            id: format!("{}_d1", cname),
+                            vector: vec![1.0, 0.0, 0.0, 0.0],
+                            text: Some("rust vector database search engine".into()),
+                            sparse_vector: None,
+                            metadata_json: Some(r#"{"tier":"core"}"#.into()),
+                            namespace: None,
+                            colbert_tokens: None,
+                        },
+                        Document {
+                            id: format!("{}_d2", cname),
+                            vector: vec![0.0, 1.0, 0.0, 0.0],
+                            text: Some("prometheus latency histograms".into()),
+                            sparse_vector: None,
+                            metadata_json: Some(r#"{"tier":"obs"}"#.into()),
+                            namespace: None,
+                            colbert_tokens: None,
+                        },
+                    ],
+                },
+                Some("admin-secret"),
+            ))
+            .await
+            .unwrap();
+    }
+
+    // Admin builds HNSW on public_docs via HTTP bridge using Bearer auth
+    let (hnsw_code, _, _) = http_json_with_headers(
+        bridge_addr,
+        "POST",
+        "/collections/public_docs/hnsw",
+        Some(serde_json::json!({"m": 16, "ef_construction": 32, "ef_search": 16})),
+        &[("Authorization", "Bearer admin-secret")],
+    )
+    .await;
+    assert_eq!(hnsw_code, 200);
+
+    // (c) Reader key checks: allowed read on public_docs, denied write/drop, denied private_docs
+    let q_ok = client
+        .query(grpc_req_with_bearer(
+            QueryRequest {
+                collection_name: "public_docs".into(),
+                vector: vec![1.0, 0.0, 0.0, 0.0],
+                text: None,
+                sparse_vector: None,
+                namespace: None,
+                filter_json: None,
+                top_k: 2,
+                hybrid: false,
+                dense_weight: 1.0,
+                bm25_weight: 0.0,
+                sparse_weight: 0.0,
+                use_ann: true,
+                colbert_tokens: None,
+                colbert_weight: 1.0,
+            },
+            Some("reader-key"),
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(q_ok.results[0].id, "public_docs_d1");
+
+    // HTTP read via X-API-Key on public_docs works + records BM25 and Flat modes
+    let (bm25_code, _, _) = http_json_with_headers(
+        bridge_addr,
+        "POST",
+        "/collections/public_docs/query",
+        Some(serde_json::json!({"text": "rust vector", "top_k": 2, "hybrid": false})),
+        &[("X-API-Key", "reader-key")],
+    )
+    .await;
+    assert_eq!(bm25_code, 200);
+
+    let (flat_code, _, _) = http_json_with_headers(
+        bridge_addr,
+        "POST",
+        "/collections/public_docs/query",
+        Some(serde_json::json!({"vector": [1.0, 0.0, 0.0, 0.0], "top_k": 2, "hybrid": false, "use_ann": false})),
+        &[("X-API-Key", "reader-key")],
+    )
+    .await;
+    assert_eq!(flat_code, 200);
+
+    // Filtered list_collections returns only public_docs for reader-key
+    let listed = client
+        .list_collections(grpc_req_with_bearer(
+            ListCollectionsRequest {},
+            Some("reader-key"),
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.collection_names, vec!["public_docs"]);
+
+    // Reader key denied on insert & drop (gRPC -> PermissionDenied, HTTP -> 403)
+    let ro_insert_err = client
+        .insert(grpc_req_with_bearer(
+            InsertRequest {
+                collection_name: "public_docs".into(),
+                documents: vec![Document {
+                    id: "denied".into(),
+                    vector: vec![0.0, 0.0, 1.0, 0.0],
+                    text: None,
+                    sparse_vector: None,
+                    metadata_json: None,
+                    namespace: None,
+                    colbert_tokens: None,
+                }],
+            },
+            Some("reader-key"),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(ro_insert_err.code(), Code::PermissionDenied);
+
+    let ro_drop_err = client
+        .drop_collection(grpc_req_with_bearer(
+            DropCollectionRequest {
+                collection_name: "public_docs".into(),
+            },
+            Some("reader-key"),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(ro_drop_err.code(), Code::PermissionDenied);
+
+    let (http_ro_ins, _, _) = http_json_with_headers(
+        bridge_addr,
+        "POST",
+        "/collections/public_docs/insert",
+        Some(serde_json::json!({"documents": [{"id": "d_ro", "vector": [1.0, 0.0, 0.0, 0.0]}]})),
+        &[("Authorization", "Bearer reader-key")],
+    )
+    .await;
+    assert_eq!(http_ro_ins, 403);
+
+    let (http_ro_drop, _, _) = http_json_with_headers(
+        bridge_addr,
+        "DELETE",
+        "/collections/public_docs",
+        None,
+        &[("Authorization", "Bearer reader-key")],
+    )
+    .await;
+    assert_eq!(http_ro_drop, 403);
+
+    // Reader key denied on disallowed collection private_docs
+    let ro_priv_err = client
+        .get_stats(grpc_req_with_bearer(
+            CollectionStatsRequest {
+                collection_name: "private_docs".into(),
+            },
+            Some("reader-key"),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(ro_priv_err.code(), Code::PermissionDenied);
+
+    let (http_ro_priv, _, _) = http_json_with_headers(
+        bridge_addr,
+        "POST",
+        "/collections/private_docs/query",
+        Some(serde_json::json!({"vector": [1.0, 0.0, 0.0, 0.0], "top_k": 1})),
+        &[("Authorization", "Bearer reader-key")],
+    )
+    .await;
+    assert_eq!(http_ro_priv, 403);
+
+    // Writer key can insert into work_col, cannot drop/save/compact or write to private_docs
+    let (wr_ins, _, _) = http_json_with_headers(
+        bridge_addr,
+        "POST",
+        "/collections/work_col/insert",
+        Some(serde_json::json!({"documents": [{"id": "w_extra", "vector": [0.0, 0.0, 1.0, 0.0]}]})),
+        &[("X-API-Key", "writer-key")],
+    )
+    .await;
+    assert_eq!(wr_ins, 200);
+
+    let (wr_drop, _, _) = http_json_with_headers(
+        bridge_addr,
+        "DELETE",
+        "/collections/work_col",
+        None,
+        &[("X-API-Key", "writer-key")],
+    )
+    .await;
+    assert_eq!(wr_drop, 403);
+
+    let (wr_priv, _, _) = http_json_with_headers(
+        bridge_addr,
+        "POST",
+        "/collections/private_docs/insert",
+        Some(serde_json::json!({"documents": [{"id": "w_priv", "vector": [0.0, 0.0, 1.0, 0.0]}]})),
+        &[("X-API-Key", "writer-key")],
+    )
+    .await;
+    assert_eq!(wr_priv, 403);
+
+    // (d) /metrics emits standard Prometheus 0.0.4 histogram buckets, gauges, and counters
+    let (m_code, m_head, m_body) = http_json_with_headers(
+        bridge_addr,
+        "GET",
+        "/metrics",
+        None,
+        &[("Authorization", "Bearer reader-key")],
+    )
+    .await;
+    assert_eq!(m_code, 200);
+    assert!(m_head.contains("text/plain; version=0.0.4"));
+    let metrics_txt = String::from_utf8_lossy(&m_body);
+
+    for expected_frag in [
+        "# TYPE sutradb_query_duration_seconds histogram",
+        "sutradb_query_duration_seconds_bucket{collection=\"public_docs\",mode=\"hnsw\",le=\"0.00025\"}",
+        "sutradb_query_duration_seconds_bucket{collection=\"public_docs\",mode=\"hnsw\",le=\"0.001\"}",
+        "sutradb_query_duration_seconds_bucket{collection=\"public_docs\",mode=\"hnsw\",le=\"0.5\"}",
+        "sutradb_query_duration_seconds_bucket{collection=\"public_docs\",mode=\"hnsw\",le=\"+Inf\"} 1",
+        "sutradb_query_duration_seconds_count{collection=\"public_docs\",mode=\"hnsw\"} 1",
+        "sutradb_query_duration_seconds_bucket{collection=\"public_docs\",mode=\"bm25\",le=\"+Inf\"} 1",
+        "sutradb_query_duration_seconds_bucket{collection=\"public_docs\",mode=\"flat\",le=\"+Inf\"} 1",
+        "sutradb_ingest_documents_total 7",
+        "sutradb_errors_total ",
+        "sutradb_collection_documents{collection=\"public_docs\"} 2",
+        "sutradb_collection_memory_bytes{collection=\"public_docs\"}",
+        "sutradb_wal_pending_records{collection=\"public_docs\"}",
+    ] {
+        assert!(
+            metrics_txt.contains(expected_frag),
+            "Missing '{}' in Prometheus output:\n{}",
+            expected_frag,
+            metrics_txt
+        );
+    }
+
+    let _ = tx.send(true);
+    let _ = gh.await;
+    let _ = bh.await;
 }

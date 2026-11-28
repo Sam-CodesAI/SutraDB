@@ -53,11 +53,7 @@ impl VectorArena {
 
     #[inline]
     pub fn len(&self) -> usize {
-        if self.dim == 0 {
-            0
-        } else {
-            self.data.len() / self.dim
-        }
+        self.data.len().checked_div(self.dim).unwrap_or(0)
     }
 
     #[inline]
@@ -257,11 +253,7 @@ impl BQArena {
 
     #[inline]
     pub fn len(&self) -> usize {
-        if self.words_per_vec == 0 {
-            0
-        } else {
-            self.bits.len() / self.words_per_vec
-        }
+        self.bits.len().checked_div(self.words_per_vec).unwrap_or(0)
     }
 
     #[inline]
@@ -335,11 +327,7 @@ impl PQArena {
 
     #[inline]
     pub fn len(&self) -> usize {
-        if self.m == 0 {
-            0
-        } else {
-            self.codes.len() / self.m
-        }
+        self.codes.len().checked_div(self.m).unwrap_or(0)
     }
 
     #[inline]

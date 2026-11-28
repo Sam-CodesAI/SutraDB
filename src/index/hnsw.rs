@@ -388,8 +388,8 @@ impl HNSWIndex {
             self.layers.push(vec![Vec::new(); node_cap]);
         }
         self.ensure_node_capacity(node_cap - 1);
-        for l in 0..=node_level {
-            self.layers[l][idx].clear();
+        for layer in self.layers.iter_mut().take(node_level + 1) {
+            layer[idx].clear();
         }
         self.node_levels[idx] = Some(node_level);
 
@@ -678,8 +678,8 @@ impl HNSWIndex {
         self.ensure_node_capacity(cap - 1);
         for &(doc_id, lvl) in &assignments {
             let idx = doc_id as usize;
-            for l in 0..=lvl {
-                self.layers[l][idx].clear();
+            for layer in self.layers.iter_mut().take(lvl + 1) {
+                layer[idx].clear();
             }
             self.node_levels[idx] = Some(lvl);
         }
@@ -791,7 +791,8 @@ impl HNSWIndex {
                             metric,
                             is_normalized,
                         );
-                        *locked_layers[l][idx].write().unwrap() = neighbors.clone();
+                        *locked_layers[l][idx].write().unwrap_or_else(|p| p.into_inner()) =
+                            neighbors.clone();
                         selected_by_level.push((l, m_max, neighbors));
 
                         if !candidates.is_empty() {
@@ -805,7 +806,8 @@ impl HNSWIndex {
                         let layer_slice = locked_layers[l].as_slice();
                         for nbr in neighbors {
                             let nbr_idx = nbr as usize;
-                            let mut nbr_guard = layer_slice[nbr_idx].write().unwrap();
+                            let mut nbr_guard =
+                                layer_slice[nbr_idx].write().unwrap_or_else(|p| p.into_inner());
                             if !nbr_guard.contains(&doc_id) {
                                 nbr_guard.push(doc_id);
                                 if nbr_guard.len() > m_max {
@@ -837,8 +839,9 @@ impl HNSWIndex {
                         }
                     }
 
-                    if node_level > ep_state.read().unwrap().1 {
-                        *ep_state.write().unwrap() = (Some(doc_id), node_level);
+                    if node_level > ep_state.read().unwrap_or_else(|p| p.into_inner()).1 {
+                        *ep_state.write().unwrap_or_else(|p| p.into_inner()) =
+                            (Some(doc_id), node_level);
                     }
 
                     Ok(())
@@ -850,11 +853,11 @@ impl HNSWIndex {
             .map(|layer| {
                 layer
                     .into_iter()
-                    .map(|lock| lock.into_inner().unwrap())
+                    .map(|lock| lock.into_inner().unwrap_or_else(|p| p.into_inner()))
                     .collect()
             })
             .collect();
-        let (final_ep, final_max_lvl) = ep_state.into_inner().unwrap();
+        let (final_ep, final_max_lvl) = ep_state.into_inner().unwrap_or_else(|p| p.into_inner());
         self.entry_point = final_ep;
         self.max_level = final_max_lvl;
 

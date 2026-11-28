@@ -145,8 +145,9 @@ fn decode_wal_record_binary(payload: &[u8]) -> Option<WalRecord> {
             let f_slice = payload.get(off..off.checked_add(byte_len)?)?;
             off += byte_len;
             let mut vec_vals = Vec::with_capacity(v_len);
-            for chunk in f_slice.chunks_exact(4) {
-                let f = f32::from_le_bytes(chunk.try_into().ok()?);
+            let (chunks, _) = f_slice.as_chunks::<4>();
+            for &chunk in chunks {
+                let f = f32::from_le_bytes(chunk);
                 vec_vals.push(serde_json::Value::from(f as f64));
             }
             if let Some(map) = val.as_object_mut() {
@@ -393,5 +394,11 @@ impl WriteAheadLog {
             .open(&self.path)?;
         self.writer = BufWriter::with_capacity(64 * 1024, file);
         Ok(())
+    }
+}
+
+impl Drop for WriteAheadLog {
+    fn drop(&mut self) {
+        let _ = self.writer.flush();
     }
 }

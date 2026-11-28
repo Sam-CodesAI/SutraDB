@@ -10,6 +10,8 @@ use tokio::task::JoinSet;
 use tonic::Status;
 
 use crate::collection::{NativeCollection, NativeDocument};
+use crate::grpc::auth::{HttpAuthError, Role};
+use crate::grpc::metrics::{classify_query_mode, MetricsRegistry};
 use crate::grpc::service::{
     sutra_err_to_status, wal_records_for_collection, write_manifest_for_collection,
     SutraGrpcService,
@@ -82,6 +84,10 @@ impl HttpResponse {
         self.force_close = true;
         self
     }
+
+    fn from_auth_err(err: HttpAuthError) -> Self {
+        Self::error(err.status, err.message)
+    }
 }
 
 fn reason_phrase(code: u16) -> &'static str {
@@ -90,6 +96,8 @@ fn reason_phrase(code: u16) -> &'static str {
         201 => "Created",
         204 => "No Content",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
@@ -104,6 +112,8 @@ fn reason_phrase(code: u16) -> &'static str {
 fn status_to_http(status: Status) -> HttpResponse {
     let code = match status.code() {
         tonic::Code::InvalidArgument | tonic::Code::FailedPrecondition => 400,
+        tonic::Code::Unauthenticated => 401,
+        tonic::Code::PermissionDenied => 403,
         tonic::Code::NotFound => 404,
         tonic::Code::AlreadyExists => 409,
         _ => 500,
@@ -166,6 +176,9 @@ async fn handle_connection(mut stream: TcpStream, service: SutraGrpcService) {
                 };
 
                 let resp = route_request(&service, req).await;
+                if resp.status_code >= 400 {
+                    service.metrics().record_error();
+                }
                 let close_after = wants_close || resp.force_close;
 
                 if write_http_response(&mut stream, &resp, !close_after)
@@ -391,7 +404,7 @@ async fn write_http_response(
 ) -> std::io::Result<()> {
     let conn_val = if keep_alive { "keep-alive" } else { "close" };
     let head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, X-API-Key\r\n\r\n",
         resp.status_code,
         resp.reason,
         resp.content_type,
@@ -635,6 +648,7 @@ fn parse_optional_json_body(body: &[u8]) -> Result<Value, HttpResponse> {
 async fn execute_json_query(
     col_arc: Arc<RwLock<NativeCollection>>,
     payload: &Value,
+    metrics: &MetricsRegistry,
 ) -> Result<Value, HttpResponse> {
     let start = Instant::now();
     let obj = payload
@@ -775,6 +789,16 @@ async fn execute_json_query(
     };
 
     let col = col_arc.read_owned().await;
+    let col_name = col.name.clone();
+    let mode = classify_query_mode(
+        &col,
+        vector.is_some(),
+        text.is_some(),
+        sparse_vector.as_ref().is_some_and(|sv| !sv.is_empty()),
+        colbert_tokens.as_ref().is_some_and(|ct| !ct.is_empty()),
+        hybrid,
+        use_ann,
+    );
     let search_results = tokio::task::spawn_blocking(move || {
         col.query(
             vector.as_deref(),
@@ -815,7 +839,9 @@ async fn execute_json_query(
         })
         .collect();
 
-    let latency_micros = start.elapsed().as_micros() as u64;
+    let elapsed = start.elapsed();
+    metrics.record_query(&col_name, mode, elapsed.as_secs_f64());
+    let latency_micros = elapsed.as_micros() as u64;
     Ok(serde_json::json!({
         "count": results_json.len(),
         "results": results_json,
@@ -873,49 +899,26 @@ async fn route_request(service: &SutraGrpcService, req: HttpRequest) -> HttpResp
 
         // GET /metrics
         ("GET", ["metrics"]) => {
-            let pairs: Vec<(String, Arc<RwLock<NativeCollection>>)> = {
-                let map = service.collections().read().await;
-                let mut list: Vec<_> = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                list.sort_by(|a, b| a.0.cmp(&b.0));
-                list
-            };
-
-            let mut lines = vec![
-                "# HELP sutradb_collections_total Total number of collections".to_string(),
-                "# TYPE sutradb_collections_total gauge".to_string(),
-                format!("sutradb_collections_total {}", pairs.len()),
-            ];
-
-            for (name, col_arc) in pairs {
-                let col = col_arc.read().await;
-                let st = col.stats();
-                let count = st.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
-                let mem_bytes = st
-                    .get("vector_memory_bytes")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                lines.push(format!(
-                    "sutradb_documents_count{{collection=\"{}\"}} {}",
-                    name, count
-                ));
-                lines.push(format!(
-                    "sutradb_vector_memory_bytes{{collection=\"{}\"}} {}",
-                    name, mem_bytes
-                ));
+            if let Err(err) = service.auth().authorize_http(&req.headers, Role::Read, None) {
+                return HttpResponse::from_auth_err(err);
             }
-
-            HttpResponse::text(
-                200,
-                "text/plain; version=0.0.4",
-                format!("{}\n", lines.join("\n")),
-            )
+            let text = service.render_prometheus_metrics().await;
+            HttpResponse::text(200, "text/plain; version=0.0.4", text)
         }
 
         // GET /collections
         ("GET", ["collections"]) => {
+            let policy = match service.auth().authorize_http(&req.headers, Role::Read, None) {
+                Ok(p) => p,
+                Err(err) => return HttpResponse::from_auth_err(err),
+            };
             let pairs: Vec<(String, Arc<RwLock<NativeCollection>>)> = {
                 let map = service.collections().read().await;
-                let mut list: Vec<_> = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                let mut list: Vec<_> = map
+                    .iter()
+                    .filter(|(k, _)| policy.as_ref().is_none_or(|p| p.allows_collection(k)))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
                 list.sort_by(|a, b| a.0.cmp(&b.0));
                 list
             };
@@ -930,6 +933,9 @@ async fn route_request(service: &SutraGrpcService, req: HttpRequest) -> HttpResp
 
         // POST /collections
         ("POST", ["collections"]) => {
+            if let Err(err) = service.auth().authorize_http(&req.headers, Role::Admin, None) {
+                return HttpResponse::from_auth_err(err);
+            }
             let body = match parse_json_body(&req.body) {
                 Ok(v) => v,
                 Err(resp) => return resp,
@@ -940,6 +946,12 @@ async fn route_request(service: &SutraGrpcService, req: HttpRequest) -> HttpResp
             let Some(name) = obj.get("name").and_then(|v| v.as_str()) else {
                 return HttpResponse::error(400, "Field 'name' (string) is required");
             };
+            if let Err(err) = service
+                .auth()
+                .authorize_http(&req.headers, Role::Admin, Some(name))
+            {
+                return HttpResponse::from_auth_err(err);
+            }
             let Some(dim_u64) = obj.get("dimension").and_then(|v| v.as_u64()) else {
                 return HttpResponse::error(400, "Field 'dimension' (positive integer) is required");
             };
@@ -984,6 +996,12 @@ async fn route_request(service: &SutraGrpcService, req: HttpRequest) -> HttpResp
 
         // DELETE /collections/{name}
         ("DELETE", ["collections", name]) => {
+            if let Err(err) = service
+                .auth()
+                .authorize_http(&req.headers, Role::Admin, Some(name))
+            {
+                return HttpResponse::from_auth_err(err);
+            }
             match service.drop_collection_internal(name).await {
                 Ok(true) => HttpResponse::json(
                     200,
@@ -998,6 +1016,12 @@ async fn route_request(service: &SutraGrpcService, req: HttpRequest) -> HttpResp
 
         // GET /collections/{name}/stats
         ("GET", ["collections", name, "stats"]) => {
+            if let Err(err) = service
+                .auth()
+                .authorize_http(&req.headers, Role::Read, Some(name))
+            {
+                return HttpResponse::from_auth_err(err);
+            }
             let col_arc = match service.get_collection_arc(name).await {
                 Ok(c) => c,
                 Err(status) => return status_to_http(*status),
@@ -1008,6 +1032,12 @@ async fn route_request(service: &SutraGrpcService, req: HttpRequest) -> HttpResp
 
         // GET /collections/{name}/documents
         ("GET", ["collections", name, "documents"]) => {
+            if let Err(err) = service
+                .auth()
+                .authorize_http(&req.headers, Role::Read, Some(name))
+            {
+                return HttpResponse::from_auth_err(err);
+            }
             let limit: usize = match query_params.get("limit") {
                 Some(s) => match s.parse::<usize>() {
                     Ok(v) if (1..=10_000).contains(&v) => v,
@@ -1052,6 +1082,12 @@ async fn route_request(service: &SutraGrpcService, req: HttpRequest) -> HttpResp
 
         // GET /collections/{name}/documents/{id}
         ("GET", ["collections", name, "documents", doc_id]) => {
+            if let Err(err) = service
+                .auth()
+                .authorize_http(&req.headers, Role::Read, Some(name))
+            {
+                return HttpResponse::from_auth_err(err);
+            }
             let col_arc = match service.get_collection_arc(name).await {
                 Ok(c) => c,
                 Err(status) => return status_to_http(*status),
@@ -1071,6 +1107,12 @@ async fn route_request(service: &SutraGrpcService, req: HttpRequest) -> HttpResp
         // GET /collections/{name}/sample or /collections/{name}/sample_vectors
         ("GET", ["collections", name, "sample"])
         | ("GET", ["collections", name, "sample_vectors"]) => {
+            if let Err(err) = service
+                .auth()
+                .authorize_http(&req.headers, Role::Read, Some(name))
+            {
+                return HttpResponse::from_auth_err(err);
+            }
             let limit: usize = match query_params.get("limit") {
                 Some(s) => match s.parse::<usize>() {
                     Ok(v) if (1..=10_000).contains(&v) => v,
@@ -1117,6 +1159,12 @@ async fn route_request(service: &SutraGrpcService, req: HttpRequest) -> HttpResp
 
         // POST /collections/{name}/insert | /documents | /upsert
         ("POST", ["collections", name, action @ ("insert" | "documents" | "upsert")]) => {
+            if let Err(err) = service
+                .auth()
+                .authorize_http(&req.headers, Role::Write, Some(name))
+            {
+                return HttpResponse::from_auth_err(err);
+            }
             let col_arc = match service.get_collection_arc(name).await {
                 Ok(c) => c,
                 Err(status) => return status_to_http(*status),
@@ -1257,6 +1305,7 @@ async fn route_request(service: &SutraGrpcService, req: HttpRequest) -> HttpResp
             };
             match res {
                 Ok(total_count) => {
+                    service.metrics().record_ingest(batch_len as u64);
                     let key = if is_upsert {
                         "upserted"
                     } else {
@@ -1276,6 +1325,12 @@ async fn route_request(service: &SutraGrpcService, req: HttpRequest) -> HttpResp
 
         // DELETE /collections/{name}/documents/{id}
         ("DELETE", ["collections", name, "documents", doc_id]) => {
+            if let Err(err) = service
+                .auth()
+                .authorize_http(&req.headers, Role::Write, Some(name))
+            {
+                return HttpResponse::from_auth_err(err);
+            }
             let col_arc = match service.get_collection_arc(name).await {
                 Ok(c) => c,
                 Err(status) => return status_to_http(*status),
@@ -1302,6 +1357,12 @@ async fn route_request(service: &SutraGrpcService, req: HttpRequest) -> HttpResp
 
         // DELETE /collections/{name}/documents
         ("DELETE", ["collections", name, "documents"]) => {
+            if let Err(err) = service
+                .auth()
+                .authorize_http(&req.headers, Role::Write, Some(name))
+            {
+                return HttpResponse::from_auth_err(err);
+            }
             let col_arc = match service.get_collection_arc(name).await {
                 Ok(c) => c,
                 Err(status) => return status_to_http(*status),
@@ -1347,6 +1408,12 @@ async fn route_request(service: &SutraGrpcService, req: HttpRequest) -> HttpResp
 
         // PATCH /collections/{name}/documents/{id}/metadata
         ("PATCH", ["collections", name, "documents", doc_id, "metadata"]) => {
+            if let Err(err) = service
+                .auth()
+                .authorize_http(&req.headers, Role::Write, Some(name))
+            {
+                return HttpResponse::from_auth_err(err);
+            }
             let col_arc = match service.get_collection_arc(name).await {
                 Ok(c) => c,
                 Err(status) => return status_to_http(*status),
@@ -1383,6 +1450,12 @@ async fn route_request(service: &SutraGrpcService, req: HttpRequest) -> HttpResp
 
         // POST /collections/{name}/query
         ("POST", ["collections", name, "query"]) => {
+            if let Err(err) = service
+                .auth()
+                .authorize_http(&req.headers, Role::Read, Some(name))
+            {
+                return HttpResponse::from_auth_err(err);
+            }
             let col_arc = match service.get_collection_arc(name).await {
                 Ok(c) => c,
                 Err(status) => return status_to_http(*status),
@@ -1391,7 +1464,7 @@ async fn route_request(service: &SutraGrpcService, req: HttpRequest) -> HttpResp
                 Ok(v) => v,
                 Err(resp) => return resp,
             };
-            match execute_json_query(col_arc, &body).await {
+            match execute_json_query(col_arc, &body, service.metrics()).await {
                 Ok(resp_val) => HttpResponse::json(200, &resp_val),
                 Err(resp) => resp,
             }
@@ -1399,6 +1472,12 @@ async fn route_request(service: &SutraGrpcService, req: HttpRequest) -> HttpResp
 
         // POST /collections/{name}/batch_query
         ("POST", ["collections", name, "batch_query"]) => {
+            if let Err(err) = service
+                .auth()
+                .authorize_http(&req.headers, Role::Read, Some(name))
+            {
+                return HttpResponse::from_auth_err(err);
+            }
             let col_arc = match service.get_collection_arc(name).await {
                 Ok(c) => c,
                 Err(status) => return status_to_http(*status),
@@ -1418,8 +1497,9 @@ async fn route_request(service: &SutraGrpcService, req: HttpRequest) -> HttpResp
             let mut join_set = JoinSet::new();
             for (idx, q) in queries.into_iter().enumerate() {
                 let c = col_arc.clone();
+                let svc = service.clone();
                 join_set.spawn(async move {
-                    let res = execute_json_query(c, &q).await;
+                    let res = execute_json_query(c, &q, svc.metrics()).await;
                     (idx, res)
                 });
             }
@@ -1443,6 +1523,12 @@ async fn route_request(service: &SutraGrpcService, req: HttpRequest) -> HttpResp
 
         // POST /collections/{name}/hnsw
         ("POST", ["collections", name, "hnsw"]) => {
+            if let Err(err) = service
+                .auth()
+                .authorize_http(&req.headers, Role::Admin, Some(name))
+            {
+                return HttpResponse::from_auth_err(err);
+            }
             let col_arc = match service.get_collection_arc(name).await {
                 Ok(c) => c,
                 Err(status) => return status_to_http(*status),
@@ -1506,6 +1592,12 @@ async fn route_request(service: &SutraGrpcService, req: HttpRequest) -> HttpResp
 
         // POST /collections/{name}/sq8
         ("POST", ["collections", name, "sq8"]) => {
+            if let Err(err) = service
+                .auth()
+                .authorize_http(&req.headers, Role::Admin, Some(name))
+            {
+                return HttpResponse::from_auth_err(err);
+            }
             let col_arc = match service.get_collection_arc(name).await {
                 Ok(c) => c,
                 Err(status) => return status_to_http(*status),
@@ -1530,6 +1622,12 @@ async fn route_request(service: &SutraGrpcService, req: HttpRequest) -> HttpResp
 
         // POST /collections/{name}/bq
         ("POST", ["collections", name, "bq"]) => {
+            if let Err(err) = service
+                .auth()
+                .authorize_http(&req.headers, Role::Admin, Some(name))
+            {
+                return HttpResponse::from_auth_err(err);
+            }
             let col_arc = match service.get_collection_arc(name).await {
                 Ok(c) => c,
                 Err(status) => return status_to_http(*status),
@@ -1554,6 +1652,12 @@ async fn route_request(service: &SutraGrpcService, req: HttpRequest) -> HttpResp
 
         // POST /collections/{name}/pq/train
         ("POST", ["collections", name, "pq", "train"]) => {
+            if let Err(err) = service
+                .auth()
+                .authorize_http(&req.headers, Role::Admin, Some(name))
+            {
+                return HttpResponse::from_auth_err(err);
+            }
             let col_arc = match service.get_collection_arc(name).await {
                 Ok(c) => c,
                 Err(status) => return status_to_http(*status),
@@ -1601,6 +1705,12 @@ async fn route_request(service: &SutraGrpcService, req: HttpRequest) -> HttpResp
 
         // POST /collections/{name}/pq
         ("POST", ["collections", name, "pq"]) => {
+            if let Err(err) = service
+                .auth()
+                .authorize_http(&req.headers, Role::Admin, Some(name))
+            {
+                return HttpResponse::from_auth_err(err);
+            }
             let col_arc = match service.get_collection_arc(name).await {
                 Ok(c) => c,
                 Err(status) => return status_to_http(*status),
@@ -1626,6 +1736,12 @@ async fn route_request(service: &SutraGrpcService, req: HttpRequest) -> HttpResp
 
         // POST /collections/{name}/save
         ("POST", ["collections", name, "save"]) => {
+            if let Err(err) = service
+                .auth()
+                .authorize_http(&req.headers, Role::Admin, Some(name))
+            {
+                return HttpResponse::from_auth_err(err);
+            }
             match service.save_collection_internal(name).await {
                 Ok((_path, bytes)) => HttpResponse::json(
                     200,
@@ -1640,6 +1756,12 @@ async fn route_request(service: &SutraGrpcService, req: HttpRequest) -> HttpResp
 
         // POST /collections/{name}/compact
         ("POST", ["collections", name, "compact"]) => {
+            if let Err(err) = service
+                .auth()
+                .authorize_http(&req.headers, Role::Admin, Some(name))
+            {
+                return HttpResponse::from_auth_err(err);
+            }
             let col_arc = match service.get_collection_arc(name).await {
                 Ok(c) => c,
                 Err(status) => return status_to_http(*status),
@@ -1664,6 +1786,11 @@ async fn route_request(service: &SutraGrpcService, req: HttpRequest) -> HttpResp
             }
         }
 
-        _ => HttpResponse::error(404, "Endpoint not found"),
+        _ => {
+            if let Err(err) = service.auth().authorize_http(&req.headers, Role::Read, None) {
+                return HttpResponse::from_auth_err(err);
+            }
+            HttpResponse::error(404, "Endpoint not found")
+        }
     }
 }

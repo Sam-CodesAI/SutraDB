@@ -43,10 +43,10 @@ impl ClusterCoordinator {
             collection: Arc::new(Mutex::new(collection)),
         };
 
-        let mut shards = self.shards.write().unwrap();
+        let mut shards = self.shards.write().unwrap_or_else(|p| p.into_inner());
         shards.insert(shard_id.to_string(), shard);
 
-        let mut ring = self.hash_ring.write().unwrap();
+        let mut ring = self.hash_ring.write().unwrap_or_else(|p| p.into_inner());
         ring.add_node(shard_id);
     }
 
@@ -68,7 +68,7 @@ impl ClusterCoordinator {
         let mut shard_batches: HashMap<String, (Vec<NativeDocument>, Vec<Vec<f32>>)> = HashMap::new();
 
         {
-            let ring = self.hash_ring.read().unwrap();
+            let ring = self.hash_ring.read().unwrap_or_else(|p| p.into_inner());
             for (doc, vec) in documents.into_iter().zip(vectors) {
                 // Route by namespace if present (tenant-affinity), otherwise doc id
                 let routing_key = doc.namespace.as_deref().unwrap_or(&doc.id);
@@ -81,13 +81,13 @@ impl ClusterCoordinator {
         }
 
         let mut total_inserted = 0;
-        let shards = self.shards.read().unwrap();
+        let shards = self.shards.read().unwrap_or_else(|p| p.into_inner());
 
         for (shard_id, (docs, vecs)) in shard_batches {
             let batch_len = docs.len();
             if let Some(shard) = shards.get(&shard_id) {
                 if shard.collection_name == collection_name {
-                    let mut col = shard.collection.lock().unwrap();
+                    let mut col = shard.collection.lock().unwrap_or_else(|p| p.into_inner());
                     col.insert(docs, vecs)?;
                     total_inserted += batch_len;
                 }
@@ -96,7 +96,7 @@ impl ClusterCoordinator {
                 // For local coordinator, fallback to any available shard matching collection name.
                 for s in shards.values() {
                     if s.collection_name == collection_name {
-                        let mut col = s.collection.lock().unwrap();
+                        let mut col = s.collection.lock().unwrap_or_else(|p| p.into_inner());
                         col.insert(docs, vecs)?;
                         total_inserted += batch_len;
                         break;
@@ -109,6 +109,7 @@ impl ClusterCoordinator {
     }
 
     /// Executes a scatter-gather query across all shards and merges partial results into a global top-K ranking.
+    #[allow(clippy::too_many_arguments)]
     pub fn scatter_gather_query(
         &self,
         collection_name: &str,
@@ -122,7 +123,7 @@ impl ClusterCoordinator {
         hybrid: bool,
     ) -> Result<Vec<NativeSearchResult>, SutraError> {
         let matching_shards: Vec<Arc<Mutex<NativeCollection>>> = {
-            let shards = self.shards.read().unwrap();
+            let shards = self.shards.read().unwrap_or_else(|p| p.into_inner());
             shards.values()
                 .filter(|s| s.collection_name == collection_name)
                 .map(|s| Arc::clone(&s.collection))
@@ -136,7 +137,7 @@ impl ClusterCoordinator {
         // Parallel query scattering across all shards using Rayon
         use rayon::prelude::*;
         let partial_results: Vec<Vec<NativeSearchResult>> = matching_shards.par_iter().map(|shard_arc| {
-            let col = shard_arc.lock().unwrap();
+            let col = shard_arc.lock().unwrap_or_else(|p| p.into_inner());
             col.query(
                 vector,
                 text,
@@ -177,10 +178,10 @@ impl ClusterCoordinator {
 
     /// Returns collection total document count aggregated across all shards.
     pub fn cluster_count(&self, collection_name: &str) -> usize {
-        let shards = self.shards.read().unwrap();
+        let shards = self.shards.read().unwrap_or_else(|p| p.into_inner());
         shards.values()
             .filter(|s| s.collection_name == collection_name)
-            .map(|s| s.collection.lock().unwrap().count())
+            .map(|s| s.collection.lock().unwrap_or_else(|p| p.into_inner()).count())
             .sum()
     }
 }

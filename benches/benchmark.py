@@ -692,7 +692,7 @@ def generate_markdown_report(results: List[BenchmarkResult], output_path: Path):
     cpu_arch = platform.machine()
     py_ver = platform.python_version()
 
-    report = f"""# 📊 SutraDB v6.0.0 Empirical Benchmark Report
+    report = f"""# 📊 SutraDB v5.5.0 Empirical Benchmark Report
 
 Generated automatically on: `{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}`
 

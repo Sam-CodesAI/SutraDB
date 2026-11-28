@@ -2537,9 +2537,9 @@ fn test_hnsw_filtered_recall_1pct_selectivity() {
     let mut vecs = Vec::with_capacity(n);
     for i in 0..n {
         let mut v = vec![0.0f32; dim];
-        for d in 0..dim {
+        for (d, slot) in v.iter_mut().enumerate().take(dim) {
             let phase = ((i * 13 + d * 29) % 200) as f32 / 100.0 - 1.0;
-            v[d] = phase;
+            *slot = phase;
         }
         // Make every 100th doc (50 docs total = 1% selectivity) match `rare = true`
         let is_rare = i % 100 == 0;
@@ -2577,8 +2577,8 @@ fn test_hnsw_filtered_recall_1pct_selectivity() {
     let num_queries = 20usize;
     for q_idx in 0..num_queries {
         let mut q = vec![0.0f32; dim];
-        for d in 0..dim {
-            q[d] = ((q_idx * 37 + d * 19) % 200) as f32 / 100.0 - 1.0;
+        for (d, slot) in q.iter_mut().enumerate().take(dim) {
+            *slot = ((q_idx * 37 + d * 19) % 200) as f32 / 100.0 - 1.0;
         }
         q[0] += 0.4;
         let q_norm = normalize_copy(&q);
@@ -2708,8 +2708,8 @@ fn test_instant_restart_preserves_hnsw_bq_pq() {
     let mut vecs = Vec::with_capacity(n);
     for i in 0..n {
         let mut v = vec![0.0f32; dim];
-        for d in 0..dim {
-            v[d] = (((i * 31 + d * 17) % 100) as f32 / 50.0) - 1.0;
+        for (d, slot) in v.iter_mut().enumerate().take(dim) {
+            *slot = (((i * 31 + d * 17) % 100) as f32 / 50.0) - 1.0;
         }
         docs.push(NativeDocument {
             id: format!("doc_{:03}", i),
@@ -2736,8 +2736,8 @@ fn test_instant_restart_preserves_hnsw_bq_pq() {
     col.enable_pq().unwrap();
 
     let mut q_raw = vec![0.0f32; dim];
-    for d in 0..dim {
-        q_raw[d] = (((7 * 43 + d * 29) % 100) as f32 / 50.0) - 1.0;
+    for (d, slot) in q_raw.iter_mut().enumerate().take(dim) {
+        *slot = (((7 * 43 + d * 29) % 100) as f32 / 50.0) - 1.0;
     }
     let query_vec = normalize_copy(&q_raw);
 
@@ -3026,4 +3026,191 @@ fn test_parallel_hnsw_batch_recall() {
         par_recall * 100.0,
         seq_recall * 100.0
     );
+}
+
+#[test]
+fn test_simd_odd_dimensions_and_nan_inf_safety() {
+    use _sutradb::distance::sq8::sq8_score_slice;
+
+    for dim in [1usize, 3, 7, 15, 17, 127] {
+        let a: Vec<f32> = (0..dim).map(|i| ((i as f32) * 0.37).sin()).collect();
+        let b: Vec<f32> = (0..dim).map(|i| ((i as f32) * 0.53 + 0.5).cos()).collect();
+
+        // Scalar exact reference
+        let dot_ref: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let cos_ref = if na > 1e-12 && nb > 1e-12 {
+            dot_ref / (na * nb)
+        } else {
+            0.0
+        };
+        let l2_sq_ref: f32 = a.iter().zip(b.iter()).map(|(x, y)| (x - y) * (x - y)).sum();
+        let euc_ref = 1.0 / (1.0 + l2_sq_ref.sqrt());
+
+        let dot_got = compute_vector_score(&a, &b, Metric::DotProduct, false).unwrap();
+        let cos_got = compute_vector_score(&a, &b, Metric::Cosine, false).unwrap();
+        let euc_got = compute_vector_score(&a, &b, Metric::Euclidean, false).unwrap();
+
+        assert!(
+            (dot_got - dot_ref).abs() < 1e-4,
+            "dim={} dot mismatch: got={} ref={}",
+            dim,
+            dot_got,
+            dot_ref
+        );
+        assert!(
+            (cos_got - cos_ref).abs() < 1e-4,
+            "dim={} cosine mismatch: got={} ref={}",
+            dim,
+            cos_got,
+            cos_ref
+        );
+        assert!(
+            (euc_got - euc_ref).abs() < 1e-4,
+            "dim={} euclidean mismatch: got={} ref={}",
+            dim,
+            euc_got,
+            euc_ref
+        );
+
+        let sq = SQ8Vector::quantize(&b);
+        let q_sum: f32 = a.iter().sum();
+        let sq_dot = sq8_score_slice(&sq.data, sq.min_val, sq.scale, &a, q_sum, Metric::DotProduct).unwrap();
+        let sq_euc = sq8_score_slice(&sq.data, sq.min_val, sq.scale, &a, q_sum, Metric::Euclidean).unwrap();
+        assert!(sq_dot.is_finite(), "dim={} sq8 dot not finite", dim);
+        assert!(sq_euc.is_finite() && (0.0..=1.0).contains(&sq_euc), "dim={} sq8 euc out of range", dim);
+    }
+
+    // Zero-norm vector must safely score 0.0 for Cosine (no NaN)
+    let zeros = vec![0.0f32; 17];
+    let unit = vec![1.0f32; 17];
+    let zero_cos = compute_vector_score(&zeros, &unit, Metric::Cosine, false).unwrap();
+    assert_eq!(zero_cos, 0.0);
+
+    // SQ8 quantization safely sanitizes NaN / Inf inputs
+    let dirty_sq = SQ8Vector::quantize(&[f32::NAN, -2.0, f32::INFINITY, 2.0, f32::NEG_INFINITY]);
+    assert!(dirty_sq.min_val.is_finite());
+    assert!(dirty_sq.scale.is_finite());
+    let all_nan_sq = SQ8Vector::quantize(&[f32::NAN, f32::INFINITY]);
+    assert_eq!(all_nan_sq.min_val, 0.0);
+    assert_eq!(all_nan_sq.scale, 0.0);
+    assert_eq!(all_nan_sq.data, vec![0u8, 0u8]);
+
+    // Collection insert & query reject non-finite dense vectors cleanly
+    let mut col = NativeCollection::new("nan_guard".into(), 4, Metric::Cosine, None, false).unwrap();
+    let doc = NativeDocument {
+        id: "d_bad".into(),
+        namespace: None,
+        text: "bad".into(),
+        metadata: json!({}),
+        sparse_vector: None,
+        colbert_tokens: None,
+    };
+    assert!(col.insert(vec![doc], vec![vec![1.0, f32::NAN, 0.0, 0.0]]).is_err());
+    assert_eq!(col.count(), 0);
+    assert!(col.query(Some(&[f32::INFINITY, 0.0, 0.0, 0.0]), None, None, None, None, None, 5, false, None, 60, 1.0, 0.0, 0.0, 0.0, false).is_err());
+}
+
+#[test]
+fn test_corrupt_index_sidecar_pq_k0_and_hnsw_bounds_no_panic() {
+    use crc32fast::Hasher;
+    use _sutradb::storage::index_file::{index_sidecar_path, IDX_HEADER_SIZE};
+
+    let tmp = tempdir().unwrap();
+    let col_path = tmp.path().join("corrupt_idx.sutra");
+    let mut col = NativeCollection::new("corrupt_idx".into(), 8, Metric::Cosine, Some(col_path.clone()), false).unwrap();
+    let docs: Vec<NativeDocument> = (0..12)
+        .map(|i| NativeDocument {
+            id: format!("d{}", i),
+            namespace: None,
+            text: format!("doc {}", i),
+            metadata: json!({}),
+            sparse_vector: None,
+            colbert_tokens: None,
+        })
+        .collect();
+    let vecs: Vec<Vec<f32>> = (0..12)
+        .map(|i| (0..8).map(|j| ((i * 8 + j) as f32 * 0.21).cos()).collect())
+        .collect();
+    col.insert(docs, vecs).unwrap();
+    col.build_hnsw(None).unwrap();
+    col.save(None::<&std::path::Path>).unwrap();
+
+    let idx_path = index_sidecar_path(&col_path);
+    let orig_bytes = std::fs::read(&idx_path).unwrap();
+    assert!(orig_bytes.len() >= IDX_HEADER_SIZE);
+
+    let write_single_section_sidecar = |tag: u8, payload: &[u8]| {
+        let mut header = [0u8; IDX_HEADER_SIZE];
+        header.copy_from_slice(&orig_bytes[..IDX_HEADER_SIZE]);
+        header[24..28].copy_from_slice(&1u32.to_le_bytes()); // section_count = 1
+        let mut h_hasher = Hasher::new();
+        h_hasher.update(&header[0..60]);
+        header[60..64].copy_from_slice(&h_hasher.finalize().to_le_bytes());
+
+        let mut p_hasher = Hasher::new();
+        p_hasher.update(payload);
+        let p_crc = p_hasher.finalize();
+
+        let mut out = Vec::with_capacity(IDX_HEADER_SIZE + 16 + payload.len());
+        out.extend_from_slice(&header);
+        out.extend_from_slice(&[tag, 0, 0, 0]);
+        out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        out.extend_from_slice(&p_crc.to_le_bytes());
+        out.extend_from_slice(payload);
+        std::fs::write(&idx_path, &out).unwrap();
+    };
+
+    // Case 1: Crafted valid-CRC PQ section with k == 0 (previously underflowed self.k - 1)
+    let mut bad_pq = Vec::new();
+    for val in [8u32, 4u32, 0u32, 2u32, 0u32] {
+        // dimension=8, m=4, k=0, sub_dim=2, num_subs=0
+        bad_pq.extend_from_slice(&val.to_le_bytes());
+    }
+    bad_pq.extend_from_slice(&4u32.to_le_bytes()); // arena_m = 4
+    bad_pq.extend_from_slice(&0u64.to_le_bytes()); // codes_len = 0
+    write_single_section_sidecar(4, &bad_pq);
+    let mut reloaded_pq = NativeCollection::new("corrupt_idx".into(), 8, Metric::Cosine, None, false).unwrap();
+    assert!(reloaded_pq.load(Some(&col_path)).is_err());
+
+    // Case 2: Crafted valid-CRC HNSW section with out-of-bounds entry_point = 9999
+    let mut bad_hnsw = Vec::new();
+    for val in [16u32, 32u32, 64u32, 32u32] {
+        bad_hnsw.extend_from_slice(&val.to_le_bytes());
+    }
+    bad_hnsw.extend_from_slice(&0.36f64.to_le_bytes());
+    bad_hnsw.extend_from_slice(&42u64.to_le_bytes());
+    bad_hnsw.push(1u8); // has_ep
+    bad_hnsw.extend_from_slice(&9999u32.to_le_bytes()); // OOB entry_point
+    bad_hnsw.extend_from_slice(&0u32.to_le_bytes()); // max_level = 0
+    bad_hnsw.extend_from_slice(&1u32.to_le_bytes()); // node_levels_len = 1
+    bad_hnsw.extend_from_slice(&0i32.to_le_bytes()); // level = 0
+    bad_hnsw.extend_from_slice(&1u32.to_le_bytes()); // num_layers = 1
+    bad_hnsw.extend_from_slice(&1u32.to_le_bytes()); // num_nodes = 1
+    bad_hnsw.extend_from_slice(&0u32.to_le_bytes()); // deg = 0
+    let mut empty_bm = Vec::new();
+    roaring::RoaringBitmap::new().serialize_into(&mut empty_bm).unwrap();
+    bad_hnsw.extend_from_slice(&(empty_bm.len() as u32).to_le_bytes());
+    bad_hnsw.extend_from_slice(&empty_bm);
+    write_single_section_sidecar(1, &bad_hnsw);
+    let mut reloaded_hnsw = NativeCollection::new("corrupt_idx".into(), 8, Metric::Cosine, None, false).unwrap();
+    assert!(reloaded_hnsw.load(Some(&col_path)).is_err());
+}
+
+#[test]
+fn test_wal_drop_flushes_buffered_records() {
+    let tmp = tempdir().unwrap();
+    let wal_path = tmp.path().join("drop_flush.wal");
+    {
+        let mut wal = WriteAheadLog::open_with_sync(&wal_path, false).unwrap();
+        wal.append(&WalRecord {
+            op: "insert".into(),
+            docs: vec![json!({"id": "buffered_doc", "text": "hello", "vector": [1.0, 0.0]})],
+            ids: Vec::new(),
+        })
+        .unwrap();
+        // Drop without calling explicit flush()
+    }
+    assert_eq!(WriteAheadLog::count_records_at(&wal_path), 1);
 }

@@ -1,4 +1,4 @@
-# 📊 SutraDB v6.0.0 Empirical Benchmark Report
+# 📊 SutraDB v5.5.0 Empirical Benchmark Report
 
 Generated automatically on: `2026-11-27 16:02:12 UTC`
 

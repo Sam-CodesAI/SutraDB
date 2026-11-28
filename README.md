@@ -1,11 +1,11 @@
-# सूत्र DB (SutraDB) v5.1.0: Zero-Build Embedded Developer Workbench & Distributed Edition
+# सूत्र DB (SutraDB) v5.5.0: Zero-Build Embedded Developer Workbench & Distributed Edition
 
 [![PyPI](https://img.shields.io/pypi/v/sutradb-core.svg?style=flat&color=blue&logo=pypi)](https://pypi.org/project/sutradb-core/)
 [![Docker Pulls](https://img.shields.io/docker/pulls/samcodesai/sutradb.svg?style=flat&logo=docker&logoColor=white&color=2496ED)](https://hub.docker.com/r/samcodesai/sutradb)
-[![Docker Image Version](https://img.shields.io/docker/v/samcodesai/sutradb/5.1.0?style=flat&logo=docker&logoColor=white&label=docker%20image&color=2496ED)](https://hub.docker.com/r/samcodesai/sutradb)
+[![Docker Image Version](https://img.shields.io/docker/v/samcodesai/sutradb/5.5.0?style=flat&logo=docker&logoColor=white&label=docker%20image&color=2496ED)](https://hub.docker.com/r/samcodesai/sutradb)
 [![GHCR](https://img.shields.io/badge/GHCR-ghcr.io%2Fsam--codesai%2Fsutradb-blue?logo=github)](https://github.com/Sam-CodesAI/SutraDB/pkgs/container/sutradb)
-[![GitHub Release](https://img.shields.io/github/v/release/Sam-CodesAI/SutraDB?style=flat&logo=github&color=purple)](https://github.com/Sam-CodesAI/SutraDB/releases/tag/v5.1.0)
-[![Tests](https://img.shields.io/badge/Tests-182%2F182%20Passing-brightgreen)](https://github.com/Sam-CodesAI/SutraDB)
+[![GitHub Release](https://img.shields.io/github/v/release/Sam-CodesAI/SutraDB?style=flat&logo=github&color=purple)](https://github.com/Sam-CodesAI/SutraDB/releases/tag/v5.5.0)
+[![Tests](https://img.shields.io/badge/Tests-332%2F332%20Passing-brightgreen)](https://github.com/Sam-CodesAI/SutraDB)
 [![Rust](https://img.shields.io/badge/Engine-Rust%20SIMD%20%2B%20gRPC-orange?logo=rust)](https://www.rust-lang.org)
 [![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.14-blue?logo=python)](https://python.org)
 [![Cluster](https://img.shields.io/badge/Distributed-Multi--Node%20Raft-purple)](https://github.com/Sam-CodesAI/SutraDB)
@@ -113,19 +113,35 @@ Designed specifically for production RAG (Retrieval-Augmented Generation), local
 
 ---
 
-## 📊 Benchmark Comparison
+## 📊 Verified v5.5.0 Benchmarks
 
-Standard 4-vCPU Linux environment (100,000 documents, 128 dimensions):
+Measured on a 2-vCPU Linux `x86_64` host (`AMD EPYC 7763`, `AVX2 / FMA`, `Python 3.14.2`, Cosine metric, `top_k=10`). Full reproducible scripts live in [`benches/benchmark.py`](benches/benchmark.py) and [`benches/scale_benchmark.py`](benches/scale_benchmark.py).
 
-| Metric | SutraDB v3.4 (सूत्र DB) | ChromaDB | Pinecone (Cloud) |
-| :--- | :--- | :--- | :--- |
-| **Engine Core** | **Rust SIMD + Rayon (PyO3)** | Python / C++ | Cloud Managed |
-| **RAM (100K 128-dim vectors)** | **~3.2 MB (PQ) / ~14 MB (SQ8)** | ~180 MB | N/A (Remote) |
-| **Search Latency (P50)** | **< 0.15 ms** | ~4.2 ms | 35 – 65 ms (Network roundtrip) |
-| **Cold Start Time** | **< 1 ms (Zero-copy mmap)** | ~850 ms | N/A |
-| **Multi-Tenant Namespaces** | **Native Built-in** | Separate DBs required | Namespace metadata |
-| **Hybrid Search** | **Linguistic Analyzer + BM25** | External / Addon | Dense-first |
-| **Dependencies** | **Zero heavy C++ toolchains** | ~45 pip dependencies | Proprietary client + API key |
+### Out-of-L3-Cache Scale (`100,000` vectors × `768` dims — `293.0 MiB` raw FP32)
+
+| Variant | Ingest / Build | P50 (ms) | P99 (ms) | QPS | Vector/Index RAM | Recall@10 |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **NumPy** (Exact GEMV baseline) | - | 35.019 | 56.064 | 27.4 | 293.0 MiB | 100.00% |
+| **SutraDB Flat** (Rust AVX2 SIMD) | 29,228 docs/s | 14.236 | 21.737 | 68.1 | 293.0 MiB | 100.00% |
+| **SutraDB HNSW Unfiltered** (`m=16`) | 1,063 docs/s (build) | **0.417** | **0.645** | **2,291.2** | 326.2 MiB | **100.00%** |
+| **SutraDB HNSW 1%-Filtered** (Cost-Based Roaring SIMD) | 1,063 docs/s (build) | **0.187** | **0.297** | **4,913.9** | 326.2 MiB | **100.00%** |
+| **SutraDB SQ8** (Mmap-Evicted 4x) | 18,966 docs/s | 6.516 | 10.836 | 141.5 | 73.2 MiB | 97.90% |
+| **SutraDB 1-Bit BQ** (Mmap-Evicted 32x) | 19,243 docs/s | 2.043 | 3.580 | 436.2 | **9.2 MiB** | 92.10% |
+
+* **Instant-Restart Snapshot (`.sutra` + `.sutra.idx` sidecar):** Saves `308.3 MiB` + `14.9 MiB` in `1,991 ms` and restores full HNSW search with exact parity in **`3,066 ms`** (vs. `94.1 s` rebuilding HNSW on 2 vCPUs).
+
+### Multi-Modal Suite (`10,000` vectors × `128` dims)
+
+| Variant | Ingestion (docs/s) | P50 (ms) | P99 (ms) | QPS | Vector/Index RAM | Recall@10 |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **NumPy** (Exact Brute-Force) | 3,749,940 | 0.153 | 0.263 | 6,285 | 4.9 MB | 100.00% |
+| **SutraDB Flat** (Rust SIMD) | 15,237 | 0.480 | 0.618 | 2,068 | 4.9 MB | 100.00% |
+| **SutraDB HNSW Graph ANN** (`m=32`) | 710 (`741` build) | 0.321 | 0.402 | 3,075 | 9.0 MB | 99.20% |
+| **SutraDB SQ8** (4x Quantized) | 16,103 | 0.467 | 0.571 | 2,117 | 1.2 MB | 98.70% |
+| **SutraDB 1-Bit BQ** (32x POPCNT) | 16,564 | 0.332 | 0.465 | 3,008 | 0.2 MB | 91.80% |
+| **SutraDB PQ** (`M=16`, 32x ADC) | 2,471 | 0.344 | 0.399 | 2,907 | 0.2 MB | 90.30% |
+| **SutraDB BM25 Lexical** | 16,287 | 0.488 | 0.634 | 2,032 | 1.9 MB | N/A |
+| **SutraDB Hybrid RRF** (Dense+BM25) | 16,209 | 1.275 | 1.468 | 778 | 4.9 MB | N/A (Hybrid) |
 
 ---
 
@@ -443,11 +459,11 @@ for r in results:
 
 ## 🛠️ Zero-Build Embedded Developer Workbench (`/ui`)
 
-SutraDB v5.1.0 ships with an industrial, **zero-build, zero-external-CDN Developer Workbench** served natively directly from the engine at `http://localhost:8765/ui`.
+SutraDB v5.5.0 ships with an industrial, **zero-build, zero-external-CDN Developer Workbench** served natively directly from the engine at `http://localhost:8765/ui`.
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
-│ ⚡ SutraDB Console | Developer Workbench                       v5.1.0  │
+│ ⚡ SutraDB Console | Developer Workbench                       v5.5.0  │
 ├────────────┬─────────────┬──────────────┬──────────┬──────────┬────────┤
 │ Hybrid Lab │ Batch Ingest│ Doc Explorer │  2D PCA  │ Admin    │ Code   │
 ├────────────┴─────────────┴──────────────┴──────────┴──────────┴────────┤
@@ -569,8 +585,8 @@ SutraDB is packaged as a supply-chain hardened, multi-stage container image conf
 
 | Registry | Image Name | Pull Command |
 | :--- | :--- | :--- |
-| **Docker Hub** | `samcodesai/sutradb` | `docker pull samcodesai/sutradb:5.1.0` |
-| **GitHub Packages (GHCR)** | `ghcr.io/sam-codesai/sutradb` | `docker pull ghcr.io/sam-codesai/sutradb:5.1.0` |
+| **Docker Hub** | `samcodesai/sutradb` | `docker pull samcodesai/sutradb:5.5.0` |
+| **GitHub Packages (GHCR)** | `ghcr.io/sam-codesai/sutradb` | `docker pull ghcr.io/sam-codesai/sutradb:5.5.0` |
 
 ### 1. Docker Compose (Quickstart)
 

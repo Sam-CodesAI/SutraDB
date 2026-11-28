@@ -1,5 +1,5 @@
 """
-Shared pytest fixtures and isolation helpers for SutraDB v5.1.0 E2E test suite.
+Shared pytest fixtures and isolation helpers for SutraDB v5.5.0 E2E test suite.
 All tests run opaque-box against public Python SDK, FastAPI REST/UI, Playground,
 and sutradb-server (gRPC + loopback HTTP bridge) interfaces with tmp_path and
 ephemeral port isolation.

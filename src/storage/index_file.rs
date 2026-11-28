@@ -129,9 +129,10 @@ impl<'a> ByteReader<'a> {
             .checked_mul(4)
             .ok_or_else(|| SutraError::InvalidHeader("f32 vector byte length overflow".into()))?;
         let raw = self.read_exact(byte_len)?;
+        let (chunks, _) = raw.as_chunks::<4>();
         let mut out = Vec::with_capacity(count);
-        for chunk in raw.chunks_exact(4) {
-            out.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+        for &chunk in chunks {
+            out.push(f32::from_le_bytes(chunk));
         }
         Ok(out)
     }
@@ -141,9 +142,10 @@ impl<'a> ByteReader<'a> {
             .checked_mul(4)
             .ok_or_else(|| SutraError::InvalidHeader("u32 vector byte length overflow".into()))?;
         let raw = self.read_exact(byte_len)?;
+        let (chunks, _) = raw.as_chunks::<4>();
         let mut out = Vec::with_capacity(count);
-        for chunk in raw.chunks_exact(4) {
-            out.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+        for &chunk in chunks {
+            out.push(u32::from_le_bytes(chunk));
         }
         Ok(out)
     }
@@ -270,6 +272,30 @@ fn decode_hnsw(payload: &[u8]) -> Result<HNSWIndex, SutraError> {
         ));
     }
 
+    if let Some(ep) = entry_point {
+        if (ep as usize) >= node_levels.len() || layers.is_empty() || max_level >= layers.len() {
+            return Err(SutraError::InvalidHeader(
+                "HNSW entry_point or max_level out of bounds".into(),
+            ));
+        }
+    }
+    for layer in &layers {
+        if layer.len() != node_levels.len() {
+            return Err(SutraError::InvalidHeader(
+                "HNSW layer node count mismatch".into(),
+            ));
+        }
+        for nbrs in layer {
+            for &nbr in nbrs {
+                if (nbr as usize) >= node_levels.len() {
+                    return Err(SutraError::InvalidHeader(
+                        "HNSW neighbor ID out of bounds".into(),
+                    ));
+                }
+            }
+        }
+    }
+
     Ok(HNSWIndex::from_persisted(
         config,
         entry_point,
@@ -383,9 +409,10 @@ fn decode_bq(payload: &[u8]) -> Result<(BQArena, Option<Vec<f32>>), SutraError> 
         .checked_mul(8)
         .ok_or_else(|| SutraError::InvalidHeader("BQ byte length overflow".into()))?;
     let words_slice = r.read_exact(raw_words_bytes)?;
+    let (word_chunks, _) = words_slice.as_chunks::<8>();
     let mut bits = Vec::with_capacity(num_words);
-    for chunk in words_slice.chunks_exact(8) {
-        bits.push(u64::from_le_bytes(chunk.try_into().unwrap()));
+    for &chunk in word_chunks {
+        bits.push(u64::from_le_bytes(chunk));
     }
 
     let has_centroid = r.read_u8()?;
@@ -450,6 +477,27 @@ fn decode_pq(payload: &[u8]) -> Result<(PQArena, PQCodebook), SutraError> {
     if r.remaining() != 0 {
         return Err(SutraError::InvalidHeader(
             "Trailing bytes in PQ index section".into(),
+        ));
+    }
+
+    if m == 0 || k == 0 || k > 256 || sub_dim == 0 || num_subs != m || arena_m != m || dimension != m.saturating_mul(sub_dim) {
+        return Err(SutraError::InvalidHeader(
+            "Invalid PQ codebook geometry".into(),
+        ));
+    }
+    let expected_sub_len = k.checked_mul(sub_dim).ok_or_else(|| {
+        SutraError::InvalidHeader("PQ codebook subvector table overflow".into())
+    })?;
+    for sub in &centroids {
+        if sub.len() != expected_sub_len {
+            return Err(SutraError::InvalidHeader(
+                "PQ codebook subvector length mismatch".into(),
+            ));
+        }
+    }
+    if !codes.len().is_multiple_of(arena_m) {
+        return Err(SutraError::InvalidHeader(
+            "PQ codes length is not a multiple of m".into(),
         ));
     }
 

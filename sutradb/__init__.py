@@ -30,7 +30,7 @@ from sutradb.cluster import (
     DistributedCluster,
 )
 
-__version__ = "5.1.0"
+__version__ = "5.5.0"
 __all__ = [
     "SutraDB",
     "Collection",

@@ -290,7 +290,8 @@ impl BM25Index {
         let avg_dl = self.avg_doc_length().max(1.0);
         let mut seen_terms: HashSet<&str, FxBuildHasher> =
             HashSet::with_capacity_and_hasher(query_terms.len(), FxBuildHasher);
-        let mut active_terms: Vec<(f32, &Vec<(u32, u32, u32)>)> = Vec::with_capacity(query_terms.len());
+        type TermPostings<'a> = (f32, &'a [(u32, u32, u32)]);
+        let mut active_terms: Vec<TermPostings<'_>> = Vec::with_capacity(query_terms.len());
         let mut total_postings = 0usize;
 
         for term in &query_terms {

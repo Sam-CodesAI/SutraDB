@@ -1,7 +1,7 @@
 """
 Tier 2 E2E Boundary & Adversarial Negative Tests (BVA + Audit Defects).
 Covers all 8 feature domains (F1-F8) with >= 5 boundary/negative tests per domain
-(42 total) including all 14 mandatory edge cases from the SutraDB v5.1.0 audit.
+(42 total) including all 14 mandatory edge cases from the SutraDB v5.5.0 audit.
 """
 
 from __future__ import annotations
@@ -1152,12 +1152,12 @@ def test_f8_boundary_server_malformed_sparse_and_dim_mismatch_no_crash(
     assert httpx.get(f"{srv.bridge_url}/health", timeout=5.0).status_code == 200
 
 
-def test_f8_boundary_server_version_5_1_0_and_wal_records(sutradb_server_factory: Callable[..., Any]) -> None:
-    """Mandatory L1: sutradb-server --version and startup banner report 5.1.0 and accurate wal_records."""
+def test_f8_boundary_server_version_5_5_0_and_wal_records(sutradb_server_factory: Callable[..., Any]) -> None:
+    """Mandatory L1: sutradb-server --version and startup banner report 5.5.0 and accurate wal_records."""
     srv = sutradb_server_factory()
     ver_proc = subprocess.run([str(srv.binary), "--version"], capture_output=True, text=True, timeout=5.0, check=False)
     assert ver_proc.returncode == 0
-    assert "5.1.0" in (ver_proc.stdout + ver_proc.stderr)
+    assert "5.5.0" in (ver_proc.stdout + ver_proc.stderr)
 
     httpx.post(
         f"{srv.bridge_url}/collections",
@@ -1181,7 +1181,7 @@ def test_f8_boundary_server_version_5_1_0_and_wal_records(sutradb_server_factory
     assert st2["wal_records"] == 0
 
     stdout, _ = srv.stop()
-    assert "v5.1.0" in stdout, f"Expected v5.1.0 banner in sutradb-server stdout, got:\n{stdout}"
+    assert "v5.5.0" in stdout, f"Expected v5.5.0 banner in sutradb-server stdout, got:\n{stdout}"
 
 
 def test_f8_boundary_sutra_all_mode_single_owner_bridge_consistency(
@@ -1247,7 +1247,7 @@ def test_f8_boundary_healthcheck_fails_when_port_down_and_optional_docker() -> N
 
     if os.getenv("SUTRA_E2E_DOCKER") == "1":
         build_proc = subprocess.run(
-            ["docker", "build", "-t", "sutradb-e2e-test:5.1.0", "."],
+            ["docker", "build", "-t", "sutradb-e2e-test:5.5.0", "."],
             cwd=str(REPO_ROOT),
             capture_output=True,
             text=True,

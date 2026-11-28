@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# SutraDB v5.1.0 Industrial Hardened Production Dockerfile
+# SutraDB v5.5.0 Industrial Hardened Production Dockerfile
 # Multi-stage build: Rust builder compiles the gRPC binary + Python wheel,
 # then copies only artifacts into the production runner.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -18,8 +18,8 @@ COPY Cargo.toml Cargo.lock build.rs ./
 COPY src/ src/
 COPY proto/ proto/
 
-# Build the standalone gRPC server binary (release)
-RUN cargo build --release --bin sutradb-server
+# Build the standalone gRPC server binary (release, without Python/PyO3 feature)
+RUN cargo build --release --no-default-features --bin sutradb-server
 
 # Build the Python extension wheel
 COPY pyproject.toml README.md ./

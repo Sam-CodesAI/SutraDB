@@ -117,7 +117,7 @@ impl RaftNode {
 
     /// Quorum size: floor(N / 2) + 1
     pub fn quorum_size(&self) -> usize {
-        (self.peers.len() + 1) / 2 + 1
+        self.peers.len().div_ceil(2) + 1
     }
 
     pub fn last_log_index(&self) -> u64 {
@@ -435,7 +435,7 @@ impl MemoryRaftCluster {
         };
 
         let mut votes = 1; // Votes for self
-        let quorum = (peers.len() + 1) / 2 + 1;
+        let quorum = peers.len().div_ceil(2) + 1;
 
         for peer_id in peers {
             if let Some(peer_arc) = self.nodes.get(&peer_id) {

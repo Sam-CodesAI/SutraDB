@@ -1374,6 +1374,6 @@ curl -X POST http://localhost:8765/collections/${colName}/query \\
 </html>
 """
 
-def get_dashboard_html(version: str = "5.1.0") -> str:
+def get_dashboard_html(version: str = "5.5.0") -> str:
     """Returns the standalone HTML/CSS/JS developer workbench string."""
     return DASHBOARD_HTML_TEMPLATE.replace("__VERSION__", version)

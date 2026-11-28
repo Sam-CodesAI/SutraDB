@@ -23,7 +23,7 @@ if [ "$#" -gt 0 ]; then
 fi
 
 echo "=========================================================="
-echo "  SutraDB v5.1.0 Production Daemon Manager"
+echo "  SutraDB v5.5.0 Production Daemon Manager"
 echo "  Mode       : ${SUTRA_MODE}"
 echo "  Storage    : ${SUTRA_DATA_DIR}"
 echo "  UID / GID  : $(id -u):$(id -g)"

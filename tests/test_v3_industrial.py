@@ -198,3 +198,55 @@ def test_server_v3_industrial_endpoints(tmp_path):
     results = query_resp.json()["results"]
     assert len(results) == 1
     assert results[0]["id"] == "d1"
+
+
+def test_rest_ui_stats_tenant_rbac_and_path_traversal_guard(tmp_path, monkeypatch):
+    """Tenant-scoped /ui/stats must isolate stats and invalid collection names must return 400 cleanly."""
+    import json
+
+    rbac = {
+        "admin-k": {"role": "admin", "collections": ["*"]},
+        "tenant-a-reader": {"role": "read", "collections": ["tenant_a_*"]},
+    }
+    monkeypatch.setenv("SUTRA_RBAC_CONFIG", json.dumps(rbac))
+
+    app = create_app(data_dir=str(tmp_path / "rbac_rest"))
+    client = TestClient(app)
+
+    admin_hdr = {"Authorization": "Bearer admin-k"}
+    tenant_a_hdr = {"Authorization": "Bearer tenant-a-reader"}
+
+    assert client.post(
+        "/collections",
+        json={"name": "tenant_a_docs", "dimension": 4, "metric": "cosine"},
+        headers=admin_hdr,
+    ).status_code == 201
+    assert client.post(
+        "/collections",
+        json={"name": "tenant_b_secret", "dimension": 4, "metric": "cosine"},
+        headers=admin_hdr,
+    ).status_code == 201
+    assert client.post(
+        "/collections/tenant_a_docs/insert",
+        json={"documents": [{"id": "a1", "vector": [1.0, 0.0, 0.0, 0.0], "text": "alpha"}]},
+        headers=admin_hdr,
+    ).status_code == 200
+    assert client.post(
+        "/collections/tenant_b_secret/insert",
+        json={"documents": [{"id": "b1", "vector": [0.0, 1.0, 0.0, 0.0], "text": "secret"}]},
+        headers=admin_hdr,
+    ).status_code == 200
+
+    # /ui/stats must only expose tenant_a_* to tenant-a-reader
+    r_stats = client.get("/ui/stats", headers=tenant_a_hdr)
+    assert r_stats.status_code == 200
+    body = r_stats.json()
+    assert body["total_collections"] == 1
+    assert body["total_documents"] == 1
+    assert [c["name"] for c in body["collections"]] == ["tenant_a_docs"]
+
+    # Path traversal / invalid collection names must return 400 (never 500 or filesystem escape)
+    r_bad = client.get("/collections/bad..name/stats", headers=admin_hdr)
+    assert r_bad.status_code == 400
+    r_dotdot = client.get("/collections/..%2Fsecret/stats", headers=admin_hdr)
+    assert r_dotdot.status_code in (400, 404)

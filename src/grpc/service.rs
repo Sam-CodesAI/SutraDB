@@ -13,6 +13,8 @@ use tonic::{Request, Response, Status};
 use crate::collection::{NativeCollection, NativeDocument};
 use crate::distance::Metric;
 use crate::error::SutraError;
+use crate::grpc::auth::{AuthConfig, Role};
+use crate::grpc::metrics::{classify_query_mode, CollectionMetricSnapshot, MetricsRegistry};
 use crate::grpc::proto::sutra_service_server::SutraService;
 use crate::grpc::proto::*;
 use crate::sparse::SparseVector;
@@ -265,10 +267,19 @@ pub struct SutraGrpcService {
     collections: CollectionMap,
     start_time: Instant,
     default_data_dir: Option<PathBuf>,
+    auth: Arc<AuthConfig>,
+    metrics: Arc<MetricsRegistry>,
 }
 
 impl SutraGrpcService {
     pub fn new(default_data_dir: Option<PathBuf>) -> Self {
+        let auth = AuthConfig::from_env().unwrap_or_else(|e| {
+            panic!("[SutraDB] Fatal auth configuration error: {}", e);
+        });
+        Self::with_auth(default_data_dir, auth)
+    }
+
+    pub fn with_auth(default_data_dir: Option<PathBuf>, auth: AuthConfig) -> Self {
         let mut recovered = HashMap::new();
 
         if let Some(ref dir) = default_data_dir {
@@ -341,17 +352,82 @@ impl SutraGrpcService {
             collections: Arc::new(RwLock::new(recovered)),
             start_time: Instant::now(),
             default_data_dir,
+            auth: Arc::new(auth),
+            metrics: Arc::new(MetricsRegistry::new()),
         }
     }
 
     pub fn with_collection(name: String, collection: NativeCollection) -> Self {
+        let auth = AuthConfig::from_env().unwrap_or_else(|e| {
+            panic!("[SutraDB] Fatal auth configuration error: {}", e);
+        });
+        Self::with_collection_and_auth(name, collection, auth)
+    }
+
+    pub fn with_collection_and_auth(
+        name: String,
+        collection: NativeCollection,
+        auth: AuthConfig,
+    ) -> Self {
         let mut map = HashMap::new();
         map.insert(name, Arc::new(RwLock::new(collection)));
         Self {
             collections: Arc::new(RwLock::new(map)),
             start_time: Instant::now(),
             default_data_dir: None,
+            auth: Arc::new(auth),
+            metrics: Arc::new(MetricsRegistry::new()),
         }
+    }
+
+    pub fn auth(&self) -> &AuthConfig {
+        &self.auth
+    }
+
+    pub fn metrics(&self) -> &MetricsRegistry {
+        &self.metrics
+    }
+
+    pub async fn render_prometheus_metrics(&self) -> String {
+        let pairs: Vec<(String, CollectionHandle)> = {
+            let map = self.collections.read().await;
+            let mut list: Vec<_> = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            list.sort_by(|a, b| a.0.cmp(&b.0));
+            list
+        };
+
+        let mut snapshots = Vec::with_capacity(pairs.len());
+        for (name, col_arc) in pairs {
+            let col = col_arc.read_owned().await;
+            let snap = tokio::task::spawn_blocking(move || {
+                let st = col.stats();
+                let docs = st.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+                let vec_mem = st
+                    .get("vector_memory_bytes")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let hnsw_mem = st
+                    .get("hnsw")
+                    .and_then(|h| h.get("memory_bytes"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let wal_pending = wal_records_for_collection(&col);
+                CollectionMetricSnapshot {
+                    name,
+                    documents: docs,
+                    memory_bytes: vec_mem.saturating_add(hnsw_mem),
+                    vector_memory_bytes: vec_mem,
+                    wal_pending_records: wal_pending,
+                }
+            })
+            .await;
+
+            if let Ok(s) = snap {
+                snapshots.push(s);
+            }
+        }
+
+        self.metrics.render_prometheus(&snapshots)
     }
 
     pub async fn add_collection(&self, name: String, collection: NativeCollection) {
@@ -646,7 +722,15 @@ impl SutraService for SutraGrpcService {
         &self,
         request: Request<CreateCollectionRequest>,
     ) -> Result<Response<CreateCollectionResponse>, Status> {
+        let meta = request.metadata().clone();
         let req = request.into_inner();
+        if let Err(st) = self
+            .auth
+            .authorize_grpc_metadata(&meta, Role::Admin, Some(&req.collection_name))
+        {
+            self.metrics.record_error();
+            return Err(st);
+        }
         let (created, _) = self
             .create_collection_internal(
                 &req.collection_name,
@@ -656,7 +740,8 @@ impl SutraService for SutraGrpcService {
                 true,
             )
             .await
-            .map_err(|e| *e)?;
+            .map_err(|e| *e)
+            .inspect_err(|_| self.metrics.record_error())?;
 
         if !created {
             return Ok(Response::new(CreateCollectionResponse {
@@ -675,20 +760,37 @@ impl SutraService for SutraGrpcService {
         &self,
         request: Request<DropCollectionRequest>,
     ) -> Result<Response<DropCollectionResponse>, Status> {
+        let meta = request.metadata().clone();
         let req = request.into_inner();
+        if let Err(st) = self
+            .auth
+            .authorize_grpc_metadata(&meta, Role::Admin, Some(&req.collection_name))
+        {
+            self.metrics.record_error();
+            return Err(st);
+        }
         let removed = self
             .drop_collection_internal(&req.collection_name)
             .await
-            .map_err(|e| *e)?;
+            .map_err(|e| *e)
+            .inspect_err(|_| self.metrics.record_error())?;
         Ok(Response::new(DropCollectionResponse { success: removed }))
     }
 
     async fn list_collections(
         &self,
-        _request: Request<ListCollectionsRequest>,
+        request: Request<ListCollectionsRequest>,
     ) -> Result<Response<ListCollectionsResponse>, Status> {
+        let policy = self
+            .auth
+            .authorize_grpc_metadata(request.metadata(), Role::Read, None)
+            .inspect_err(|_| self.metrics.record_error())?;
         let map = self.collections.read().await;
-        let mut collection_names: Vec<String> = map.keys().cloned().collect();
+        let mut collection_names: Vec<String> = map
+            .keys()
+            .filter(|name| policy.as_ref().is_none_or(|p| p.allows_collection(name)))
+            .cloned()
+            .collect();
         collection_names.sort();
         Ok(Response::new(ListCollectionsResponse { collection_names }))
     }
@@ -697,11 +799,20 @@ impl SutraService for SutraGrpcService {
         &self,
         request: Request<CollectionStatsRequest>,
     ) -> Result<Response<CollectionStatsResponse>, Status> {
+        let meta = request.metadata().clone();
         let req = request.into_inner();
+        if let Err(st) = self
+            .auth
+            .authorize_grpc_metadata(&meta, Role::Read, Some(&req.collection_name))
+        {
+            self.metrics.record_error();
+            return Err(st);
+        }
         let col_arc = self
             .get_collection_arc(&req.collection_name)
             .await
-            .map_err(|e| *e)?;
+            .map_err(|e| *e)
+            .inspect_err(|_| self.metrics.record_error())?;
 
         let col = col_arc.read_owned().await;
         let resp = tokio::task::spawn_blocking(move || {
@@ -716,22 +827,34 @@ impl SutraService for SutraGrpcService {
             }
         })
         .await
-        .map_err(|e| Status::internal(format!("get_stats task panicked: {}", e)))?;
+        .map_err(|e| Status::internal(format!("get_stats task panicked: {}", e)))
+        .inspect_err(|_| self.metrics.record_error())?;
         Ok(Response::new(resp))
     }
 
     async fn insert(&self, request: Request<InsertRequest>) -> Result<Response<InsertResponse>, Status> {
+        let meta = request.metadata().clone();
         let req = request.into_inner();
+        if let Err(st) = self
+            .auth
+            .authorize_grpc_metadata(&meta, Role::Write, Some(&req.collection_name))
+        {
+            self.metrics.record_error();
+            return Err(st);
+        }
         let col_arc = self
             .get_collection_arc(&req.collection_name)
             .await
-            .map_err(|e| *e)?;
+            .map_err(|e| *e)
+            .inspect_err(|_| self.metrics.record_error())?;
 
+        let batch_len = req.documents.len() as u64;
         let mut docs = Vec::with_capacity(req.documents.len());
         let mut vecs = Vec::with_capacity(req.documents.len());
 
         for d in req.documents {
             if d.id.trim().is_empty() {
+                self.metrics.record_error();
                 return Err(Status::invalid_argument("Document id cannot be empty"));
             }
 
@@ -742,17 +865,22 @@ impl SutraService for SutraGrpcService {
                             "Invalid metadata_json for document '{}': {}",
                             d.id, e
                         ))
-                    })?,
+                    })
+                    .inspect_err(|_| self.metrics.record_error())?,
                 _ => serde_json::Value::Object(serde_json::Map::new()),
             };
 
             let sparse_vector = match d.sparse_vector {
-                Some(sv) => Some(SparseVector::try_new(sv.indices, sv.values).map_err(|e| {
-                    Status::invalid_argument(format!(
-                        "Invalid sparse_vector for document '{}': {}",
-                        d.id, e
-                    ))
-                })?),
+                Some(sv) => Some(
+                    SparseVector::try_new(sv.indices, sv.values)
+                        .map_err(|e| {
+                            Status::invalid_argument(format!(
+                                "Invalid sparse_vector for document '{}': {}",
+                                d.id, e
+                            ))
+                        })
+                        .inspect_err(|_| self.metrics.record_error())?,
+                ),
                 None => None,
             };
 
@@ -774,8 +902,12 @@ impl SutraService for SutraGrpcService {
         let mut col = col_arc.write_owned().await;
         let inserted = tokio::task::spawn_blocking(move || col.insert(docs, vecs))
             .await
-            .map_err(|e| Status::internal(format!("insert task panicked: {}", e)))?
-            .map_err(sutra_err_to_status)?;
+            .map_err(|e| Status::internal(format!("insert task panicked: {}", e)))
+            .inspect_err(|_| self.metrics.record_error())?
+            .map_err(sutra_err_to_status)
+            .inspect_err(|_| self.metrics.record_error())?;
+
+        self.metrics.record_ingest(batch_len);
 
         Ok(Response::new(InsertResponse {
             inserted_count: inserted as u64,
@@ -785,18 +917,29 @@ impl SutraService for SutraGrpcService {
     }
 
     async fn delete(&self, request: Request<DeleteRequest>) -> Result<Response<DeleteResponse>, Status> {
+        let meta = request.metadata().clone();
         let req = request.into_inner();
+        if let Err(st) = self
+            .auth
+            .authorize_grpc_metadata(&meta, Role::Write, Some(&req.collection_name))
+        {
+            self.metrics.record_error();
+            return Err(st);
+        }
         let col_arc = self
             .get_collection_arc(&req.collection_name)
             .await
-            .map_err(|e| *e)?;
+            .map_err(|e| *e)
+            .inspect_err(|_| self.metrics.record_error())?;
 
         let ids = req.ids;
         let mut col = col_arc.write_owned().await;
         let deleted = tokio::task::spawn_blocking(move || col.delete(&ids))
             .await
-            .map_err(|e| Status::internal(format!("delete task panicked: {}", e)))?
-            .map_err(sutra_err_to_status)?;
+            .map_err(|e| Status::internal(format!("delete task panicked: {}", e)))
+            .inspect_err(|_| self.metrics.record_error())?
+            .map_err(sutra_err_to_status)
+            .inspect_err(|_| self.metrics.record_error())?;
 
         Ok(Response::new(DeleteResponse {
             deleted_count: deleted as u64,
@@ -805,131 +948,40 @@ impl SutraService for SutraGrpcService {
     }
 
     async fn query(&self, request: Request<QueryRequest>) -> Result<Response<QueryResponse>, Status> {
-        let start = Instant::now();
+        let meta = request.metadata().clone();
         let req = request.into_inner();
-        let col_arc = self
-            .get_collection_arc(&req.collection_name)
-            .await
-            .map_err(|e| *e)?;
-
-        let filter_val = match req.filter_json {
-            Some(ref s) if !s.trim().is_empty() => {
-                let parsed: serde_json::Value = serde_json::from_str(s)
-                    .map_err(|e| Status::invalid_argument(format!("Invalid filter JSON: {}", e)))?;
-                Some(parsed)
-            }
-            _ => None,
-        };
-
-        let sparse_vec = match req.sparse_vector {
-            Some(sv) => Some(
-                SparseVector::try_new(sv.indices, sv.values)
-                    .map_err(|e| Status::invalid_argument(format!("Invalid sparse_vector: {}", e)))?,
-            ),
-            None => None,
-        };
-
-        let colbert_tokens: Option<Vec<Vec<f32>>> = req.colbert_tokens.map(|mv| {
-            mv.vectors.into_iter().map(|v| v.values).collect()
-        });
-        let vector_owned: Option<Vec<f32>> = if !req.vector.is_empty() {
-            Some(req.vector)
-        } else {
-            None
-        };
-        let text_owned: Option<String> = req
-            .text
-            .filter(|s| !s.trim().is_empty());
-        let namespace_owned: Option<String> = req.namespace.filter(|s| !s.is_empty());
-
-        let has_any_signal = vector_owned.is_some()
-            || text_owned.is_some()
-            || sparse_vec.as_ref().is_some_and(|sv| !sv.is_empty())
-            || colbert_tokens.as_ref().is_some_and(|ct| !ct.is_empty());
-        if !has_any_signal {
-            return Err(Status::invalid_argument(
-                "Query must specify at least one of vector, text, sparse_vector, or colbert_tokens",
-            ));
+        if let Err(st) = self
+            .auth
+            .authorize_grpc_metadata(&meta, Role::Read, Some(&req.collection_name))
+        {
+            self.metrics.record_error();
+            return Err(st);
         }
-
-        let top_k = if req.top_k > 0 { req.top_k as usize } else { 10 };
-        let d_w = if req.dense_weight > 0.0 {
-            req.dense_weight
-        } else {
-            1.0
-        };
-        let b_w = if req.bm25_weight > 0.0 {
-            req.bm25_weight
-        } else {
-            1.0
-        };
-        let s_w = if req.sparse_weight > 0.0 {
-            req.sparse_weight
-        } else {
-            1.0
-        };
-        let c_w = if req.colbert_weight > 0.0 {
-            req.colbert_weight
-        } else {
-            1.0
-        };
-        let hybrid = req.hybrid;
-        let use_ann = req.use_ann;
-
-        let col = col_arc.read_owned().await;
-        let search_results = tokio::task::spawn_blocking(move || {
-            col.query(
-                vector_owned.as_deref(),
-                text_owned.as_deref(),
-                sparse_vec.as_ref(),
-                colbert_tokens.as_deref(),
-                namespace_owned.as_deref(),
-                filter_val.as_ref(),
-                top_k,
-                hybrid,
-                None,
-                60,
-                d_w,
-                b_w,
-                s_w,
-                c_w,
-                use_ann,
-            )
-        })
-        .await
-        .map_err(|e| Status::internal(format!("query task panicked: {}", e)))?
-        .map_err(sutra_err_to_status)?;
-
-        let results = search_results
-            .into_iter()
-            .map(|r| SearchResult {
-                id: r.id,
-                score: r.score,
-                text: if r.text.is_empty() { None } else { Some(r.text) },
-                metadata_json: serde_json::to_string(&r.metadata).ok(),
-                dense_score: r.dense_score,
-                bm25_score: r.bm25_score,
-                sparse_score: r.sparse_score,
-                colbert_score: r.colbert_score,
-                namespace: r.namespace,
-            })
-            .collect();
-
-        let latency_micros = start.elapsed().as_micros() as u64;
-        Ok(Response::new(QueryResponse {
-            results,
-            latency_micros,
-        }))
+        self.execute_query_unchecked(req).await
     }
 
     async fn batch_query(
         &self,
         request: Request<BatchQueryRequest>,
     ) -> Result<Response<BatchQueryResponse>, Status> {
+        let meta = request.metadata().clone();
         let req = request.into_inner();
         let default_col = req.collection_name.trim().to_string();
         if !default_col.is_empty() {
-            validate_collection_name(&default_col).map_err(sutra_err_to_status)?;
+            validate_collection_name(&default_col)
+                .map_err(sutra_err_to_status)
+                .inspect_err(|_| self.metrics.record_error())?;
+            if let Err(st) = self
+                .auth
+                .authorize_grpc_metadata(&meta, Role::Read, Some(&default_col))
+            {
+                self.metrics.record_error();
+                return Err(st);
+            }
+        } else {
+            self.auth
+                .authorize_grpc_metadata(&meta, Role::Read, None)
+                .inspect_err(|_| self.metrics.record_error())?;
         }
 
         if req.queries.is_empty() {
@@ -938,18 +990,32 @@ impl SutraService for SutraGrpcService {
             }));
         }
 
-        let total = req.queries.len();
-        let mut join_set = JoinSet::new();
-
-        for (idx, mut query_req) in req.queries.into_iter().enumerate() {
+        let mut prepared = Vec::with_capacity(req.queries.len());
+        for mut query_req in req.queries {
             if query_req.collection_name.trim().is_empty() {
                 query_req.collection_name = default_col.clone();
             }
-            validate_collection_name(&query_req.collection_name).map_err(sutra_err_to_status)?;
+            validate_collection_name(&query_req.collection_name)
+                .map_err(sutra_err_to_status)
+                .inspect_err(|_| self.metrics.record_error())?;
+            if let Err(st) = self.auth.authorize_grpc_metadata(
+                &meta,
+                Role::Read,
+                Some(&query_req.collection_name),
+            ) {
+                self.metrics.record_error();
+                return Err(st);
+            }
+            prepared.push(query_req);
+        }
 
+        let total = prepared.len();
+        let mut join_set = JoinSet::new();
+
+        for (idx, query_req) in prepared.into_iter().enumerate() {
             let svc = self.clone();
             join_set.spawn(async move {
-                let res = svc.query(Request::new(query_req)).await?.into_inner();
+                let res = svc.execute_query_unchecked(query_req).await?.into_inner();
                 Ok::<(usize, QueryResponse), Status>((idx, res))
             });
         }
@@ -957,7 +1023,8 @@ impl SutraService for SutraGrpcService {
         let mut ordered: Vec<Option<QueryResponse>> = vec![None; total];
         while let Some(joined) = join_set.join_next().await {
             let (idx, res) = joined
-                .map_err(|e| Status::internal(format!("batch_query worker failed: {}", e)))??;
+                .map_err(|e| Status::internal(format!("batch_query worker failed: {}", e)))
+                .inspect_err(|_| self.metrics.record_error())??;
             ordered[idx] = Some(res);
         }
 
@@ -969,12 +1036,17 @@ impl SutraService for SutraGrpcService {
         &self,
         request: Request<BatchDistanceRequest>,
     ) -> Result<Response<BatchDistanceResponse>, Status> {
+        self.auth
+            .authorize_grpc_metadata(request.metadata(), Role::Read, None)
+            .inspect_err(|_| self.metrics.record_error())?;
         let req = request.into_inner();
         let dim = req.dimension as usize;
         if dim == 0 {
+            self.metrics.record_error();
             return Err(Status::invalid_argument("Dimension must be greater than 0"));
         }
         if req.query_vector.len() != dim {
+            self.metrics.record_error();
             return Err(Status::invalid_argument(format!(
                 "Query vector length ({}) does not match dimension ({})",
                 req.query_vector.len(),
@@ -982,6 +1054,7 @@ impl SutraService for SutraGrpcService {
             )));
         }
         if !req.target_vectors.len().is_multiple_of(dim) {
+            self.metrics.record_error();
             return Err(Status::invalid_argument(format!(
                 "Target vectors length ({}) is not a multiple of dimension ({})",
                 req.target_vectors.len(),
@@ -989,7 +1062,9 @@ impl SutraService for SutraGrpcService {
             )));
         }
 
-        let metric = Metric::from_str(&req.metric).map_err(sutra_err_to_status)?;
+        let metric = Metric::from_str(&req.metric)
+            .map_err(sutra_err_to_status)
+            .inspect_err(|_| self.metrics.record_error())?;
         let query_vec = req.query_vector;
         let target_vecs = req.target_vectors;
         let scores = tokio::task::spawn_blocking(move || -> Result<Vec<f32>, SutraError> {
@@ -1010,18 +1085,29 @@ impl SutraService for SutraGrpcService {
             Ok(scores)
         })
         .await
-        .map_err(|e| Status::internal(format!("batch_distances task panicked: {}", e)))?
-        .map_err(sutra_err_to_status)?;
+        .map_err(|e| Status::internal(format!("batch_distances task panicked: {}", e)))
+        .inspect_err(|_| self.metrics.record_error())?
+        .map_err(sutra_err_to_status)
+        .inspect_err(|_| self.metrics.record_error())?;
 
         Ok(Response::new(BatchDistanceResponse { scores }))
     }
 
     async fn save(&self, request: Request<SaveRequest>) -> Result<Response<SaveResponse>, Status> {
+        let meta = request.metadata().clone();
         let req = request.into_inner();
+        if let Err(st) = self
+            .auth
+            .authorize_grpc_metadata(&meta, Role::Admin, Some(&req.collection_name))
+        {
+            self.metrics.record_error();
+            return Err(st);
+        }
         let (path, bytes_written) = self
             .save_collection_internal(&req.collection_name)
             .await
-            .map_err(|e| *e)?;
+            .map_err(|e| *e)
+            .inspect_err(|_| self.metrics.record_error())?;
         Ok(Response::new(SaveResponse {
             success: true,
             message: format!(
@@ -1037,11 +1123,20 @@ impl SutraService for SutraGrpcService {
         &self,
         request: Request<CompactRequest>,
     ) -> Result<Response<CompactResponse>, Status> {
+        let meta = request.metadata().clone();
         let req = request.into_inner();
+        if let Err(st) = self
+            .auth
+            .authorize_grpc_metadata(&meta, Role::Admin, Some(&req.collection_name))
+        {
+            self.metrics.record_error();
+            return Err(st);
+        }
         let count = self
             .compact_collection_internal(&req.collection_name)
             .await
-            .map_err(|e| *e)?;
+            .map_err(|e| *e)
+            .inspect_err(|_| self.metrics.record_error())?;
         Ok(Response::new(CompactResponse {
             success: true,
             count: count as u64,
@@ -1049,6 +1144,121 @@ impl SutraService for SutraGrpcService {
                 "Collection '{}' compacted ({} active documents)",
                 req.collection_name, count
             ),
+        }))
+    }
+}
+
+impl SutraGrpcService {
+    #[allow(clippy::result_large_err)]
+    async fn execute_query_unchecked(&self, req: QueryRequest) -> Result<Response<QueryResponse>, Status> {
+        let start = Instant::now();
+        let col_name = req.collection_name.clone();
+        let col_arc = self
+            .get_collection_arc(&req.collection_name)
+            .await
+            .map_err(|e| *e)
+            .inspect_err(|_| self.metrics.record_error())?;
+
+        let filter_val = match req.filter_json {
+            Some(ref s) if !s.trim().is_empty() => {
+                let parsed: serde_json::Value = serde_json::from_str(s)
+                    .map_err(|e| Status::invalid_argument(format!("Invalid filter JSON: {}", e)))
+                    .inspect_err(|_| self.metrics.record_error())?;
+                Some(parsed)
+            }
+            _ => None,
+        };
+
+        let sparse_vec = match req.sparse_vector {
+            Some(sv) => Some(
+                SparseVector::try_new(sv.indices, sv.values)
+                    .map_err(|e| Status::invalid_argument(format!("Invalid sparse_vector: {}", e)))
+                    .inspect_err(|_| self.metrics.record_error())?,
+            ),
+            None => None,
+        };
+
+        let colbert_tokens: Option<Vec<Vec<f32>>> = req.colbert_tokens.map(|mv| {
+            mv.vectors.into_iter().map(|v| v.values).collect()
+        });
+        let vector_owned: Option<Vec<f32>> = if !req.vector.is_empty() {
+            Some(req.vector)
+        } else {
+            None
+        };
+        let text_owned: Option<String> = req
+            .text
+            .filter(|s| !s.trim().is_empty());
+        let namespace_owned: Option<String> = req.namespace.filter(|s| !s.is_empty());
+
+        let has_vec = vector_owned.is_some();
+        let has_txt = text_owned.is_some();
+        let has_sp = sparse_vec.as_ref().is_some_and(|sv| !sv.is_empty());
+        let has_cb = colbert_tokens.as_ref().is_some_and(|ct| !ct.is_empty());
+        if !(has_vec || has_txt || has_sp || has_cb) {
+            self.metrics.record_error();
+            return Err(Status::invalid_argument(
+                "Query must specify at least one of vector, text, sparse_vector, or colbert_tokens",
+            ));
+        }
+
+        let top_k = if req.top_k > 0 { req.top_k as usize } else { 10 };
+        let d_w = if req.dense_weight > 0.0 { req.dense_weight } else { 1.0 };
+        let b_w = if req.bm25_weight > 0.0 { req.bm25_weight } else { 1.0 };
+        let s_w = if req.sparse_weight > 0.0 { req.sparse_weight } else { 1.0 };
+        let c_w = if req.colbert_weight > 0.0 { req.colbert_weight } else { 1.0 };
+        let hybrid = req.hybrid;
+        let use_ann = req.use_ann;
+
+        let col = col_arc.read_owned().await;
+        let mode = classify_query_mode(&col, has_vec, has_txt, has_sp, has_cb, hybrid, use_ann);
+        let search_results = tokio::task::spawn_blocking(move || {
+            col.query(
+                vector_owned.as_deref(),
+                text_owned.as_deref(),
+                sparse_vec.as_ref(),
+                colbert_tokens.as_deref(),
+                namespace_owned.as_deref(),
+                filter_val.as_ref(),
+                top_k,
+                hybrid,
+                None,
+                60,
+                d_w,
+                b_w,
+                s_w,
+                c_w,
+                use_ann,
+            )
+        })
+        .await
+        .map_err(|e| Status::internal(format!("query task panicked: {}", e)))
+        .inspect_err(|_| self.metrics.record_error())?
+        .map_err(sutra_err_to_status)
+        .inspect_err(|_| self.metrics.record_error())?;
+
+        let results = search_results
+            .into_iter()
+            .map(|r| SearchResult {
+                id: r.id,
+                score: r.score,
+                text: if r.text.is_empty() { None } else { Some(r.text) },
+                metadata_json: serde_json::to_string(&r.metadata).ok(),
+                dense_score: r.dense_score,
+                bm25_score: r.bm25_score,
+                sparse_score: r.sparse_score,
+                colbert_score: r.colbert_score,
+                namespace: r.namespace,
+            })
+            .collect();
+
+        let elapsed = start.elapsed();
+        self.metrics
+            .record_query(&col_name, mode, elapsed.as_secs_f64());
+
+        Ok(Response::new(QueryResponse {
+            results,
+            latency_micros: elapsed.as_micros() as u64,
         }))
     }
 }

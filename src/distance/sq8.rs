@@ -348,6 +348,7 @@ pub fn sq8_score_slice(
 }
 
 /// Quantizes `v` directly into `out_data`, returning `(min_val, scale)`.
+/// Non-finite (`NaN`/`Inf`) components are ignored when computing bounds and quantized to `0`.
 #[inline]
 pub fn quantize_sq8_into(v: &[f32], out_data: &mut Vec<u8>) -> (f32, f32) {
     if v.is_empty() {
@@ -356,6 +357,9 @@ pub fn quantize_sq8_into(v: &[f32], out_data: &mut Vec<u8>) -> (f32, f32) {
     let mut min_val = f32::INFINITY;
     let mut max_val = f32::NEG_INFINITY;
     for &x in v {
+        if !x.is_finite() {
+            continue;
+        }
         if x < min_val {
             min_val = x;
         }
@@ -363,13 +367,21 @@ pub fn quantize_sq8_into(v: &[f32], out_data: &mut Vec<u8>) -> (f32, f32) {
             max_val = x;
         }
     }
+    if !min_val.is_finite() || !max_val.is_finite() {
+        out_data.resize(out_data.len() + v.len(), 0u8);
+        return (0.0, 0.0);
+    }
     let diff = max_val - min_val;
-    let scale = if diff > 1e-12 { diff / 255.0 } else { 0.0 };
+    let scale = if diff > 1e-12 && diff.is_finite() {
+        diff / 255.0
+    } else {
+        0.0
+    };
     let inv_scale = if scale > 0.0 { 1.0 / scale } else { 0.0 };
 
     out_data.reserve(v.len());
     for &x in v {
-        let q = if scale > 0.0 {
+        let q = if scale > 0.0 && x.is_finite() {
             ((x - min_val) * inv_scale).round().clamp(0.0, 255.0) as u8
         } else {
             0u8

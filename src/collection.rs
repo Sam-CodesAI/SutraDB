@@ -442,12 +442,12 @@ impl NativeCollection {
         mut flat_vectors: Vec<f32>,
         log_to_wal: bool,
     ) -> Result<usize, SutraError> {
-        let expected_flat = documents.len().checked_mul(self.dimension).ok_or_else(|| {
+        let expected_flat = documents.len().checked_mul(self.dimension).ok_or(
             SutraError::DimensionMismatch {
                 expected: usize::MAX,
                 got: flat_vectors.len(),
-            }
-        })?;
+            },
+        )?;
         if flat_vectors.len() != expected_flat {
             return Err(SutraError::DimensionMismatch {
                 expected: expected_flat,
@@ -455,7 +455,12 @@ impl NativeCollection {
             });
         }
 
-        // Phase 1: Validate all metadata/sparse/colbert inputs upfront before mutating state or WAL
+        // Phase 1: Validate all vector, metadata, sparse, and colbert inputs upfront before mutating state or WAL
+        if flat_vectors.iter().any(|x| !x.is_finite()) {
+            return Err(SutraError::InvalidQuery(
+                "Vector contains non-finite value (NaN or Inf)".into(),
+            ));
+        }
         for doc in &documents {
             if let Some(ref sv) = doc.sparse_vector {
                 if sv.indices.len() != sv.values.len() {
@@ -463,6 +468,11 @@ impl NativeCollection {
                         expected: sv.indices.len(),
                         got: sv.values.len(),
                     });
+                }
+                if sv.values.iter().any(|x| !x.is_finite()) {
+                    return Err(SutraError::InvalidQuery(
+                        "Sparse vector contains non-finite value (NaN or Inf)".into(),
+                    ));
                 }
             }
             if let Some(ref tokens) = doc.colbert_tokens {
@@ -472,6 +482,11 @@ impl NativeCollection {
                             expected: self.dimension,
                             got: tok.len(),
                         });
+                    }
+                    if tok.iter().any(|x| !x.is_finite()) {
+                        return Err(SutraError::InvalidQuery(
+                            "ColBERT token vector contains non-finite value (NaN or Inf)".into(),
+                        ));
                     }
                 }
             }
@@ -944,6 +959,11 @@ impl NativeCollection {
                     got: q_vec.len(),
                 });
             }
+            if q_vec.iter().any(|x| !x.is_finite()) {
+                return Err(SutraError::InvalidQuery(
+                    "Query vector contains non-finite value (NaN or Inf)".into(),
+                ));
+            }
         }
         if let Some(sv) = sparse_vector {
             if sv.indices.len() != sv.values.len() {
@@ -951,6 +971,11 @@ impl NativeCollection {
                     expected: sv.indices.len(),
                     got: sv.values.len(),
                 });
+            }
+            if sv.values.iter().any(|x| !x.is_finite()) {
+                return Err(SutraError::InvalidQuery(
+                    "Query sparse vector contains non-finite value (NaN or Inf)".into(),
+                ));
             }
         }
         if let Some(ct) = colbert_tokens {
@@ -961,6 +986,11 @@ impl NativeCollection {
                         got: tok.len(),
                     });
                 }
+                if tok.iter().any(|x| !x.is_finite()) {
+                    return Err(SutraError::InvalidQuery(
+                        "Query ColBERT token contains non-finite value (NaN or Inf)".into(),
+                    ));
+                }
             }
         }
 
@@ -969,11 +999,110 @@ impl NativeCollection {
             return Ok(Vec::new());
         }
 
-        // 1. Build compound mask: metadata filter & tombstones & namespace isolation
-        // Sub-microsecond filter evaluation via SecondaryMetadataIndex
+        let has_vector = vector.is_some();
+        let has_text = text.map(|t| !t.trim().is_empty()).unwrap_or(false);
+        let has_sparse = sparse_vector.map(|sv| !sv.is_empty()).unwrap_or(false);
+        let has_colbert = colbert_tokens.map(|ct| !ct.is_empty()).unwrap_or(false);
+        let is_cosine = self.metric == Metric::Cosine;
+
+        // 1. Sub-microsecond SecondaryMetadataIndex lookup BEFORE any O(N) mask allocation
+        let eval_res = self.metadata_index.evaluate_filter_checked(filter);
+        if let Some(q_vec) = vector {
+            if !has_text && !has_sparse && !has_colbert {
+                if let Some((ref bitmap, is_exact)) = eval_res {
+                    if is_exact && !filter.is_some_and(crate::filter::has_complex_operators) {
+                        let bm_count = bitmap.len() as usize;
+                        if bm_count == 0 {
+                            return Ok(Vec::new());
+                        }
+                        let active_total = self.count().max(1);
+                        let valid_ratio = (bm_count as f64) / (active_total as f64);
+                        if bm_count <= 2048 || (valid_ratio < 0.03 && bm_count <= 4096) {
+                            let normalized_q =
+                                if is_cosine { normalize_copy(q_vec) } else { q_vec.to_vec() };
+                            let q_sum: f32 = if self.use_sq8 && self.vectors_evicted {
+                                normalized_q.iter().sum()
+                            } else {
+                                0.0
+                            };
+                            let mut scored: Vec<(usize, f32)> = Vec::with_capacity(bm_count);
+                            for doc_id in bitmap.iter() {
+                                let idx = doc_id as usize;
+                                if idx >= n || (idx < self.tombstones.len() && self.tombstones[idx]) {
+                                    continue;
+                                }
+                                if let Some(ns) = namespace {
+                                    if self.documents[idx].namespace.as_deref() != Some(ns) {
+                                        continue;
+                                    }
+                                }
+                                let score = if !self.vectors_evicted {
+                                    compute_vector_score(
+                                        &normalized_q,
+                                        &self.vectors[idx],
+                                        self.metric,
+                                        is_cosine,
+                                    )?
+                                } else if let Some(v) = self.get_vector(idx) {
+                                    compute_vector_score(
+                                        &normalized_q,
+                                        v.as_ref(),
+                                        self.metric,
+                                        is_cosine,
+                                    )?
+                                } else if self.use_sq8 && idx < self.sq8_vectors.len() {
+                                    self.sq8_vectors.try_score_idx(
+                                        idx,
+                                        &normalized_q,
+                                        q_sum,
+                                        self.metric,
+                                    )?
+                                } else {
+                                    continue;
+                                };
+                                if score.is_finite() {
+                                    scored.push((idx, score));
+                                }
+                            }
+                            if scored.len() > top_k {
+                                scored.select_nth_unstable_by(top_k - 1, |a, b| {
+                                    b.1.partial_cmp(&a.1)
+                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                        .then_with(|| a.0.cmp(&b.0))
+                                });
+                                scored.truncate(top_k);
+                            }
+                            scored.sort_by(|a, b| {
+                                b.1.partial_cmp(&a.1)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                                    .then_with(|| a.0.cmp(&b.0))
+                            });
+                            return Ok(scored
+                                .into_iter()
+                                .map(|(idx, score)| {
+                                    let doc = &self.documents[idx];
+                                    NativeSearchResult {
+                                        id: doc.id.clone(),
+                                        score,
+                                        text: doc.text.clone(),
+                                        metadata: doc.metadata.clone(),
+                                        dense_score: Some(score),
+                                        bm25_score: None,
+                                        sparse_score: None,
+                                        colbert_score: None,
+                                        namespace: doc.namespace.clone(),
+                                    }
+                                })
+                                .collect());
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Build compound mask: metadata filter & tombstones & namespace isolation
         let mut mask = vec![true; n];
         let mut index_exact = true;
-        let eval_res = self.metadata_index.evaluate_filter_checked(filter);
         let mut exact_filter_bitmap: Option<roaring::RoaringBitmap> = None;
         if let Some((bitmap, is_exact)) = eval_res {
             index_exact = is_exact;
@@ -1014,17 +1143,12 @@ impl NativeCollection {
             return Ok(Vec::new());
         }
 
-        let has_vector = vector.is_some();
-        let has_text = text.map(|t| !t.trim().is_empty()).unwrap_or(false);
-        let has_sparse = sparse_vector.map(|sv| !sv.is_empty()).unwrap_or(false);
-        let has_colbert = colbert_tokens.map(|ct| !ct.is_empty()).unwrap_or(false);
+        // 3. Cost-Based Query Planning:
+        // Bypass HNSW for restrictive candidate pools (<= 2048 or < 3% selectivity up to 4096) where
+        // exact SIMD scan over matching docs is sub-millisecond and avoids high-ef HNSW hops.
+        let valid_ratio = (valid_count as f64) / (self.count().max(1) as f64);
+        let should_bypass_hnsw = valid_count <= 2048 || (valid_ratio < 0.03 && valid_count <= 4096);
 
-        // 2. Cost-Based Query Planning:
-        // Only bypass HNSW for tiny candidate pools (<= 32) where exact SIMD scan finishes in microseconds;
-        // larger filtered queries (including 1% selectivity on large corpora) traverse HNSW with in-flight bitmap filtering.
-        let should_bypass_hnsw = valid_count <= 32;
-
-        let is_cosine = self.metric == Metric::Cosine;
         let mut dense_scores = if has_vector {
             vec![f32::NEG_INFINITY; n]
         } else {
@@ -1096,8 +1220,8 @@ impl NativeCollection {
                     let lut = cb.try_compute_lut(&normalized_q, self.metric)?;
                     let mut candidates: Vec<(usize, f32)> = Vec::with_capacity(valid_count);
 
-                    for i in 0..n {
-                        if mask[i] {
+                    for (i, &allowed) in mask.iter().enumerate().take(n) {
+                        if allowed {
                             let score = cb.try_score_adc_slice(
                                 self.pq_vectors.code_slice(i),
                                 &lut,
@@ -1164,8 +1288,8 @@ impl NativeCollection {
                         .collect::<Result<Vec<_>, _>>()?
                 } else {
                     let mut out = Vec::with_capacity(valid_count);
-                    for i in 0..n {
-                        if mask[i] {
+                    for (i, &allowed) in mask.iter().enumerate().take(n) {
+                        if allowed {
                             let d = self.bq_vectors.try_hamming_idx(i, &q_bq.bits)?;
                             out.push((i, d));
                         }
@@ -1310,27 +1434,29 @@ impl NativeCollection {
         }
 
         // Fast-path return for pure BM25 lexical query without allocating O(N) score buffers
-        if has_text && (!hybrid || num_modalities < 2) && !has_vector && !has_colbert && !has_sparse {
-            let valid = self.bm25.search_top_k(text.unwrap(), top_k, Some(&mask));
-            return Ok(valid.into_iter().map(|(idx, score)| {
-                let doc = &self.documents[idx];
-                NativeSearchResult {
-                    id: doc.id.clone(),
-                    score,
-                    text: doc.text.clone(),
-                    metadata: doc.metadata.clone(),
-                    dense_score: None,
-                    bm25_score: Some(score),
-                    sparse_score: None,
-                    colbert_score: None,
-                    namespace: doc.namespace.clone(),
-                }
-            }).collect());
+        if let Some(q_text) = text.filter(|t| !t.trim().is_empty()) {
+            if (!hybrid || num_modalities < 2) && !has_vector && !has_colbert && !has_sparse {
+                let valid = self.bm25.search_top_k(q_text, top_k, Some(&mask));
+                return Ok(valid.into_iter().map(|(idx, score)| {
+                    let doc = &self.documents[idx];
+                    NativeSearchResult {
+                        id: doc.id.clone(),
+                        score,
+                        text: doc.text.clone(),
+                        metadata: doc.metadata.clone(),
+                        dense_score: None,
+                        bm25_score: Some(score),
+                        sparse_score: None,
+                        colbert_score: None,
+                        namespace: doc.namespace.clone(),
+                    }
+                }).collect());
+            }
         }
 
         // 3. Score BM25
-        let bm25_scores = if has_text {
-            self.bm25.score_query(text.unwrap(), Some(&mask))
+        let bm25_scores = if let Some(q_text) = text.filter(|t| !t.trim().is_empty()) {
+            self.bm25.score_query(q_text, Some(&mask))
         } else {
             vec![0.0f32; n]
         };

@@ -581,7 +581,7 @@ def main() -> None:
     print("  ╔══════════════════════════════════════════════════╗")
     print("  ║      ⚡ SutraSearch Playground                   ║")
     print("  ║      Hybrid Vector + BM25 Search Engine          ║")
-    print("  ║      Powered by SutraDB v5.1.0                    ║")
+    print("  ║      Powered by SutraDB v5.5.0                    ║")
     print("  ╚══════════════════════════════════════════════════╝")
     print()
 

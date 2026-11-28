@@ -1015,7 +1015,7 @@ def test_f7_rest_ui_stats_and_prometheus_metrics(rest_client: Any) -> None:
 
     r_ui = rest_client.get("/ui")
     assert r_ui.status_code == 200
-    assert "5.1.0" in r_ui.text
+    assert "5.5.0" in r_ui.text
     assert rest_client.get("/dashboard").status_code == 200
 
     r_ui_stats = rest_client.get("/ui/stats")

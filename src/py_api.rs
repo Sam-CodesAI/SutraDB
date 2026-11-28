@@ -946,6 +946,7 @@ impl PyNativeCollection {
         .map_err(Into::into)
     }
 
+    #[allow(clippy::type_complexity)]
     fn hnsw_layers(&self, py: Python) -> PyResult<Option<Vec<HashMap<u32, Vec<u32>>>>> {
         py.allow_threads(|| -> Result<_, SutraError> {
             let guard = self

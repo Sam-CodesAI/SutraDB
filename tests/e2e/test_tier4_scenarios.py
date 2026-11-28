@@ -338,7 +338,7 @@ def test_scenario_5_full_rest_ui_playground_and_client_lifecycle(
         assert [h["id"] for h in hits] == ["w1"]
 
     ui_html = httpx.get(f"{base_url}/ui", timeout=5.0).text
-    assert "5.1.0" in ui_html and "${r.id}" not in ui_html
+    assert "5.5.0" in ui_html and "${r.id}" not in ui_html
     metrics_txt = httpx.get(f"{base_url}/metrics", timeout=5.0).text
     assert 'sutradb_documents_count{collection="web_kb"} 1' in metrics_txt
 

@@ -26,13 +26,17 @@ sutra_data/
 rag_data/
 *.wal
 *.sutra
+*.sutra.idx
+*.idx
+*.meta.json
 *.tmp
 
-# Rust target
+# Rust & Python build artifacts / caches
 target/
-
-# Pytest / Coverage
+*.whl
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
 htmlcov/
 .venv/

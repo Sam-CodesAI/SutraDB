@@ -28,8 +28,15 @@ jobs:
           pip install --upgrade pip
           pip install maturin pytest httpx psutil fastapi uvicorn numpy pydantic
 
+      - name: Lint & Verify Standalone Server Build
+        run: |
+          rustup component add clippy
+          cargo clippy --no-default-features --bin sutradb-server -- -D warnings
+          cargo clippy --all-targets -- -D warnings
+          cargo build --release --no-default-features --bin sutradb-server
+
       - name: Run Rust Tests
-        run: cargo test --verbose
+        run: cargo test --release --verbose
 
       - name: Build Local Wheel & Run Pytest
         run: |
