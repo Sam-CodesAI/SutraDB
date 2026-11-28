@@ -41,7 +41,7 @@ jobs:
       - name: Build Local Wheel & Run Pytest
         run: |
           pip install .
-          python -m pytest -v
+          pytest -v
 
   build-wheels:
     name: Build Wheels (${{ matrix.os }})
