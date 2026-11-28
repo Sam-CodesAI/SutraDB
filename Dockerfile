@@ -5,7 +5,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Stage 1: Rust builder ────────────────────────────────────────────────────
-FROM rust:1.82-slim AS builder
+FROM rust:1-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv pkg-config libssl-dev \
@@ -27,7 +27,7 @@ COPY sutradb/ sutradb/
 RUN maturin build --release --out /wheels
 
 # ── Stage 2: Production runner ───────────────────────────────────────────────
-FROM python:3.12-slim AS runner
+FROM python:3.12-slim-bookworm AS runner
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
